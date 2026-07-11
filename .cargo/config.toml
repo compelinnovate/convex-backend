@@ -4,6 +4,11 @@ bindeps = true
 [env]
 CARGO_WORKSPACE_ROOT = { value = "", relative = true }
 CHRONO_TZ_TIMEZONE_FILTER = "US/Pacific"
+# Bundled RocksDB 8.10 relies on a transitive <cstdint> include that GCC 15 no
+# longer provides. Keep the workaround target-specific so it cannot affect MSVC
+# or Apple builds, and let an explicit caller value take precedence.
+CXXFLAGS_x86_64_unknown_linux_gnu = { value = "-include cstdint", force = false }
+CXXFLAGS_aarch64_unknown_linux_gnu = { value = "-include cstdint", force = false }
 # Custom rusty_v8 build: V8 14.9.207.26 base with leaptiering dispatch-handle UAF
 # fixes (JSFunction 8e1b07549b03 + FeedbackCell e4f0cfdd659) plus these backports:
 #   - 5e34aa5c30c turboshaft store-store-elimination backedge revisit (never
