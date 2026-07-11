@@ -5,6 +5,9 @@ import { log, setDebugLogging } from "./log";
 import os from "node:os";
 import http from "node:http";
 import express, { Request, Response } from "express";
+import { extractErrorMessage, getPrepareStackTraceStats } from "./errors";
+import { getPackageCacheStats } from "./source_package";
+import { prepareSourcePackage } from "./prepare";
 
 const DEFAULT_PORT = 3002;
 
@@ -19,14 +22,35 @@ async function startServer(
 
   // Override os.tmpdir to use the provided tempdir
   os.tmpdir = () => tempdir;
-  log(`Node executor using tempdir: ${tempdir}`);
+  log("Node executor tempdir configured");
+  let activeRequests = 0;
 
   // Add health check endpoint
   app.get("/health", (_req: Request, res: Response) => {
-    res.json({ status: "ok" });
+    res.json({
+      status: "ok",
+      activeRequests,
+      packageCache: getPackageCacheStats(),
+      stackTrace: getPrepareStackTraceStats(),
+    });
+  });
+
+  app.post("/prepare", async (req: Request, res: Response) => {
+    try {
+      await prepareSourcePackage(req.body);
+      res.json({ type: "success" });
+    } catch (_error: unknown) {
+      // Package failure is a typed protocol outcome. Keep HTTP errors for
+      // failures that prevent the endpoint from producing that response.
+      res.json({
+        type: "error",
+        message: "Package preparation failed",
+      });
+    }
   });
 
   app.post("/invoke", async (req: Request, res: Response) => {
+    activeRequests += 1;
     try {
       const request = req.body;
       request.requestId = uuidv4();
@@ -36,23 +60,25 @@ async function startServer(
       res.setHeader("Transfer-Encoding", "chunked");
 
       await invoke(request, res);
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const message = extractErrorMessage(err) || "Internal server error";
       // If we haven't written anything yet, send an error response
       if (!res.headersSent) {
         res.status(500).json({
           type: "error",
-          message: err.message || "Internal server error",
+          message,
         });
       } else {
         // If we've already started streaming, try to write an error line
         res.write(
           JSON.stringify({
             type: "error",
-            message: err.message || "Internal server error",
+            message,
           }) + "\n",
         );
       }
     } finally {
+      activeRequests -= 1;
       res.end();
     }
   });
@@ -64,7 +90,7 @@ async function startServer(
       typeof addr === "object" && addr
         ? `port ${addr.port}`
         : typeof listenTarget === "object" && "path" in listenTarget
-          ? `path ${listenTarget.path}`
+          ? "IPC endpoint"
           : String(listenTarget);
     log(`Node executor server listening on ${addrStr}`);
   });

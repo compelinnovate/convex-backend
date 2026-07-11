@@ -1,3 +1,7 @@
+import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { fileURLToPath } from "node:url";
+
 export interface FrameData {
   typeName: string | null;
   functionName: string | null;
@@ -13,6 +17,80 @@ export interface FrameData {
   isAsync: boolean;
   isPromiseAll: boolean;
   promiseIndex: number | null;
+}
+
+type ExtendedCallSite = NodeJS.CallSite & {
+  isAsync(): boolean;
+  isPromiseAll(): boolean;
+  getPromiseIndex(): number | null;
+};
+
+// V8 resolves prepareStackTrace through the current global Error constructor.
+// Retain the pristine constructor so user code cannot redirect hook ownership
+// by replacing globalThis.Error.
+const executorErrorConstructor = Error;
+const userModulesDirs = new Map<string, number>();
+const errorFrames = new WeakMap<Error, FrameData[]>();
+const stackTraceStats = {
+  invocations: 0,
+  framesProcessed: 0,
+  durationMs: 0,
+};
+
+export function getPrepareStackTraceStats() {
+  return {
+    registeredRoots: userModulesDirs.size,
+    ...stackTraceStats,
+  };
+}
+
+function registeredFrameFileName(fileName: string): string | null {
+  let normalizedFileName: string;
+  try {
+    if (fileName.startsWith("file:")) {
+      const fileUrl = new URL(fileName);
+      fileUrl.search = "";
+      normalizedFileName = path.normalize(fileURLToPath(fileUrl));
+    } else {
+      normalizedFileName = path.normalize(fileName.split("?", 1)[0]);
+    }
+  } catch {
+    return null;
+  }
+
+  // Every registered package root ends in `modules`. Derive that root from
+  // the frame path and verify it directly instead of scanning deployment
+  // history for a matching prefix.
+  const modulesMarker = `${path.sep}modules${path.sep}`;
+  let markerIndex = normalizedFileName.indexOf(modulesMarker);
+  let modulesDir: string | null = null;
+  while (markerIndex !== -1) {
+    const candidate = normalizedFileName.slice(
+      0,
+      markerIndex + modulesMarker.length - path.sep.length,
+    );
+    if (userModulesDirs.has(candidate)) {
+      modulesDir = candidate;
+      break;
+    }
+    markerIndex = normalizedFileName.indexOf(
+      modulesMarker,
+      markerIndex + modulesMarker.length,
+    );
+  }
+  if (modulesDir === null) {
+    return null;
+  }
+  const relativeFileName = path.relative(modulesDir, normalizedFileName);
+  if (
+    relativeFileName === "" ||
+    relativeFileName === ".." ||
+    relativeFileName.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relativeFileName)
+  ) {
+    return null;
+  }
+  return `convex:/user/${relativeFileName.split(path.sep).join("/")}`;
 }
 
 // https://v8.dev/docs/stack-trace-api#appendix%3A-stack-trace-format
@@ -51,29 +129,27 @@ function formatTraceLine(frame: FrameData) {
   }
 }
 
-export function registerPrepareStackTrace(modulesDir: string) {
+const prepareStackTrace: NonNullable<ErrorConstructor["prepareStackTrace"]> = (
+  error,
+  stackFrames,
+) => {
   // This function is called on-demand when the `stack` property of an `Error` is accessed for the first time.
   // See https://v8.dev/docs/stack-trace-api for more details.
-  Error.prepareStackTrace = (error, stackFrames) => {
+  const start = performance.now();
+  stackTraceStats.invocations += 1;
+  stackTraceStats.framesProcessed += stackFrames.length;
+  try {
     const frameData: FrameData[] = stackFrames.map((v8Frame) => {
-      let fileName = v8Frame.getFileName();
-      // For source mapping to work, all user modules need to start with
-      // "convex:/user". Replace the full path with that. Note that we use
-      // indexOf() instead of startsWith() since there might be different
-      // prefixes like "file://" or "file://private/" and we don't want to
-      // enumerate them all since those might differ between mac and linux.
-      if (fileName) {
-        const index = fileName.indexOf(modulesDir);
-        if (index !== -1) {
-          fileName =
-            "convex:/user" + fileName.substring(index + modulesDir.length);
-        }
-      }
+      const extendedFrame = v8Frame as ExtendedCallSite;
+      const originalFileName = v8Frame.getFileName();
+      const fileName = originalFileName
+        ? (registeredFrameFileName(originalFileName) ?? originalFileName)
+        : null;
       return {
         typeName: v8Frame.getTypeName(),
         functionName: v8Frame.getFunctionName(),
         methodName: v8Frame.getMethodName(),
-        fileName: fileName ?? null,
+        fileName,
         lineNumber: v8Frame.getLineNumber(),
         columnNumber: v8Frame.getColumnNumber(),
         evalOrigin: v8Frame.getEvalOrigin() ?? null,
@@ -81,17 +157,24 @@ export function registerPrepareStackTrace(modulesDir: string) {
         isEval: v8Frame.isEval(),
         isNative: v8Frame.isNative(),
         isConstructor: v8Frame.isConstructor(),
-        isAsync: (v8Frame as any).isAsync() as boolean,
-        isPromiseAll: (v8Frame as any).isPromiseAll() as boolean,
-        promiseIndex: (v8Frame as any).getPromiseIndex() as number | null,
+        isAsync: extendedFrame.isAsync(),
+        isPromiseAll: extendedFrame.isPromiseAll(),
+        promiseIndex: extendedFrame.getPromiseIndex(),
       };
     });
+    errorFrames.set(error, frameData);
     // We currently always go through JSON when going over the JS <-> Rust boundary. Eventually we can make this more efficient by accessing the V8 objects directly in Rust.
     const frameJSON = JSON.stringify(frameData);
     // Save the structured frame data on the exception so we can use it from Rust later.
-    Object.defineProperties(error, {
-      __frameData: { value: frameJSON, configurable: true },
-    });
+    try {
+      Object.defineProperties(error, {
+        __frameData: { value: frameJSON, configurable: true },
+      });
+    } catch {
+      // User code can freeze an Error or reserve this compatibility property.
+      // The private WeakMap remains authoritative for action and analysis
+      // error handling.
+    }
     // For now, we don't expose the source mapped stack to userspace: The only way to get a good traceback is to throw an exception and have the Rust layer catch it.
     // After evaluating a UDF and catching its error, the Rust layer loads the source map and does its best to get a good traceback.
     //
@@ -105,24 +188,110 @@ export function registerPrepareStackTrace(modulesDir: string) {
     return `Error${errorMessage !== "" ? `: ${errorMessage}` : ""}\n${frameData
       .map((frame) => formatTraceLine(frame))
       .join("\n")}`;
-  };
+  } finally {
+    stackTraceStats.durationMs += performance.now() - start;
+  }
+};
+
+export function tryInstallPrepareStackTrace(): boolean {
+  try {
+    if (globalThis.Error !== executorErrorConstructor) {
+      return false;
+    }
+    executorErrorConstructor.prepareStackTrace = prepareStackTrace;
+    return executorErrorConstructor.prepareStackTrace === prepareStackTrace;
+  } catch {
+    return false;
+  }
 }
 
-// Extract an error message from an exception throw by untrusted source.
-export function extractErrorMessage(e: any): string {
+export function installPrepareStackTrace() {
+  if (!tryInstallPrepareStackTrace()) {
+    throw new executorErrorConstructor(
+      "Cannot install the executor stack-trace formatter",
+    );
+  }
+}
+
+export function captureErrorFrames(error: unknown): FrameData[] {
+  if (!tryInstallPrepareStackTrace()) {
+    return [];
+  }
+  try {
+    // `instanceof` can invoke a Proxy's getPrototypeOf trap. Keep every
+    // operation on the untrusted thrown value inside this boundary.
+    if (!(error instanceof executorErrorConstructor)) {
+      return [];
+    }
+    // Accessing stack invokes prepareStackTrace unless user code already did so.
+    void error.stack;
+  } catch {
+    // User-defined Proxy traps or stack getters must not replace the original
+    // action error.
+    return [];
+  }
+  return errorFrames.get(error) ?? [];
+}
+
+export function registerPrepareStackTrace(modulesDir: string) {
+  const normalizedModulesDir = path.resolve(modulesDir);
+  // Install first so a user-defined non-writable hook cannot leave a root
+  // registered for a source package whose publication then fails.
+  installPrepareStackTrace();
+  userModulesDirs.set(
+    normalizedModulesDir,
+    (userModulesDirs.get(normalizedModulesDir) ?? 0) + 1,
+  );
+}
+
+export function unregisterPrepareStackTrace(modulesDir: string) {
+  const normalizedModulesDir = path.resolve(modulesDir);
+  const registrations = userModulesDirs.get(normalizedModulesDir);
+  if (registrations === undefined) {
+    throw new executorErrorConstructor(
+      "Cannot unregister an unknown stack-trace root",
+    );
+  }
+  if (registrations === 1) {
+    userModulesDirs.delete(normalizedModulesDir);
+  } else {
+    userModulesDirs.set(normalizedModulesDir, registrations - 1);
+  }
+}
+
+export function extractErrorName(e: unknown): string {
+  try {
+    if (typeof e === "object" && e !== null && "name" in e) {
+      const name = (e as { name?: unknown }).name;
+      return typeof name === "string" ? name : "";
+    }
+  } catch {
+    // A thrown Proxy can reject property access.
+  }
+  return "";
+}
+
+// Extract an error message from an exception thrown by untrusted source.
+export function extractErrorMessage(e: unknown): string {
   if (e === null || e === undefined) {
     return "unknown error";
   }
 
   try {
-    if (typeof e.message?.toString === "function") {
-      const errorMessage = e.message.toString();
+    const errorLike = e as {
+      message?: unknown;
+      toString?: () => unknown;
+    };
+    const message = errorLike.message;
+    const messageLike = message as { toString?: () => unknown } | null;
+    if (typeof messageLike?.toString === "function") {
+      const errorMessage = messageLike.toString();
       // Make sure toString() returns a string.
       if (typeof errorMessage === "string") {
         return errorMessage;
       }
-    } else if (typeof e.toString === "function") {
-      const errorMessage = e.toString();
+    } else if (typeof errorLike.toString === "function") {
+      const errorMessage = errorLike.toString();
       // Make sure toString() returns a string.
       if (typeof errorMessage === "string") {
         return errorMessage;
