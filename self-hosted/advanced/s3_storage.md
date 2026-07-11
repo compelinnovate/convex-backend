@@ -19,6 +19,10 @@ Optionally set the `S3_ENDPOINT_URL` environment variable. This is required for
 using [R2](https://www.cloudflare.com/developer-platform/products/r2/) or some
 other drop-in replacement compatible with the AWS S3 API.
 
+For ZIP snapshot imports, compatible endpoints must return exact
+`Content-Length`, `Content-Range`, and `ETag` headers for ranged `GetObject`
+requests and honor `If-Match`.
+
 Then run the backend!
 
 ## Migrating storage providers
@@ -37,3 +41,10 @@ Then set up a fresh backend with the new storage provider and import the data:
 ```sh
 npx convex import --replace-all <path-to-export-file>
 ```
+
+ZIP snapshot imports are downloaded to a local temporary file before parsing,
+including when the snapshot-import bucket uses S3. The backend host or
+container therefore needs temporary disk space for the full ZIP plus normal
+runtime headroom. The file uses the process's default temporary directory; on
+Unix, set `TMPDIR` before starting the backend to select another location. The
+temporary file is removed after the import's lazy archive readers are closed.

@@ -80,6 +80,7 @@ pub type ImportDocumentStream = BoxStream<'static, anyhow::Result<JsonValue>>;
 pub type ImportStorageFileStream =
     Box<dyn FnOnce() -> BoxStream<'static, anyhow::Result<Bytes>> + Send>;
 pub struct ParsedImport {
+    pub source_size: u64,
     pub generated_schemas: Vec<(ComponentPath, TableName, GeneratedSchema<ProdConfig>)>,
     pub documents: Vec<(ComponentPath, TableName, ImportDocumentStream)>,
     pub storage_files: BoxStream<
@@ -93,8 +94,10 @@ impl ParsedImport {
         component_path: ComponentPath,
         table_name: TableName,
         documents: ImportDocumentStream,
+        source_size: u64,
     ) -> Self {
         Self {
+            source_size,
             generated_schemas: vec![],
             documents: vec![(component_path, table_name, documents)],
             storage_files: stream::empty().boxed(),
@@ -158,13 +161,22 @@ pub async fn parse_import_file(
             .with_context(|| format!("Missing import object {fq_object_key:?}"))
     };
     match format {
-        ImportFormat::Csv(table_name) => Ok(ParsedImport::single_table(
-            component_path,
-            table_name,
-            parse_csv_import(stream_body().await?).boxed(),
-        )),
+        ImportFormat::Csv(table_name) => {
+            let body = stream_body().await?;
+            let source_size = u64::try_from(body.content_length)
+                .context("snapshot import object has a negative content length")?;
+            Ok(ParsedImport::single_table(
+                component_path,
+                table_name,
+                parse_csv_import(body).boxed(),
+                source_size,
+            ))
+        },
         ImportFormat::JsonLines(table_name) => {
-            let mut reader = stream_body().await?.into_reader();
+            let body = stream_body().await?;
+            let source_size = u64::try_from(body.content_length)
+                .context("snapshot import object has a negative content length")?;
+            let mut reader = body.into_reader();
             Ok(ParsedImport::single_table(
                 component_path,
                 table_name,
@@ -189,10 +201,13 @@ pub async fn parse_import_file(
                     }
                 })
                 .boxed(),
+                source_size,
             ))
         },
         ImportFormat::JsonArray(table_name) => {
             let reader = stream_body().await?;
+            let source_size = u64::try_from(reader.content_length)
+                .context("snapshot import object has a negative content length")?;
             let mut buf = Vec::new();
             let mut truncated_reader = reader
                 .into_reader()
@@ -215,11 +230,15 @@ pub async fn parse_import_file(
                 component_path,
                 table_name,
                 stream::iter(array.into_iter().map(Ok)).boxed(),
+                source_size,
             ))
         },
         ImportFormat::Zip => {
             let base_component_path = component_path;
-            let zip_reader = StorageZipArchive::open_fq(storage, fq_object_key).await?;
+            tracing::info!("Materializing snapshot import zip object before parsing");
+            let zip_reader =
+                StorageZipArchive::open_fq_materialized(storage, fq_object_key).await?;
+            let source_size = zip_reader.size();
 
             let mut generated_schemas = vec![];
             let mut documents = vec![];
@@ -274,6 +293,7 @@ pub async fn parse_import_file(
                 }
             });
             Ok(ParsedImport {
+                source_size,
                 generated_schemas,
                 documents,
                 storage_files: storage_files.boxed(),

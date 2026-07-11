@@ -32,6 +32,7 @@ errors = { workspace = true, features = ["testing"] }
 metrics = { workspace = true, features = ["testing"] }
 runtime = { workspace = true }
 storage = { workspace = true, features = ["testing"] }
+tempfile = { workspace = true }
 tokio-stream = { workspace = true }
 
 [lints]
