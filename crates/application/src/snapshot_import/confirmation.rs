@@ -5,7 +5,10 @@ use std::collections::{
 
 use anyhow::Context;
 use common::{
-    bootstrap_model::tables::TABLES_TABLE,
+    bootstrap_model::{
+        schema::SchemaState,
+        tables::TABLES_TABLE,
+    },
     components::ComponentPath,
     document::{
         ParsedDocument,
@@ -70,7 +73,7 @@ async fn messages_to_confirm_replace<RT: Runtime>(
     snapshot_import: ParsedDocument<SnapshotImport>,
 ) -> anyhow::Result<(Vec<String>, bool, Vec<ImportTableCheckpoint>)> {
     let mode = snapshot_import.mode;
-    let (_, import) = executor
+    let (initial_schemas, import) = executor
         .parse_import(snapshot_import.developer_id())
         .await?;
     // Find all tables being written to.
@@ -108,11 +111,12 @@ async fn messages_to_confirm_replace<RT: Runtime>(
     }
 
     let db_snapshot = executor.database.latest_snapshot()?;
+    let component_paths = db_snapshot.component_ids_to_paths();
+    let mut checkpoint_only_empty_schema_tables = BTreeSet::new();
 
     // Add to count_by_table all tables that are being replaced that don't appear in
     // the import.
     if mode == ImportMode::ReplaceAll {
-        let component_paths = db_snapshot.component_ids_to_paths();
         let table_mapping = db_snapshot.table_mapping();
         for (tablet_id, namespace, _, table_name) in table_mapping.iter() {
             let Some(component_path) = component_paths.get(&namespace.into()) else {
@@ -124,6 +128,25 @@ async fn messages_to_confirm_replace<RT: Runtime>(
             count_by_table
                 .entry((component_path.clone(), table_name.clone()))
                 .or_default();
+        }
+
+        // Execution prepares empty hidden tablets for active-schema tables even
+        // when they have no current physical table and do not appear in the
+        // source. Record checkpoints for those tablets without adding no-op rows
+        // to the confirmation summary.
+        for (namespace, schema_state, (_, schema)) in &initial_schemas {
+            if schema_state != &SchemaState::Active {
+                continue;
+            }
+            let Some(component_path) = component_paths.get(&(*namespace).into()) else {
+                continue;
+            };
+            for table_name in schema.tables.keys() {
+                let component_table = (component_path.clone(), table_name.clone());
+                if !count_by_table.contains_key(&component_table) {
+                    checkpoint_only_empty_schema_tables.insert(component_table);
+                }
+            }
         }
     }
 
@@ -218,6 +241,18 @@ async fn messages_to_confirm_replace<RT: Runtime>(
             existing_rows_to_delete: *deleted as i64,
             existing_rows_in_table: *existing as i64,
             is_missing_id_field: *is_missing_id_field,
+        });
+    }
+    for (component_path, table_name) in checkpoint_only_empty_schema_tables {
+        new_checkpoints.push(ImportTableCheckpoint {
+            component_path,
+            display_table_name: table_name,
+            tablet_id: None,
+            num_rows_written: 0,
+            total_num_rows_to_write: 0,
+            existing_rows_to_delete: 0,
+            existing_rows_in_table: 0,
+            is_missing_id_field: false,
         });
     }
     let mut message_lines = Vec::new();

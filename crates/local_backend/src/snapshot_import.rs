@@ -17,6 +17,7 @@ use common::{
             MtState,
             Query,
         },
+        ExtractRequestMetadata,
         HttpResponseError,
     },
 };
@@ -263,6 +264,37 @@ pub async fn perform_import(
     ))?;
     snapshot_import::perform_import(&st.application, identity, import_id).await?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairFailedImportFromCheckpointsArgs {
+    pub import_id: String,
+    #[serde(default)]
+    pub execute: bool,
+}
+
+pub async fn repair_failed_import_from_checkpoints(
+    MtState(st): MtState<LocalAppState>,
+    ExtractIdentity(identity): ExtractIdentity,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
+    Json(RepairFailedImportFromCheckpointsArgs { import_id, execute }): Json<
+        RepairFailedImportFromCheckpointsArgs,
+    >,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let import_id = DeveloperDocumentId::decode(&import_id).context(ErrorMetadata::bad_request(
+        "InvalidImport",
+        format!("invalid import id {import_id}"),
+    ))?;
+    let report = snapshot_import::repair_failed_import_from_checkpoints(
+        &st.application,
+        identity,
+        request_metadata,
+        import_id,
+        !execute,
+    )
+    .await?;
+    Ok(Json(report))
 }
 
 #[derive(Deserialize)]

@@ -191,6 +191,9 @@ Import│Worker imports       │
 │ Completed  │      │ Failed  │
 └────────────┘      └─────────┘
  */
+// Failed is terminal for the normal worker and operator state machine. The
+// privileged checkpoint repair path can move Failed to Completed only in the
+// same transaction that activates the repaired tables and writes the audit log.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ImportState {
     Uploaded,

@@ -236,11 +236,54 @@ impl<'a, RT: Runtime> SnapshotImportModel<'a, RT> {
         ts: Timestamp,
         num_rows_written: u64,
     ) -> anyhow::Result<()> {
+        let num_rows_written = i64::try_from(num_rows_written)
+            .context("snapshot import row count exceeds the completed-state representation")?;
         self.update_state(id, move |_| ImportState::Completed {
             ts,
-            num_rows_written: num_rows_written as i64,
+            num_rows_written,
         })
         .await
+    }
+
+    /// Used only by checkpoint repair after activation and audit writes have
+    /// been added to the same transaction.
+    pub async fn complete_failed_import_from_checkpoints(
+        &mut self,
+        id: DeveloperDocumentId,
+        ts: Timestamp,
+        num_rows_written: u64,
+    ) -> anyhow::Result<()> {
+        let num_rows_written = i64::try_from(num_rows_written)
+            .context("snapshot import row count exceeds the completed-state representation")?;
+        let (resolved_id, import) = self.must_get(id).await?.into_id_and_value();
+        match import.state {
+            ImportState::Failed(_) => {},
+            ImportState::Completed { .. } => {
+                anyhow::bail!(ErrorMetadata::bad_request(
+                    "ImportAlreadyCompleted",
+                    "import is already completed",
+                ))
+            },
+            _ => {
+                anyhow::bail!(ErrorMetadata::bad_request(
+                    "ImportNotFailed",
+                    format!("expected failed import, found {:?}", import.state),
+                ))
+            },
+        }
+        let completed_state = ImportState::Completed {
+            ts,
+            num_rows_written,
+        };
+        SystemMetadataModel::new_global(self.tx)
+            .patch(
+                resolved_id,
+                patch_value!(
+                    "state" => Some(ConvexValue::Object(completed_state.try_into()?))
+                )?,
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn fail_import(

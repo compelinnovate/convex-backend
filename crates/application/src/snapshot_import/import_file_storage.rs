@@ -1,5 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     str::FromStr,
 };
 
@@ -97,7 +100,11 @@ pub async fn import_storage_table<RT: Runtime>(
                 )
             )
         );
-        let content_length = metadata.size.map(|size| ContentLength(size as u64));
+        let content_length = metadata
+            .size
+            .map(|size| u64::try_from(size).map(ContentLength))
+            .transpose()
+            .map_err(|e| ImportError::InvalidConvexValue(lineno, e.into()))?;
         let content_type = metadata
             .content_type
             .map(|content_type| anyhow::Ok(ContentType::from_str(&content_type)?))
@@ -121,35 +128,83 @@ pub async fn import_storage_table<RT: Runtime>(
             .transpose()
             .map_err(|e| ImportError::InvalidConvexValue(lineno, e))?;
 
-        storage_metadata.insert(
-            id,
-            (
-                content_length,
-                content_type,
-                sha256,
-                storage_id,
-                creation_time,
-            ),
+        anyhow::ensure!(
+            storage_metadata
+                .insert(
+                    id,
+                    (
+                        content_length,
+                        content_type,
+                        sha256,
+                        storage_id,
+                        creation_time,
+                    ),
+                )
+                .is_none(),
+            ErrorMetadata::bad_request(
+                "DuplicateId",
+                format!("_storage metadata contains duplicate ID {id}"),
+            )
         );
     }
     let total_num_files = storage_metadata.len();
+    anyhow::ensure!(
+        num_to_skip <= total_num_files as u64,
+        ErrorMetadata::bad_request(
+            "InvalidImportCheckpoint",
+            format!(
+                "checkpoint for _storage{} has {num_to_skip} existing rows, but import contains \
+                 {total_num_files} metadata rows",
+                component_path.in_component_str(),
+            ),
+        )
+    );
+    let mut seen_storage_files = BTreeSet::new();
+    for (id, _) in &storage_files {
+        anyhow::ensure!(
+            seen_storage_files.insert(*id),
+            ErrorMetadata::bad_request(
+                "DuplicateId",
+                format!("_storage contains duplicate file entry for ID {id}"),
+            )
+        );
+        anyhow::ensure!(
+            storage_metadata.contains_key(id),
+            ErrorMetadata::bad_request(
+                "UnexpectedStorageFile",
+                format!("_storage contains file entry for ID {id} without matching metadata"),
+            )
+        );
+    }
+    if let Some(missing_id) = storage_metadata
+        .keys()
+        .find(|id| !seen_storage_files.contains(id))
+    {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "MissingStorageFile",
+            format!("_storage metadata references missing file entry for ID {missing_id}"),
+        ));
+    }
+
     let mut num_files = 0;
     for (id, file_chunks) in storage_files {
-        // The or_default means a storage file with a valid id will be imported
-        // even if it has been explicitly removed from _storage/documents.jsonl,
-        // to be robust to manual modifications.
         let (content_length, content_type, expected_sha256, storage_id, creation_time) =
-            storage_metadata.remove(&id).unwrap_or_default();
+            storage_metadata
+                .remove(&id)
+                .context("prevalidated _storage metadata disappeared")?;
+        if num_files < num_to_skip {
+            // Checkpoint resume must skip before reading the blob stream. The
+            // metadata row already exists, and re-uploading the blob would leak
+            // an unreferenced file object.
+            num_files += 1;
+            continue;
+        }
         let mut entry = file_storage
             .transactional_file_storage
             .upload_file(content_length, content_type, file_chunks(), expected_sha256)
             .await?;
         if let Some(storage_id) = storage_id {
             entry.storage_id = storage_id;
-        }
-        if num_files < num_to_skip {
-            num_files += 1;
-            continue;
         }
         let file_size = entry.size as u64;
         database
@@ -222,6 +277,7 @@ pub async fn import_storage_table<RT: Runtime>(
             .await;
         }
     }
+    anyhow::ensure!(storage_metadata.is_empty());
     if let Some(import_id) = import_id {
         add_checkpoint_message(
             database,
