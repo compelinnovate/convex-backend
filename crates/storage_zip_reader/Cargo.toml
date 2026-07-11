@@ -13,12 +13,12 @@ testing = ["common/testing", "errors/testing", "storage/testing"]
 
 [dependencies]
 anyhow = { workspace = true }
-bytes = { workspace = true }
 common = { workspace = true }
 errors = { workspace = true }
 futures = { workspace = true }
 rc-zip = { workspace = true }
 storage = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 

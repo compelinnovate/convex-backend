@@ -1,5 +1,7 @@
 use std::{
+    cmp,
     env,
+    io::SeekFrom,
     pin::Pin,
     time::{
         Duration,
@@ -11,10 +13,14 @@ use anyhow::Context;
 use async_trait::async_trait;
 use aws_config::retry::RetryConfig;
 use aws_sdk_s3::{
-    config::IdentityCache,
+    config::{
+        IdentityCache,
+        StalledStreamProtectionConfig,
+    },
     error::ProvideErrorMetadata,
     operation::{
         create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+        get_object::GetObjectError,
         head_object::{
             HeadObjectError,
             HeadObjectOutput,
@@ -82,7 +88,12 @@ use storage::{
     StorageUseCase,
     Upload,
     UploadId,
+    DOWNLOAD_CHUNK_SIZE,
     MAXIMUM_PARALLEL_UPLOADS,
+};
+use tokio::io::{
+    AsyncSeekExt,
+    AsyncWriteExt,
 };
 
 use crate::{
@@ -105,6 +116,9 @@ pub const ACCESS_KEY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const MIN_S3_INTERMEDIATE_PART_SIZE: usize = 5 * (1 << 20);
 /// S3 maximum part size for multipart upload is 5GiB
 const MAX_S3_INTERMEDIATE_PART_SIZE: usize = 5 * (1 << 30);
+const SNAPSHOT_IMPORT_S3_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const SNAPSHOT_IMPORT_S3_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const SNAPSHOT_IMPORT_S3_RANGE_RETRIES: usize = 5;
 
 #[derive(Clone)]
 pub struct S3Storage<RT: Runtime> {
@@ -215,6 +229,265 @@ impl<RT: Runtime> S3Storage<RT> {
         .await?;
         Ok(s3_upload)
     }
+
+    async fn download_snapshot_import_range_to_file(
+        &self,
+        bucket: &str,
+        s3_key: &str,
+        key: &FullyQualifiedObjectKey,
+        file: &mut tokio::fs::File,
+        range_start: u64,
+        range_end: u64,
+        object_size: u64,
+        expected_etag: &mut Option<String>,
+    ) -> Result<(), SnapshotImportRangeAttemptError> {
+        let mut request = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(s3_key)
+            .range(format!("bytes={range_start}-{}", range_end - 1));
+        if let Some(etag) = expected_etag.as_ref() {
+            request = request.if_match(etag);
+        }
+        let output = tokio::time::timeout(
+            SNAPSHOT_IMPORT_S3_REQUEST_TIMEOUT,
+            request
+                .customize()
+                .config_override(
+                    aws_sdk_s3::config::Builder::new()
+                        .stalled_stream_protection(StalledStreamProtectionConfig::disabled()),
+                )
+                .send(),
+        )
+        .await
+        .with_context(|| {
+            format!("timed out requesting object range {range_start}..{range_end} for {key:?}")
+        })
+        .map_err(SnapshotImportRangeAttemptError::Retryable)?
+        .map_err(|error| {
+            classify_snapshot_import_request_error(key, range_start, range_end, error)
+        })?;
+        validate_snapshot_import_range_response(
+            key,
+            range_start,
+            range_end,
+            object_size,
+            output.content_length(),
+            output.content_range(),
+        )
+        .map_err(SnapshotImportRangeAttemptError::Fatal)?;
+        validate_snapshot_import_etag(key, expected_etag, output.e_tag())
+            .map_err(SnapshotImportRangeAttemptError::Fatal)?;
+        write_snapshot_import_range_attempt(
+            key,
+            file,
+            range_start,
+            range_end,
+            output.body.into_stream(),
+            SNAPSHOT_IMPORT_S3_READ_IDLE_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum SnapshotImportRangeAttemptError {
+    // The SDK retries request failures internally. The bounded outer retry also
+    // covers an exhausted SDK request and starts a new request after a body
+    // transport failure.
+    Retryable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl SnapshotImportRangeAttemptError {
+    #[cfg(test)]
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Retryable(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
+fn classify_snapshot_import_request_error(
+    key: &FullyQualifiedObjectKey,
+    range_start: u64,
+    range_end: u64,
+    error: aws_sdk_s3::error::SdkError<GetObjectError>,
+) -> SnapshotImportRangeAttemptError {
+    let retryable = match &error {
+        aws_sdk_s3::error::SdkError::TimeoutError(_)
+        | aws_sdk_s3::error::SdkError::DispatchFailure(_)
+        | aws_sdk_s3::error::SdkError::ResponseError(_) => true,
+        aws_sdk_s3::error::SdkError::ServiceError(service_error) => {
+            let status = service_error.raw().status().as_u16();
+            status == 408 || status == 429 || status >= 500
+        },
+        aws_sdk_s3::error::SdkError::ConstructionFailure(_) => false,
+        // New SDK error variants need an explicit retry decision before they
+        // are safe to retry in a restore workflow.
+        _ => false,
+    };
+    let error = anyhow::Error::new(error).context(format!(
+        "download object range {range_start}..{range_end} for {key:?}"
+    ));
+    if retryable {
+        SnapshotImportRangeAttemptError::Retryable(error)
+    } else {
+        SnapshotImportRangeAttemptError::Fatal(error)
+    }
+}
+
+fn validate_snapshot_import_etag(
+    key: &FullyQualifiedObjectKey,
+    expected_etag: &mut Option<String>,
+    response_etag: Option<&str>,
+) -> anyhow::Result<()> {
+    let response_etag = response_etag
+        .with_context(|| format!("Missing ETag while materializing object {key:?}"))?;
+    match expected_etag.as_deref() {
+        Some(expected_etag) => {
+            anyhow::ensure!(
+                response_etag == expected_etag,
+                "Object {key:?} changed while it was being materialized: range response ETag \
+                 {response_etag:?} does not match {expected_etag:?}"
+            );
+        },
+        None => *expected_etag = Some(response_etag.to_owned()),
+    }
+    Ok(())
+}
+
+fn validate_snapshot_import_range_response(
+    key: &FullyQualifiedObjectKey,
+    range_start: u64,
+    range_end: u64,
+    object_size: u64,
+    content_length: Option<i64>,
+    content_range: Option<&str>,
+) -> anyhow::Result<()> {
+    let expected_range_len = range_end - range_start;
+    let content_length = content_length.with_context(|| {
+        format!("Missing content length for object range {range_start}..{range_end} for {key:?}")
+    })?;
+    anyhow::ensure!(
+        content_length >= 0 && content_length as u64 == expected_range_len,
+        "Downloaded object range {range_start}..{range_end} for {key:?} has content length \
+         {content_length}, expected {expected_range_len}"
+    );
+    let expected_content_range = format!("bytes {range_start}-{}/{object_size}", range_end - 1);
+    let content_range = content_range.with_context(|| {
+        format!("Missing content range for object range {range_start}..{range_end} for {key:?}")
+    })?;
+    let parsed_content_range =
+        parse_snapshot_import_content_range(content_range).with_context(|| {
+            format!(
+                "Downloaded object range {range_start}..{range_end} for {key:?} has invalid \
+                 content range {content_range:?}, expected {expected_content_range:?}"
+            )
+        })?;
+    anyhow::ensure!(
+        parsed_content_range == (range_start, range_end - 1, object_size),
+        "Downloaded object range {range_start}..{range_end} for {key:?} has content range \
+         {content_range:?}, expected {expected_content_range:?}"
+    );
+    Ok(())
+}
+
+fn parse_snapshot_import_content_range(content_range: &str) -> anyhow::Result<(u64, u64, u64)> {
+    let parse_decimal = |value: &str| -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+            "expected an unsigned decimal integer"
+        );
+        value.parse().context("content range integer is too large")
+    };
+    let (range_unit, range) = content_range
+        .split_once(' ')
+        .context("content range is missing its range unit")?;
+    anyhow::ensure!(
+        range_unit.eq_ignore_ascii_case("bytes"),
+        "content range unit is not bytes"
+    );
+    let (range, total) = range
+        .split_once('/')
+        .context("content range is missing its object size")?;
+    let (start, end) = range
+        .split_once('-')
+        .context("content range is missing its byte interval")?;
+    Ok((
+        parse_decimal(start)?,
+        parse_decimal(end)?,
+        parse_decimal(total)?,
+    ))
+}
+
+async fn write_snapshot_import_range_attempt<S, E>(
+    key: &FullyQualifiedObjectKey,
+    file: &mut tokio::fs::File,
+    range_start: u64,
+    range_end: u64,
+    mut stream: S,
+    read_idle_timeout: Duration,
+) -> Result<(), SnapshotImportRangeAttemptError>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    // A failed attempt may already have written a prefix of this range.
+    file.seek(SeekFrom::Start(range_start))
+        .await
+        .with_context(|| format!("seek materialized S3 object to byte {range_start}"))
+        .map_err(SnapshotImportRangeAttemptError::Fatal)?;
+    let expected_range_len = range_end - range_start;
+    let mut range_bytes = 0;
+    let mut read_idle_deadline = tokio::time::Instant::now() + read_idle_timeout;
+    loop {
+        // `timeout_at` can prefer an immediately-ready stream item even after
+        // its deadline, so check explicitly before polling another empty frame.
+        if tokio::time::Instant::now() >= read_idle_deadline {
+            return Err(SnapshotImportRangeAttemptError::Retryable(anyhow::anyhow!(
+                "timed out reading object range {range_start}..{range_end} for {key:?}"
+            )));
+        }
+        let next_chunk = tokio::time::timeout_at(read_idle_deadline, stream.try_next())
+            .await
+            .with_context(|| {
+                format!("timed out reading object range {range_start}..{range_end} for {key:?}")
+            })
+            .map_err(SnapshotImportRangeAttemptError::Retryable)?
+            .with_context(|| format!("read object range {range_start}..{range_end} for {key:?}"))
+            .map_err(SnapshotImportRangeAttemptError::Retryable)?;
+        let Some(bytes) = next_chunk else {
+            break;
+        };
+        if bytes.is_empty() {
+            // Empty HTTP data frames are not byte progress. Yield so an
+            // immediately-ready stream cannot starve the idle deadline.
+            tokio::task::yield_now().await;
+            continue;
+        }
+        range_bytes += bytes.len() as u64;
+        if range_bytes > expected_range_len {
+            return Err(SnapshotImportRangeAttemptError::Fatal(anyhow::anyhow!(
+                "Downloaded too many bytes for object range {range_start}..{range_end} for \
+                 {key:?}: {range_bytes}, expected {expected_range_len}"
+            )));
+        }
+        file.write_all(&bytes)
+            .await
+            .context("write materialized S3 object range")
+            .map_err(SnapshotImportRangeAttemptError::Fatal)?;
+        read_idle_deadline = tokio::time::Instant::now() + read_idle_timeout;
+    }
+    if range_bytes != expected_range_len {
+        return Err(SnapshotImportRangeAttemptError::Retryable(anyhow::anyhow!(
+            "Downloaded {range_bytes} bytes for object range {range_start}..{range_end} for \
+             {key:?}, expected {expected_range_len}"
+        )));
+    }
+    Ok(())
 }
 
 async fn s3_client() -> Result<Client, anyhow::Error> {
@@ -508,9 +781,11 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
             .await;
         match result {
             Ok(head_attributes) => {
-                let size = head_attributes
+                let content_length = head_attributes
                     .content_length
-                    .context("Object is missing size")? as u64;
+                    .context("Object is missing size")?;
+                let size =
+                    u64::try_from(content_length).context("Object has invalid negative size")?;
                 Ok(Some(ObjectAttributes { size }))
             },
             Err(aws_sdk_s3::error::SdkError::ServiceError(err)) => match err.err() {
@@ -521,6 +796,79 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
             // Unable to get a response from S3 (e.g. timeout error)
             Err(err) => Err(err.into()),
         }
+    }
+
+    async fn download_fq_object_to_file(
+        &self,
+        key: &FullyQualifiedObjectKey,
+        file: &mut tokio::fs::File,
+        expected_size: u64,
+    ) -> anyhow::Result<u64> {
+        let (bucket, s3_key) = key
+            .as_str()
+            .split_once('/')
+            .with_context(|| format!("Invalid fully qualified S3 key {key:?}"))?;
+        file.set_len(0)
+            .await
+            .context("truncate materialized S3 object")?;
+        file.seek(SeekFrom::Start(0))
+            .await
+            .context("seek materialized S3 object to start")?;
+        let mut copied_bytes = 0;
+        let mut expected_etag = None;
+        while copied_bytes < expected_size {
+            let range_start = copied_bytes;
+            let range_end = cmp::min(
+                range_start.saturating_add(DOWNLOAD_CHUNK_SIZE),
+                expected_size,
+            );
+            let mut retries_remaining = SNAPSHOT_IMPORT_S3_RANGE_RETRIES;
+            loop {
+                match self
+                    .download_snapshot_import_range_to_file(
+                        bucket,
+                        s3_key,
+                        key,
+                        file,
+                        range_start,
+                        range_end,
+                        expected_size,
+                        &mut expected_etag,
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(SnapshotImportRangeAttemptError::Retryable(e)) if retries_remaining > 0 => {
+                        let mut toreport = e.context(format!(
+                            "failed to materialize snapshot import range \
+                             {range_start}..{range_end} for {key:?}. {retries_remaining} attempts \
+                             remaining"
+                        ));
+                        report_error(&mut toreport).await;
+                        retries_remaining -= 1;
+                    },
+                    Err(SnapshotImportRangeAttemptError::Retryable(e)) => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "failed to materialize snapshot import range \
+                                 {range_start}..{range_end} for {key:?} after \
+                                 {SNAPSHOT_IMPORT_S3_RANGE_RETRIES} retries"
+                            )
+                        });
+                    },
+                    Err(SnapshotImportRangeAttemptError::Fatal(e)) => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "failed to materialize snapshot import range \
+                                 {range_start}..{range_end} for {key:?}"
+                            )
+                        });
+                    },
+                }
+            }
+            copied_bytes = range_end;
+        }
+        Ok(copied_bytes)
     }
 
     fn storage_type_proto(&self) -> pb::searchlight::StorageType {
@@ -865,4 +1213,182 @@ pub fn s3_bucket_name(use_case: &StorageUseCase) -> anyhow::Result<String> {
     ))
 }
 
-// Test below only works if you have AWS environment variables set
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{
+            self,
+            SeekFrom,
+        },
+        time::Duration,
+    };
+
+    use bytes::Bytes;
+    use futures::stream;
+    use tempfile::NamedTempFile;
+    use tokio::io::{
+        AsyncReadExt,
+        AsyncSeekExt,
+        AsyncWriteExt,
+    };
+
+    use super::{
+        validate_snapshot_import_etag,
+        validate_snapshot_import_range_response,
+        write_snapshot_import_range_attempt,
+        SnapshotImportRangeAttemptError,
+    };
+
+    #[test]
+    fn snapshot_import_range_response_requires_exact_content_range() {
+        let key = "bucket/object".to_string().into();
+        validate_snapshot_import_range_response(&key, 8, 12, 20, Some(4), Some("bytes 8-11/20"))
+            .unwrap();
+        validate_snapshot_import_range_response(
+            &key,
+            8,
+            12,
+            20,
+            Some(4),
+            Some("Bytes 008-011/020"),
+        )
+        .unwrap();
+
+        for invalid_content_range in [
+            "bytes 0-3/20",
+            "bytes 8-12/20",
+            "bytes 8-11/21",
+            "bytes 8-11/*",
+            "items 8-11/20",
+        ] {
+            let error = validate_snapshot_import_range_response(
+                &key,
+                8,
+                12,
+                20,
+                Some(4),
+                Some(invalid_content_range),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("expected \"bytes 8-11/20\""),
+                "unexpected error: {error:#}",
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_import_ranges_require_one_object_version() {
+        let key = "bucket/object".to_string().into();
+        let mut expected_etag = None;
+        validate_snapshot_import_etag(&key, &mut expected_etag, Some("etag-a")).unwrap();
+        assert_eq!(expected_etag.as_deref(), Some("etag-a"));
+
+        let error =
+            validate_snapshot_import_etag(&key, &mut expected_etag, Some("etag-b")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("changed while it was being materialized"),
+            "unexpected error: {error:#}",
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_import_range_retry_overwrites_partial_attempt() -> anyhow::Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp_file.path())
+            .await?;
+        file.write_all(b"01......89").await?;
+        let key = "bucket/object".to_string().into();
+
+        let short_stream = stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"bad"))]);
+        let error = write_snapshot_import_range_attempt(
+            &key,
+            &mut file,
+            2,
+            8,
+            short_stream,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotImportRangeAttemptError::Retryable(_)
+        ));
+        let error = error.into_inner();
+        assert!(
+            format!("{error:#}").contains("Downloaded 3 bytes"),
+            "unexpected error: {error:#}",
+        );
+
+        let overread_stream = stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"toolong"))]);
+        let error = write_snapshot_import_range_attempt(
+            &key,
+            &mut file,
+            2,
+            8,
+            overread_stream,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SnapshotImportRangeAttemptError::Fatal(_)));
+
+        let complete_stream = stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"ABC")),
+            Ok::<_, io::Error>(Bytes::from_static(b"DEF")),
+        ]);
+        write_snapshot_import_range_attempt(
+            &key,
+            &mut file,
+            2,
+            8,
+            complete_stream,
+            Duration::from_secs(1),
+        )
+        .await
+        .map_err(SnapshotImportRangeAttemptError::into_inner)?;
+        file.flush().await?;
+        file.seek(SeekFrom::Start(0)).await?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await?;
+        assert_eq!(bytes, b"01ABCDEF89");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_import_empty_chunks_do_not_reset_read_idle_timeout() -> anyhow::Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp_file.path())
+            .await?;
+        let key = "bucket/object".to_string().into();
+        let empty_stream = stream::repeat_with(|| Ok::<_, io::Error>(Bytes::new()));
+
+        let error = write_snapshot_import_range_attempt(
+            &key,
+            &mut file,
+            0,
+            1,
+            empty_stream,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotImportRangeAttemptError::Retryable(_)
+        ));
+        let error = error.into_inner();
+        assert!(
+            format!("{error:#}").contains("timed out reading object range"),
+            "unexpected error: {error:#}",
+        );
+        Ok(())
+    }
+}

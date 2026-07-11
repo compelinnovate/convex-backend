@@ -366,6 +366,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
     ) -> anyhow::Result<(Timestamp, u64)> {
         self.fail_if_too_old(&snapshot_import)?;
         let (initial_schemas, import) = self.parse_import(snapshot_import.developer_id()).await?;
+        let source_size = import.source_size;
 
         let usage = FunctionUsageTracker::new();
 
@@ -382,26 +383,12 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
         )
         .await?;
 
-        let object_attributes = (match &snapshot_import.object_key {
-            Ok(key) => {
-                self.snapshot_imports_storage
-                    .get_fq_object_attributes(key)
-                    .await
-            },
-            Err(key) => {
-                self.snapshot_imports_storage
-                    .get_object_attributes(key)
-                    .await
-            },
-        })?
-        .context("error getting export object attributes from S3")?;
-
         // Charge file bandwidth for the download of the snapshot from imports storage
         usage
             .track_storage_egress(
                 ComponentPath::root(),
                 snapshot_import.requestor.usage_tag().to_string(),
-                object_attributes.size,
+                source_size,
             )
             .await;
 
