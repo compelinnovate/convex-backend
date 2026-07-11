@@ -13,8 +13,19 @@ WORKDIR /tmp
 COPY rust-toolchain .
 # Dummy command to just fetch the toolchain that'll get installed by running `cargo chef`
 RUN rustup self update && rustup toolchain install
+# The pinned nightly supports shallow Git dependencies, including when Cargo
+# delegates fetching to the Git CLI. This avoids cloning reachable history for
+# exact revisions.
+ENV CARGO_UNSTABLE_GIT=shallow-deps
 COPY --parents crates* Cargo* ./
-RUN cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
+COPY .cargo ./.cargo
+# Exclusive cache mounts make it safe to remove Git locks left by a canceled
+# BuildKit step before Cargo accesses the persistent repositories.
+RUN --mount=type=cache,id=convex-backend-cargo-git-db,target=/usr/local/cargo/git/db,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-checkouts,target=/usr/local/cargo/git/checkouts,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    find /usr/local/cargo/git -type f -name '*.lock' -delete && \
+    cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
 
 # Build stage: Compiles the Rust backend with all dependencies
 # Uses cargo-chef's recipe from the previous stage for optimal caching
@@ -55,14 +66,11 @@ EOF
 COPY rust-toolchain /rust-toolchain
 # Dummy command to just fetch the toolchain and cargo index
 RUN rustup self update && rustup toolchain install && cargo search -q convex
+ENV CARGO_UNSTABLE_GIT=shallow-deps
 
 WORKDIR /convex
 COPY scripts ./scripts
 RUN npm ci --prefix scripts/
-
-COPY npm-packages ./npm-packages
-COPY Justfile ./
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked just install-js
 
 # Provision protoc via mise before the cargo layers (version + checksum from
 # mise.toml/mise.lock; mise's own version from min_version). mise lives only in
@@ -78,13 +86,46 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="v$(sed -nE 's/^min_version = "([
 
 # Cargo reads .cargo/config.toml (e.g. RUSTY_V8_MIRROR, which redirects the V8
 # static-lib download to our fork) via hierarchical discovery from the working
-# directory, so it must be present before `cargo chef cook` builds dependencies.
-COPY .cargo/config.toml ./.cargo/config.toml
+# directory, so the complete Cargo configuration must be present before
+# `cargo chef cook` builds dependencies.
+COPY .cargo ./.cargo
 COPY --from=chef /tmp/recipe.json recipe.json
+ARG CARGO_BUILD_PROFILE=release
+ARG CARGO_PROFILE_RELEASE_DEBUG=
+ARG CARGO_PROFILE_RELEASE_STRIP=
+ARG TARGETARCH
+# Keep cargo-chef and the final build on the mounted target cache. This also
+# makes the artifact paths below independent of Cargo config target-dir changes.
+ENV CARGO_TARGET_DIR=/convex/target
+# cargo-chef removes dummy workspace artifacts after Cargo releases its own
+# target lock. Lock all partially mounted Cargo caches across concurrent builds;
+# TARGETARCH also keeps native artifacts from different platforms separate.
 # Use cargo-chef to build dependencies from the recipe created in the first stage
 # This step will be cached unless dependencies change
-RUN --mount=type=cache,target=/convex/target/ --mount=type=cache,target=/usr/local/cargo/git/db --mount=type=cache,target=/usr/local/cargo/registry/ PROTOC="$(mise which protoc)" cargo chef cook --release --recipe-path recipe.json
-# Now copy everything else over -- we've minimized the set of files that cause a full `pnpm install` or `cargo build` to run.
+RUN --mount=type=cache,id=convex-backend-target-${TARGETARCH},target=/convex/target,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-db,target=/usr/local/cargo/git/db,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-checkouts,target=/usr/local/cargo/git/checkouts,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-registry,target=/usr/local/cargo/registry,sharing=locked <<EOF
+set -euo pipefail
+find /usr/local/cargo/git -type f -name '*.lock' -delete
+: "${CARGO_BUILD_PROFILE:?CARGO_BUILD_PROFILE must not be empty}"
+if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
+  export CARGO_PROFILE_RELEASE_DEBUG
+else
+  unset CARGO_PROFILE_RELEASE_DEBUG
+fi
+if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
+  export CARGO_PROFILE_RELEASE_STRIP
+else
+  unset CARGO_PROFILE_RELEASE_STRIP
+fi
+PROTOC="$(mise which protoc)" cargo chef cook --profile "$CARGO_BUILD_PROFILE" --recipe-path recipe.json
+EOF
+# Copy first-party Rust and JavaScript sources only after dependency cooking.
+# isolate's build script installs the frozen JavaScript workspace with lifecycle
+# scripts disabled and builds the packages embedded in the backend. A separate
+# `just install-js` here duplicates that install and downloads unrelated browser
+# artifacts whenever package source changes.
 COPY . .
 
 # Build the convex-local-backend binary
@@ -93,15 +134,58 @@ ARG VERGEN_GIT_SHA
 ARG VERGEN_GIT_COMMIT_TIMESTAMP
 ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
 ENV VERGEN_GIT_COMMIT_TIMESTAMP=${VERGEN_GIT_COMMIT_TIMESTAMP}
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked --mount=type=cache,target=/convex/target/ --mount=type=cache,target=/usr/local/cargo/git/db --mount=type=cache,target=/usr/local/cargo/registry/ <<EOF
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
+    --mount=type=cache,id=convex-backend-target-${TARGETARCH},target=/convex/target,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-db,target=/usr/local/cargo/git/db,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-checkouts,target=/usr/local/cargo/git/checkouts,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-registry,target=/usr/local/cargo/registry,sharing=locked <<EOF
+set -euo pipefail
+find /usr/local/cargo/git -type f -name '*.lock' -delete
+if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
+  export CARGO_PROFILE_RELEASE_DEBUG
+else
+  unset CARGO_PROFILE_RELEASE_DEBUG
+fi
+if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
+  export CARGO_PROFILE_RELEASE_STRIP
+else
+  unset CARGO_PROFILE_RELEASE_STRIP
+fi
 export PROTOC="$(mise which protoc)"
-cargo build --release -p local_backend --bin convex-local-backend
-cp target/release/convex-local-backend .
-cargo build --release -p keybroker --bin generate_key
-cp target/release/generate_key .
+artifact_dir=/convex/backend-artifacts
+mkdir "$artifact_dir"
+# The pinned nightly Cargo copies each requested binary and final companion
+# artifacts such as packed split-debuginfo files out of the cache mount.
+cargo -Z unstable-options build \
+  --artifact-dir "$artifact_dir" \
+  --profile "$CARGO_BUILD_PROFILE" \
+  -p local_backend \
+  --bin convex-local-backend
+test -x "$artifact_dir/convex-local-backend"
+cargo -Z unstable-options build \
+  --artifact-dir "$artifact_dir" \
+  --profile "$CARGO_BUILD_PROFILE" \
+  -p keybroker \
+  --bin generate_key
+test -x "$artifact_dir/generate_key"
 EOF
 ARG debug
-RUN if [[ -z "$debug" ]]; then strip ./convex-local-backend; strip ./generate_key; fi
+RUN <<EOF
+set -euo pipefail
+cargo_profile_release_debug="${CARGO_PROFILE_RELEASE_DEBUG:-}"
+# Keep the legacy GNU strip only for release builds where Cargo was not asked
+# to control stripping or emit debuginfo.
+if [[ -z "${debug:-}" &&
+      "${CARGO_BUILD_PROFILE:-release}" == "release" &&
+      -z "${CARGO_PROFILE_RELEASE_STRIP:-}" ]]; then
+  case "${cargo_profile_release_debug,,}" in
+    ""|false|0|none)
+      strip ./backend-artifacts/convex-local-backend
+      strip ./backend-artifacts/generate_key
+      ;;
+  esac
+fi
+EOF
 
 # Final stage: Creates minimal runtime image with only necessary components
 # Uses Ubuntu Noble (24.04) as the base image
@@ -127,8 +211,8 @@ RUN ln -sf /usr/lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
     chmod +x /usr/bin/npm
 RUN ln -sf /usr/lib/node_modules/npm/bin/npx-cli.js /usr/bin/npx && \
     chmod +x /usr/bin/npx
-COPY --from=build --chmod=744 /convex/convex-local-backend .
-COPY --from=build --chmod=744 /convex/generate_key .
+COPY --from=build /convex/backend-artifacts/ ./
+RUN chmod 744 ./convex-local-backend ./generate_key
 COPY --chmod=744 self-hosted/docker-build/read_credentials.sh .
 COPY --chmod=744 self-hosted/docker-build/run_backend.sh .
 COPY --chmod=744 self-hosted/docker-build/generate_admin_key.sh .

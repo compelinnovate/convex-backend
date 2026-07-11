@@ -11,6 +11,29 @@ Build the backend from scratch by running:
 docker build -t convex-backend -f self-hosted/docker-build/Dockerfile.backend .
 ```
 
+The backend build uses Cargo's `release` profile by default. Select another
+built-in or custom workspace profile with `CARGO_BUILD_PROFILE`:
+
+```sh
+docker build \
+  -t convex-backend \
+  -f self-hosted/docker-build/Dockerfile.backend \
+  --build-arg CARGO_BUILD_PROFILE=slim-release \
+  .
+```
+
+For a release profiling build, request Cargo debuginfo and disable both Cargo's
+strip setting and the Dockerfile's final strip pass:
+
+```sh
+docker build \
+  -t convex-backend \
+  -f self-hosted/docker-build/Dockerfile.backend \
+  --build-arg CARGO_PROFILE_RELEASE_DEBUG=1 \
+  --build-arg CARGO_PROFILE_RELEASE_STRIP=none \
+  .
+```
+
 Build the dashboard from scratch by running:
 
 ```sh
