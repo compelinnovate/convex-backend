@@ -1,3 +1,4 @@
+use common::types::UdfType;
 use metrics::{
     log_counter,
     log_counter_with_labels,
@@ -34,6 +35,37 @@ pub(crate) fn log_function_limit_warning(
         ],
     };
     log_counter_with_labels(&FUNCTION_LIMIT_WARNING_TOTAL, 1, labels);
+}
+
+register_convex_counter!(
+    CONTEXT_REUSE_DECISION_TOTAL,
+    "Number of validated marked UDF attempts by effective context reuse decision",
+    &["udf_type", "decision"],
+    std::time::Duration::MAX,
+);
+
+pub(crate) fn log_context_reuse_decision(udf_type: UdfType, reuse_context_enabled: bool) {
+    let udf_type = match udf_type {
+        UdfType::Query => "query",
+        UdfType::Mutation => "mutation",
+        UdfType::Action => "action",
+        UdfType::HttpAction => "http_action",
+    };
+    log_counter_with_labels(
+        &CONTEXT_REUSE_DECISION_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("udf_type", udf_type),
+            StaticMetricLabel::new(
+                "decision",
+                if reuse_context_enabled {
+                    "allowed"
+                } else {
+                    "disabled"
+                },
+            ),
+        ],
+    );
 }
 
 pub fn is_developer_ok(outcome: &FunctionOutcome) -> bool {

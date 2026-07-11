@@ -3,10 +3,10 @@
 There is a large number of detailed configuration options in
 [knobs.rs](/crates/common/src/knobs.rs). These options are configurable via
 environment variables. In order to tune your Convex instance at scale for your
-workload, you may need to adjust these knobs. You will have to set these
-environment variables by adding them to your `docker-compose.yml` file. Commonly
-overriden knobs are listed in the `env` section of the
-[`docker-compose.yml`](../docker/docker-compose.yml)
+workload, you may need to adjust these knobs. The stock Compose file passes
+commonly overridden knobs from the host environment or Compose `.env` file.
+Add other variables to the backend service's `environment` section in
+[`docker-compose.yml`](../docker/docker-compose.yml).
 
 ## Backend memory feasibility and local Node lifetime
 
@@ -81,8 +81,11 @@ the pressure signal only after headroom reaches
 `LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES`, which defaults to 8 GiB.
 
 On entry, the controller first evaluates an optional glibc trim and resamples cgroup headroom. If
-pressure remains, it publishes one shared signal. The local Node watchdog gracefully retires its
-generation only after the signal has remained active for
+pressure remains, it publishes one shared signal. When the bounded context-reuse patch is also
+carried, idle isolates drop their fresh context, prune the reusable cache from its normal
+one-probationary-plus-five-protected capacity to the two strongest protected entries, suppress new
+reusable admission, and ask V8 to collect after removing roots. The local Node watchdog gracefully
+retires its generation only after the signal has remained active for
 `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS` and a successful direct-child RSS sample reaches
 `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`. The ordinary Node RSS limit remains the
 higher-priority retirement reason.
@@ -327,6 +330,35 @@ A one-worker pool cannot run a function and a separately scheduled descendant
 at the same time. Use at least two workers and a reserve of at least one for
 applications with these call patterns. The reserve is finite; deep chains or
 parallel fanout can still consume every worker and queue entry.
+
+## `ISOLATE_CONTEXT_CACHE_PROTECTED_RESIDENTS_PER_ISOLATE`
+
+The context-reuse patch retains one probationary reusable context plus a configurable
+frequency-protected segment in each isolate worker. This setting controls the protected segment and
+defaults to `5`, producing the default `5+1` layout. Values below `2`, malformed values, addition or
+frequency-aging overflow, and values above the platform permit bound fail backend startup. The
+minimum preserves the separate pressure layout, which removes the probationary resident and keeps
+at most the two strongest protected entries.
+
+Changing this value also changes the structural maximum used to validate
+`ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS`. The maintained Docker Compose file passes the setting through
+without overriding the backend default. Changing it requires a backend restart.
+
+## `ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS`
+
+By default, the scheduler-pool resident-token capacity is the configured per-isolate protected
+capacity plus one probationary resident, multiplied by `MAX_ISOLATE_WORKERS`. Set
+`ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS` to a smaller positive decimal value when the backend memory
+allocation cannot support full population. Values greater than the structural maximum, zero,
+malformed values, and multiplication overflow fail backend startup.
+
+The limit applies to database-UDF, ordinary-action, and HTTP-action reusable contexts together. A
+token remains owned while a cache hit is in flight, so a returning context cannot lose its capacity
+to another worker. The setting does not change V8 user or extra heap limits, does not enable context
+reuse, and does not make mutable module state safe. The maintained Docker Compose file passes the
+variable through without a default. Changing it requires a backend restart. See
+[`patches/context_reuse/README.md`](../../patches/context_reuse/README.md)
+for admission, memory pressure, metrics, rollout, and rollback behavior.
 
 ## `FUNRUN_ISOLATE_ACTIVE_THREADS`
 

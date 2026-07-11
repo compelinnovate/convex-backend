@@ -4,13 +4,25 @@ package common;
 
 import "google/protobuf/empty.proto";
 
+// Omitted permissions are false.
+message ContextReusePolicy {
+  optional bool queries = 1;
+  optional bool mutations = 2;
+  optional bool actions = 3;
+  optional bool http_actions = 4;
+}
+
 message ValidatedPathAndArgs {
   optional string path = 1;
   optional bytes args = 2;
   optional string npm_version = 3;
   optional ComponentPath component_path = 4;
   optional string component_id = 5;
+  // Legacy query/mutation marker. New consumers use it only when the typed
+  // policy is absent and still combine it with the request's UdfType.
   optional bool reuse_context = 6;
+  // Authoritative when present.
+  optional ContextReusePolicy context_reuse = 7;
 }
 
 message ValidatedHttpPath {
@@ -18,7 +30,10 @@ message ValidatedHttpPath {
   optional ComponentPath component_path = 22;
   optional string component_id = 3;
   optional string npm_version = 4;
+  // Legacy database-module marker. HTTP action reuse does not use this field.
   optional bool reuse_context = 5;
+  // Authoritative when present.
+  optional ContextReusePolicy context_reuse = 6;
 }
 
 message ComponentPath {

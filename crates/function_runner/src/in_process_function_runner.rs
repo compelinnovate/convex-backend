@@ -25,9 +25,13 @@ use common::{
     http::fetch::FetchClient,
     knobs::{
         FUNRUN_ISOLATE_ACTIVE_THREADS,
+        FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN,
+        FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN,
+        MAX_ISOLATE_WORKERS,
         SUBFUNCTIONS_IN_SAME_ISOLATE,
     },
     log_lines::LogLine,
+    memory_pressure::MemoryPressureSignal,
     persistence::{
         PersistenceReader,
         RepeatablePersistence,
@@ -61,6 +65,7 @@ use futures::{
 use isolate::{
     isolate_worker::FunctionRunnerIsolateWorker,
     ConcurrencyLimiter,
+    IsolateClient,
     IsolateConfig,
 };
 use keybroker::{
@@ -131,6 +136,11 @@ pub struct InProcessFunctionRunner<RT: Runtime> {
 const ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY: Duration = Duration::from_secs(10);
 
 impl<RT: Runtime> InProcessFunctionRunner<RT> {
+    pub fn preflight_context_cache_configuration() -> anyhow::Result<()> {
+        let _ = IsolateClient::<RT>::preflight_context_cache_capacity(*MAX_ISOLATE_WORKERS)?;
+        Ok(())
+    }
+
     pub fn new(
         deployment: DeploymentMetadata,
         keybroker: FunctionRunnerKeyBroker,
@@ -141,8 +151,41 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
         database: Database<RT>,
         fetch_client: Arc<dyn FetchClient>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_memory_pressure(
+            deployment,
+            keybroker,
+            convex_origin,
+            rt,
+            persistence_reader,
+            storage,
+            database,
+            fetch_client,
+            MemoryPressureSignal::default(),
+        )
+    }
+
+    pub fn new_with_memory_pressure(
+        deployment: DeploymentMetadata,
+        keybroker: FunctionRunnerKeyBroker,
+        convex_origin: ConvexOrigin,
+        rt: RT,
+        persistence_reader: Arc<dyn PersistenceReader>,
+        storage: DeploymentStorage,
+        database: Database<RT>,
+        fetch_client: Arc<dyn FetchClient>,
+        memory_pressure: MemoryPressureSignal,
+    ) -> anyhow::Result<Self> {
         // InProcessFunctionRunner is single tenant and thus can use the full capacity.
         let max_percent_per_client = 100;
+        let context_cache_capacity =
+            IsolateClient::<RT>::preflight_context_cache_capacity(*MAX_ISOLATE_WORKERS)?;
+        let degradable_leader_capacity = *APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS;
+        validate_active_javascript_class_minimums(
+            *FUNRUN_ISOLATE_ACTIVE_THREADS,
+            *FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN,
+            *FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN,
+            degradable_leader_capacity,
+        )?;
         let concurrency_limiter = if *FUNRUN_ISOLATE_ACTIVE_THREADS > 0 {
             ConcurrencyLimiter::new(*FUNRUN_ISOLATE_ACTIVE_THREADS)
         } else {
@@ -152,7 +195,8 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
             "concurrency_logger",
             concurrency_limiter.go_log(rt.clone(), ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY),
         );
-        let isolate_config = IsolateConfig::new("funrun", concurrency_limiter);
+        let isolate_config = IsolateConfig::new("funrun", concurrency_limiter)
+            .with_context_cache_budget(context_cache_capacity, memory_pressure);
         let isolate_worker = FunctionRunnerIsolateWorker::new(rt.clone(), isolate_config);
         let server = FunctionRunnerCore::new(rt, storage, max_percent_per_client, isolate_worker)?;
         Ok(Self {

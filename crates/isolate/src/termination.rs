@@ -303,6 +303,9 @@ impl ExecutionHandle {
         inner.next_context_id += 1;
         if !nested {
             inner.context_stack.clear();
+            // This is per-root-request diagnostic state. Nested calls must keep
+            // the parent HTTP request size available for OOM reporting.
+            inner.request_stream_bytes = None;
         }
         let handle = ContextId { context_id };
         inner.context_stack.push(context_id);
