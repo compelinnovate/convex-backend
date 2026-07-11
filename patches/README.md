@@ -5,10 +5,10 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
 a patch, preserve its prerequisites, and verify the effective configuration and metrics after every
 backend replacement.
 
-The current backend source chain has 14 commits and 14 operator essays, one commit per backend
-adoption unit. Lane-aware queueing and its optional deployment extension are one queue-control
-patch. The matching degradable-query client half is maintained in `convex-js`; it shares the
-protocol and adoption essay but is not another commit in this backend chain.
+The maintained backend source chain keeps one commit per operator adoption unit. Lane-aware
+queueing and its optional deployment extension are one queue-control patch. The matching
+degradable-query client half is maintained in `convex-js`; it shares the protocol and adoption essay
+but is not another commit in this backend chain.
 
 ## Snapshot and import reliability
 
@@ -161,32 +161,18 @@ protocol and adoption essay but is not another commit in this backend chain.
 
 ## Context reuse
 
-### [Cancellation-safe database context reuse](cancellation_safe_database_context_reuse/README.md)
+### [Context reuse](context_reuse/README.md)
 
-- Purpose: preserve upstream module-wide query and mutation reuse while preventing canceled or
-  visibly terminated executions from publishing a context.
-- Prerequisites: application source review for every marked entry module.
-- Activation: application modules opt in with `experimental_reuseContext`; the backend never carries
-  a deployment module allowlist.
-- Rollback: remove the marker from every opted-in module, deploy those application changes, and
-  restart backend workers to clear process-local cached contexts before restoring traffic.
-
-### [Context reuse observability](context_reuse_observability/README.md)
-
-- Purpose: expose bounded allow/suppress, lookup, validation, take/save/clear, affinity, occupancy,
-  and isolate-memory signals.
-- Prerequisites: none for metrics; it is most useful with one of the context-reuse patches.
-- Activation: automatic after backend rollout. Absent series can be valid when no matching context
-  activity occurred.
-- Rollback: remove the patch; runtime context policy is otherwise unchanged.
-
-### [HTTP action context reuse](reuse_http_action_contexts/README.md)
-
-- Purpose: reuse V8 contexts for hot HTTP action modules while reinstalling per-request Rust state.
-- Prerequisites: source-purity review of every reachable HTTP action module graph. Context reuse
-  observability is strongly recommended.
-- Activation: disabled by default through `REUSE_HTTP_ACTION_CONTEXTS=false`.
-- Rollback: disable the knob and restart to clear worker-local contexts.
+- Purpose: unify bounded, cancellation-safe V8 context reuse for queries, mutations, ordinary
+  Convex-runtime actions, and HTTP actions under one per-module policy and one set of observability
+  signals.
+- Prerequisites: backend memory resilience and the current isolate scheduler/cache-capacity
+  machinery; application source review for every module graph that opts in.
+- Activation: automatic cache support and metrics after backend rollout. Applications opt into each
+  execution kind with the typed `experimental_reuseContext` export; the legacy boolean remains
+  query/mutation-only compatible. There is no startup-time HTTP reuse knob.
+- Rollback: remove the corresponding policy property, redeploy the module, and restart backend
+  workers to clear process-local cached contexts before restoring traffic.
 
 ## Degradable client behavior
 
@@ -205,8 +191,6 @@ protocol and adoption essay but is not another commit in this backend chain.
 - Rollback: remove the application opt-in first, then unset the backend cap. The protocol fields can
   remain deployed inertly.
 
-The short HTTP-action note in this essay is future work, not part of the current implementation.
-
 ## Detailed design references
 
 These files preserve the full earlier analysis without creating additional operator adoption units:
@@ -220,8 +204,8 @@ These files preserve the full earlier analysis without creating additional opera
 - [Degradable active-JavaScript admission](degradable_reactive_queries/active_javascript_admission.md)
   records the service-class propagation, work-conserving floor policy, scheduler exposure
   invariant, configuration rules, and deliberately excluded generalizations.
-- [Database context cancellation design](cancellation_safe_database_context_reuse/cancellation_design_reference.md)
-  retains the full signal ownership, memory ordering, nested-call, timing, and save-boundary analysis.
+- [Context reuse design](context_reuse/design_reference.md) retains lifecycle, compatibility,
+  cancellation, cache, metrics, scheduler, and cross-patch interaction details.
 
 ## Recommended rollout order
 
@@ -229,8 +213,8 @@ These files preserve the full earlier analysis without creating additional opera
 2. Deploy dependency capacity before lane-aware queueing or the deployment lane.
 3. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
    own wait and occupancy signals.
-4. Establish observability before enabling application context-reuse markers or HTTP reuse.
-5. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
+4. Deploy the unified context-reuse patch before enabling reviewed module policy properties.
+5. Enable reviewed context-reuse properties in application-owned stages; consider prewarming only
    after cold-miss evidence.
 6. Deliver matching backend and client protocol before enabling degradable frontend behavior.
 7. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a

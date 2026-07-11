@@ -237,7 +237,7 @@ pub async fn make_app(
         reqwest::redirect::Policy::default(),
     );
     let function_runner: Arc<dyn FunctionRunner<ProdRuntime>> =
-        Arc::new(InProcessFunctionRunner::new(
+        Arc::new(InProcessFunctionRunner::new_with_memory_pressure(
             deployment,
             key_broker.function_runner_keybroker(),
             config.convex_origin_url()?,
@@ -249,6 +249,7 @@ pub async fn make_app(
             },
             database.clone(),
             fetch_client.clone(),
+            memory_reclamation,
         )?);
 
     let application = Application::new(

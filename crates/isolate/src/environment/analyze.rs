@@ -62,6 +62,7 @@ use model::{
             AnalyzedHttpRoutes,
             AnalyzedModule,
             AnalyzedSourcePosition,
+            ContextReusePolicy,
             Visibility,
         },
         user_error::{
@@ -449,22 +450,42 @@ impl AnalyzeEnvironment {
                 None
             });
 
-        let reuse_context = module
+        let module_namespace = module
             .get_module_namespace()
             .to_object(&scope)
-            .context("Module namespace wasn't an object?")?
-            .get(
-                &scope,
-                strings::experimental_reuseContext.create(&scope)?.into(),
-            )
-            .is_some_and(|value| value.is_true());
+            .context("Module namespace wasn't an object?")?;
+        let context_reuse = match module_namespace.get(
+            &scope,
+            strings::experimental_reuseContext.create(&scope)?.into(),
+        ) {
+            // Keep the original boolean marker's meaning for existing apps.
+            Some(value) if value.is_true() => ContextReusePolicy::database(),
+            Some(value) if value.is_object() => {
+                let object = value
+                    .to_object(&scope)
+                    .context("Context reuse policy wasn't an object")?;
+                let property = |name: &'static strings::StaticString| -> anyhow::Result<bool> {
+                    let name = name.create(&scope)?;
+                    Ok(object
+                        .get(&scope, name.into())
+                        .is_some_and(|value| value.is_true()))
+                };
+                ContextReusePolicy {
+                    queries: property(&strings::queries)?,
+                    mutations: property(&strings::mutations)?,
+                    actions: property(&strings::actions)?,
+                    http_actions: property(&strings::httpActions)?,
+                }
+            },
+            _ => ContextReusePolicy::default(),
+        };
 
         Ok(Ok(AnalyzedModule {
             functions,
             http_routes,
             cron_specs,
             source_index,
-            reuse_context,
+            context_reuse,
         }))
     }
 }

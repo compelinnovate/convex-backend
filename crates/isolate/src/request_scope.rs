@@ -100,6 +100,7 @@ pub struct RequestState<RT: Runtime, E: V8IsolateEnvironment<RT>> {
     pub stream_listeners: WithHeapSize<BTreeMap<uuid::Uuid, StreamListener>>,
     /// Tracks bytes read in HTTP action requests
     pub request_stream_state: Option<RequestStreamState>,
+    http_action_abort_stream_id: Option<uuid::Uuid>,
     pub console_timers: WithHeapSize<BTreeMap<String, UnixTimestamp>>,
 }
 
@@ -112,6 +113,7 @@ impl<RT: Runtime, E: V8IsolateEnvironment<RT>> RequestState<RT, E> {
             streams: WithHeapSize::default(),
             stream_listeners: WithHeapSize::default(),
             request_stream_state: None,
+            http_action_abort_stream_id: None,
             console_timers: WithHeapSize::default(),
         }
     }
@@ -180,6 +182,36 @@ impl<RT: Runtime, E: V8IsolateEnvironment<RT>> RequestState<RT, E> {
         let uuid = self.create_stream()?;
         self.request_stream_state = Some(RequestStreamState::new(uuid));
         Ok(uuid)
+    }
+
+    pub fn create_http_action_abort_stream(&mut self) -> anyhow::Result<uuid::Uuid> {
+        anyhow::ensure!(
+            self.http_action_abort_stream_id.is_none(),
+            "HTTP action abort stream created twice"
+        );
+        let uuid = self.create_stream()?;
+        self.http_action_abort_stream_id = Some(uuid);
+        Ok(uuid)
+    }
+
+    pub fn has_pending_stream_work_for_context_reuse(&self) -> bool {
+        let abort_stream_id = self.http_action_abort_stream_id;
+        // The abort listener is expected to wait for client disconnect. Its Rust
+        // resolver root is dropped with RequestState and must not disable reuse.
+        let has_pending_stream = self.streams.iter().any(|(stream_id, stream)| {
+            if Some(*stream_id) == abort_stream_id {
+                return false;
+            }
+            match stream {
+                Ok(stream) => !stream.done || !stream.parts.is_empty(),
+                Err(_) => true,
+            }
+        });
+        let has_pending_listener = self
+            .stream_listeners
+            .keys()
+            .any(|stream_id| Some(*stream_id) != abort_stream_id);
+        has_pending_stream || has_pending_listener
     }
 
     /// As the name implies, the time returned by this function would be a

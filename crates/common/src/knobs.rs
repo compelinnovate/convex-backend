@@ -1277,6 +1277,30 @@ pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS",
 /// heap.
 pub static REUSE_ISOLATES: LazyLock<bool> = LazyLock::new(|| env_config("REUSE_ISOLATES", true));
 
+/// Number of frequency-protected reusable V8 contexts retained by each isolate
+/// context cache. The cache also has one probationary resident. Keep at least
+/// two protected residents so cgroup pressure can preserve its two hottest
+/// entries without increasing the configured normal capacity.
+pub static ISOLATE_CONTEXT_CACHE_PROTECTED_RESIDENTS_PER_ISOLATE: LazyLock<usize> =
+    LazyLock::new(|| {
+        let value = env_config_usize_strict_nonzero(
+            "ISOLATE_CONTEXT_CACHE_PROTECTED_RESIDENTS_PER_ISOLATE",
+            5,
+        );
+        assert!(
+            value >= 2,
+            "ISOLATE_CONTEXT_CACHE_PROTECTED_RESIDENTS_PER_ISOLATE must be at least 2"
+        );
+        value
+    });
+
+/// Optional scheduler-wide hard limit on reusable V8 contexts retained by the
+/// isolate context caches. When unset, the isolate scheduler derives the
+/// structural maximum from its worker count and per-isolate cache capacity. A
+/// configured value must be positive and cannot exceed that structural maximum.
+pub static ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS: LazyLock<Option<usize>> =
+    LazyLock::new(|| env_config_optional_usize_strict("ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS"));
+
 /// Duration in seconds before an idle isolate is recreated
 pub static ISOLATE_IDLE_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_IDLE_TIMEOUT_SECONDS", 600)));
@@ -1341,6 +1365,118 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
         DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY,
     )
 });
+
+/// Maximum elastic capacity shared by degradable root reactive-query
+/// cache-miss leaders and isolate module analysis. Absence disables degradable
+/// admission and preserves unpaced analysis. A configured cap leaves at least
+/// one shared-base application and isolate-worker slot. A finite active-
+/// JavaScript gate either exceeds the cap or configures class minimums.
+pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
+    LazyLock::new(|| {
+        let capacity =
+            env_config_optional_usize_strict("APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS");
+        if let Some(capacity) = capacity {
+            validate_degradable_query_leader_capacity(
+                capacity,
+                *APPLICATION_MAX_CONCURRENT_QUERIES,
+                *MAX_ISOLATE_WORKERS,
+                *ISOLATE_DEPENDENCY_WORKER_RESERVE,
+                *FUNRUN_ISOLATE_ACTIVE_THREADS,
+                *FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN,
+                *FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN,
+            )
+            .unwrap_or_else(|e| {
+                panic!("Invalid APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: {e}")
+            });
+        }
+        capacity
+    });
+
+fn validate_degradable_query_leader_capacity(
+    capacity: usize,
+    application_query_capacity: usize,
+    isolate_worker_capacity: usize,
+    dependency_reserve: usize,
+    active_javascript_capacity: usize,
+    protected_active_minimum: usize,
+    degradable_active_minimum: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(capacity > 0, "the cap must be greater than zero");
+    anyhow::ensure!(
+        capacity <= tokio::sync::Semaphore::MAX_PERMITS,
+        "the cap must not exceed the semaphore permit limit"
+    );
+    anyhow::ensure!(
+        dependency_reserve < isolate_worker_capacity,
+        "ISOLATE_DEPENDENCY_WORKER_RESERVE must be smaller than MAX_ISOLATE_WORKERS"
+    );
+    let application_reserve = dependency_reserve.min(application_query_capacity.saturating_sub(1));
+    let application_shared_base = application_query_capacity - application_reserve;
+    anyhow::ensure!(
+        capacity < application_shared_base,
+        "the cap must be smaller than the application query shared-base capacity \
+         ({application_shared_base})"
+    );
+    let isolate_shared_base = isolate_worker_capacity - dependency_reserve;
+    anyhow::ensure!(
+        capacity < isolate_shared_base,
+        "the cap must be smaller than the isolate shared-base capacity ({isolate_shared_base})"
+    );
+    validate_active_javascript_class_minimums(
+        active_javascript_capacity,
+        protected_active_minimum,
+        degradable_active_minimum,
+        Some(capacity),
+    )?;
+    let class_minimums_enabled = protected_active_minimum > 0;
+    if !class_minimums_enabled && active_javascript_capacity > 0 {
+        anyhow::ensure!(
+            capacity < active_javascript_capacity,
+            "the cap must be smaller than FUNRUN_ISOLATE_ACTIVE_THREADS \
+             ({active_javascript_capacity}) when active-JavaScript class minimums are disabled"
+        );
+    }
+    Ok(())
+}
+
+/// Validates the active-JavaScript service floors against total active and
+/// degradable leader capacity.
+pub fn validate_active_javascript_class_minimums(
+    active_javascript_capacity: usize,
+    protected_active_minimum: usize,
+    degradable_active_minimum: usize,
+    degradable_leader_capacity: Option<usize>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (protected_active_minimum == 0) == (degradable_active_minimum == 0),
+        "FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN and \
+         FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN must be enabled together"
+    );
+    if protected_active_minimum > 0 {
+        anyhow::ensure!(
+            active_javascript_capacity > 0,
+            "active-JavaScript class minimums require finite FUNRUN_ISOLATE_ACTIVE_THREADS"
+        );
+        let combined_minimum = protected_active_minimum
+            .checked_add(degradable_active_minimum)
+            .context("active-JavaScript class minimums overflow")?;
+        anyhow::ensure!(
+            combined_minimum <= active_javascript_capacity,
+            "active-JavaScript class minimums ({combined_minimum}) must not exceed \
+             FUNRUN_ISOLATE_ACTIVE_THREADS ({active_javascript_capacity})"
+        );
+        let degradable_leader_capacity = degradable_leader_capacity.context(
+            "active-JavaScript class minimums require \
+             APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS",
+        )?;
+        anyhow::ensure!(
+            degradable_active_minimum <= degradable_leader_capacity,
+            "FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN must not exceed the degradable leader \
+             cap ({degradable_leader_capacity})"
+        );
+    }
+    Ok(())
+}
 
 /// The maximum number of mutations that can be run concurrently by an
 /// application.

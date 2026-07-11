@@ -1,6 +1,10 @@
 use std::{
     collections::BTreeMap,
     mem,
+    ops::{
+        Deref,
+        DerefMut,
+    },
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -27,6 +31,7 @@ use common::{
 };
 use database::{
     BootstrapComponentsModel,
+    SnoopedTransaction,
     Transaction,
 };
 use errors::ErrorMetadata;
@@ -44,7 +49,10 @@ use model::{
         types::ModuleMetadata,
         ModuleModel,
     },
-    source_packages::SourcePackageModel,
+    source_packages::{
+        types::SourcePackage,
+        SourcePackageModel,
+    },
     udf_config::UdfConfigModel,
 };
 use parking_lot::Mutex;
@@ -67,6 +75,10 @@ use value::{
 };
 
 use crate::{
+    context_cache::{
+        ContextCache,
+        ContextReadSet,
+    },
     environment::{
         action::task::TaskRequestEnum,
         helpers::{
@@ -110,7 +122,7 @@ struct ComponentEnvCtx {
 
 enum ActionPreloaded<RT: Runtime> {
     Created {
-        tx: Transaction<RT>,
+        tx: MaybeSnooped<RT>,
         module_loader: Arc<dyn ModuleCache<RT>>,
         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
         resources: Arc<Mutex<BTreeMap<Reference, Resource>>>,
@@ -119,6 +131,8 @@ enum ActionPreloaded<RT: Runtime> {
     Preloading,
     Ready {
         module_loader: Arc<dyn ModuleCache<RT>>,
+        module_metadata: BTreeMap<CanonicalizedModulePath, Arc<ParsedDocument<ModuleMetadata>>>,
+        source_package: Option<Arc<ParsedDocument<SourcePackage>>>,
         modules: BTreeMap<
             CanonicalizedModulePath,
             (Arc<ParsedDocument<ModuleMetadata>>, Arc<V8ModuleSource>),
@@ -129,7 +143,33 @@ enum ActionPreloaded<RT: Runtime> {
         rng: Option<ChaCha12Rng>,
         import_time_unix_timestamp: Option<UnixTimestamp>,
         performance_api: Option<PerformanceApi>,
+        context_read_set: Option<ContextReadSet>,
     },
+}
+
+enum MaybeSnooped<RT: Runtime> {
+    Tx(Transaction<RT>),
+    SnoopedTx(SnoopedTransaction<RT>),
+}
+
+impl<RT: Runtime> Deref for MaybeSnooped<RT> {
+    type Target = Transaction<RT>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            MaybeSnooped::Tx(tx) => tx,
+            MaybeSnooped::SnoopedTx(tx) => tx,
+        }
+    }
+}
+
+impl<RT: Runtime> DerefMut for MaybeSnooped<RT> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            MaybeSnooped::Tx(tx) => tx,
+            MaybeSnooped::SnoopedTx(tx) => tx,
+        }
+    }
 }
 
 impl<RT: Runtime> ActionPhase<RT> {
@@ -147,7 +187,7 @@ impl<RT: Runtime> ActionPhase<RT> {
             phase: Phase::Importing,
             rt,
             preloaded: ActionPreloaded::Created {
-                tx,
+                tx: MaybeSnooped::Tx(tx),
                 module_loader,
                 default_system_env_vars,
                 resources,
@@ -184,29 +224,17 @@ impl<RT: Runtime> ActionPhase<RT> {
                     .map(|c| ChaCha12Rng::from_seed(c.import_phase_rng_seed));
                 let import_time_unix_timestamp =
                     udf_config.as_ref().map(|c| c.import_phase_unix_timestamp);
-
                 let module_metadata = ModuleModel::new(&mut tx)
                     .get_all_metadata(component_id)
                     .await?;
                 let source_package = SourcePackageModel::new(&mut tx, component_id.into())
                     .get_latest()
                     .await?;
-                let mut modules = BTreeMap::new();
-                for metadata in module_metadata {
-                    if metadata.path.is_system() {
-                        continue;
-                    }
-                    let path = metadata.path.clone();
-                    let module = module_loader
-                        .get_module_with_metadata(
-                            &metadata,
-                            source_package
-                                .as_ref()
-                                .context("source package not found")?,
-                        )
-                        .await?;
-                    modules.insert(path, (metadata, module));
-                }
+                let module_metadata = module_metadata
+                    .into_iter()
+                    .filter(|metadata| !metadata.path.is_system())
+                    .map(|metadata| (metadata.path.clone(), metadata))
+                    .collect();
 
                 {
                     let loaded_resources = ComponentsModel::new(&mut tx)
@@ -278,15 +306,26 @@ impl<RT: Runtime> ActionPhase<RT> {
                     )
                 };
 
+                let context_read_set = match tx {
+                    MaybeSnooped::Tx(_) => None,
+                    MaybeSnooped::SnoopedTx(snooped_tx) => {
+                        let (mut tx, read_set) = snooped_tx.finish_snoop();
+                        ContextCache::capture_context_read_set(read_set, &mut tx).await?
+                    },
+                };
+
                 Ok(ActionPreloaded::Ready {
                     module_loader,
-                    modules,
+                    module_metadata,
+                    source_package,
+                    modules: BTreeMap::new(),
                     env_vars,
                     component_arguments,
                     component_env,
                     rng,
                     import_time_unix_timestamp,
                     performance_api: import_time_unix_timestamp.map(PerformanceApi::new),
+                    context_read_set,
                 })
             })
             .await?;
@@ -298,34 +337,128 @@ impl<RT: Runtime> ActionPhase<RT> {
         self.component
     }
 
-    pub fn get_module(
+    pub fn snoop_reads(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.phase == Phase::Importing);
+        let preloaded = mem::replace(&mut self.preloaded, ActionPreloaded::Preloading);
+        let (tx, module_loader, default_system_env_vars, resources, convex_origin_override) =
+            match preloaded {
+                ActionPreloaded::Created {
+                    tx,
+                    module_loader,
+                    default_system_env_vars,
+                    resources,
+                    convex_origin_override,
+                } => (
+                    tx,
+                    module_loader,
+                    default_system_env_vars,
+                    resources,
+                    convex_origin_override,
+                ),
+                preloaded => {
+                    self.preloaded = preloaded;
+                    anyhow::bail!("Phase not initialized");
+                },
+            };
+        let tx = match tx {
+            MaybeSnooped::Tx(tx) => MaybeSnooped::SnoopedTx(tx.snoop_reads()),
+            MaybeSnooped::SnoopedTx(tx) => {
+                self.preloaded = ActionPreloaded::Created {
+                    tx: MaybeSnooped::SnoopedTx(tx),
+                    module_loader,
+                    default_system_env_vars,
+                    resources,
+                    convex_origin_override,
+                };
+                anyhow::bail!("Called snoop_reads while already snooping")
+            },
+        };
+        self.preloaded = ActionPreloaded::Created {
+            tx,
+            module_loader,
+            default_system_env_vars,
+            resources,
+            convex_origin_override,
+        };
+        Ok(())
+    }
+
+    pub async fn validate_context_read_set(
+        &mut self,
+        read_set: &ContextReadSet,
+        timeout: &mut Timeout<RT>,
+    ) -> anyhow::Result<bool> {
+        let ActionPreloaded::Created { tx, .. } = &mut self.preloaded else {
+            anyhow::bail!("Phase not initialized");
+        };
+        // Validation hashes are initialization work. If the future blocks,
+        // `with_release_permit` releases the active-JavaScript permit and excludes
+        // only that blocked interval from the user timeout.
+        timeout
+            .with_release_permit(
+                PauseReason::UdfInitialize,
+                ContextCache::validate_and_apply_context_read_set(tx, read_set),
+            )
+            .await
+    }
+
+    pub fn take_context_read_set(&mut self) -> anyhow::Result<Option<ContextReadSet>> {
+        let ActionPreloaded::Ready {
+            context_read_set, ..
+        } = &mut self.preloaded
+        else {
+            anyhow::bail!("Phase not initialized");
+        };
+        Ok(context_read_set.take())
+    }
+
+    pub async fn get_module(
         &mut self,
         module_path: &ModulePath,
-        _timeout: &mut Timeout<RT>,
+        timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
+        let canonical_path = module_path.clone().canonicalize();
         let ActionPreloaded::Ready {
             ref module_loader,
-            ref modules,
+            ref module_metadata,
+            ref source_package,
+            ref mut modules,
             ..
         } = self.preloaded
         else {
             anyhow::bail!("Phase not initialized");
         };
-        let module = modules.get(&module_path.clone().canonicalize());
 
-        let Some((module, source)) = module else {
+        if let Some((module, source)) = modules.get(&canonical_path) {
+            let code_cache_result = module_loader.clone().code_cache_result(module);
+            return Ok(Some((source.clone(), code_cache_result)));
+        }
+
+        let Some(module_metadata) = module_metadata.get(&canonical_path) else {
             return Ok(None);
         };
 
         anyhow::ensure!(
-            module.environment == ModuleEnvironment::Isolate,
+            module_metadata.environment == ModuleEnvironment::Isolate,
             "Trying to execute {:?} in isolate, but it is bundled for {:?}.",
             module_path,
-            module.environment
+            module_metadata.environment
         );
 
-        let code_cache_result = module_loader.clone().code_cache_result(module);
-        Ok(Some((source.clone(), code_cache_result)))
+        let source = timeout
+            .with_release_permit(
+                PauseReason::LoadModule,
+                module_loader.get_module_with_metadata(
+                    module_metadata,
+                    source_package
+                        .as_ref()
+                        .context("source package not found")?,
+                ),
+            )
+            .await?;
+        let code_cache_result = module_loader.clone().code_cache_result(module_metadata);
+        modules.insert(canonical_path, (module_metadata.clone(), source.clone()));
+        Ok(Some((source, code_cache_result)))
     }
 
     pub fn begin_execution(&mut self) -> anyhow::Result<()> {

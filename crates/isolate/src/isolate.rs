@@ -269,6 +269,16 @@ impl<RT: Runtime> Isolate<RT> {
         IsolateHeapStats::new(stats, 0, self.array_buffer_memory_limit.used())
     }
 
+    pub(crate) fn set_cgroup_memory_pressure(
+        &mut self,
+        context_cache: &mut ContextCache,
+        active: bool,
+    ) {
+        if context_cache.set_cgroup_memory_pressure(active) {
+            self.v8_isolate.low_memory_notification();
+        }
+    }
+
     pub fn check_isolate_clean(
         &mut self,
         context_cache: &mut ContextCache,
@@ -284,11 +294,34 @@ impl<RT: Runtime> Isolate<RT> {
             return Err(not_clean);
         }
         // The heap should have enough memory available.
-        let stats = self.v8_isolate.get_heap_statistics();
+        let mut stats = self.v8_isolate.get_heap_statistics();
         log_heap_statistics(&stats);
-        if stats.total_available_size() < *ISOLATE_MAX_USER_HEAP_SIZE
-            && !context_cache.has_saved_context()
-        {
+        if stats.total_available_size() < *ISOLATE_MAX_USER_HEAP_SIZE {
+            // A dropped Global only makes its context collectible. Recheck after
+            // asking V8 to collect so we keep as many useful residents as the
+            // isolate's actual heap permits instead of treating any resident as a
+            // blanket exemption from the fresh-request free-space requirement.
+            context_cache.clear_fresh_context();
+            // Collect before evicting reusable state even when no fresh root was
+            // present; unrelated garbage may satisfy the free-heap requirement.
+            self.v8_isolate.low_memory_notification();
+            stats = self.v8_isolate.get_heap_statistics();
+            while stats.total_available_size() < *ISOLATE_MAX_USER_HEAP_SIZE
+                && context_cache.evict_for_memory_pressure()
+            {
+                self.v8_isolate.low_memory_notification();
+                stats = self.v8_isolate.get_heap_statistics();
+            }
+            // Forced collection can expose a near-heap-limit termination after
+            // the initial cleanliness check. Do not start a request in that
+            // isolate even when collection recovered enough nominal free space.
+            if stats.total_available_size() >= *ISOLATE_MAX_USER_HEAP_SIZE
+                && let Some(not_clean) = self.handle.is_not_clean()
+            {
+                return Err(not_clean);
+            }
+        }
+        if stats.total_available_size() < *ISOLATE_MAX_USER_HEAP_SIZE {
             self.handle
                 .terminate(IsolateTerminationReason::OutOfMemory.into());
             return Err(IsolateNotClean::TooMuchMemoryCarryOver(

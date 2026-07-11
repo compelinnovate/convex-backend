@@ -33,8 +33,8 @@ only the admission patch should set an explicit HTTP gate and verify that nested
 V8 and HTTP actions continue to make progress under saturation. Adopting only
 the scheduler patch preserves the upstream HTTP gates while removing the isolate
 worker-capacity inversion for admitted action query/mutation callbacks. The
-measurements in this document used both patches, with HTTP action context reuse
-enabled where stated.
+measurements in this document used both patches, with the HTTP action module opting into
+`experimental_reuseContext: { httpActions: true }` where stated.
 
 Node.js action callbacks re-enter the main HTTP server on port `3210` while the
 parent request can retain its base HTTP permit. The main backend HTTP gate
@@ -434,8 +434,7 @@ load-test validation of the final scheduler policy. The final policy is covered
 by deterministic scheduler-loop and queue regression tests; operators should
 repeat representative load tests before rollout.
 
-HTTP action context reuse is a separate patch. It was enabled for most
-successful stress results below.
+The unified context-reuse patch was enabled for most successful stress results below.
 
 With context reuse disabled at `200 rps`, the scheduler-dependency backend only
 returned `587/6000` successful responses, returned `5413` HTTP `503` responses,
@@ -452,7 +451,7 @@ sample, so `192` stayed the selected gate for this five-CPU candidate.
 ## Worker And Active-Thread Matrix
 
 The matrix below used `HTTP_SERVER_MAX_CONCURRENT_REQUESTS=192` and
-`REUSE_HTTP_ACTION_CONTEXTS=true`.
+the per-module `experimental_reuseContext` policy with `httpActions: true`.
 
 At `200 rps`, `8/8` had the best warmed p95 latency in this single-route test.
 `5/5`, `8/5`, and `10/8` also completed without HTTP failures in warmed runs,
@@ -743,10 +742,10 @@ best-effort fallback for a runner that does not honor this contract.
 
 ## Scope
 
-These patches do not solve every throughput problem. HTTP action context reuse
-is a separate patch, and it was enabled for the successful `200 rps` and worker
-matrix results above. Without that patch, the same scheduler-dependency backend
-failed the `200 rps` sample with `5413` HTTP `503`s.
+These patches do not solve every throughput problem. The unified context-reuse
+patch was enabled for the successful `200 rps` and worker matrix results above.
+Without HTTP action reuse, the same scheduler-dependency backend failed the
+`200 rps` sample with `5413` HTTP `503`s.
 
 Docker CPU and memory split is deployment policy. The measurements above show
 the backend cgroup CPU limit becoming binding while MySQL stayed low. Moving CPU

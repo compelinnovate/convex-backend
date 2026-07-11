@@ -498,3 +498,154 @@ impl<RT: Runtime> Drop for PauseGuard<'_, RT> {
         self.unpause();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Arc,
+        task::Poll,
+    };
+
+    use futures::{
+        future,
+        poll,
+    };
+    use runtime::prod::ProdRuntime;
+
+    use super::*;
+    use crate::ConcurrencyLimiter;
+
+    fn timeout_for_test(rt: &ProdRuntime, permit: ConcurrencyPermit) -> Timeout<ProdRuntime> {
+        let (done_tx, done_rx) = broadcast(1);
+        let handle = rt.spawn("timeout_test", async move {
+            let _done_tx = done_tx;
+            future::pending::<()>().await;
+        });
+        Timeout {
+            handle,
+            inner: Arc::new(Mutex::new(TimeoutInner {
+                rt: rt.clone(),
+                start: rt.monotonic_now(),
+                timeout: None,
+                pause_elapsed: Duration::ZERO,
+                max_time_paused: None,
+                state: TimeoutState::Running,
+                pause_breakdown: HashMap::new(),
+            })),
+            done_rx,
+            permit: Some(permit),
+        }
+    }
+
+    #[test]
+    fn with_release_permit_only_pauses_after_pending() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let block_rt = rt.clone();
+        block_rt.block_on("conditional_permit_release_test", async move {
+            let limiter = ConcurrencyLimiter::new(1);
+            let permit = limiter
+                .acquire(Arc::new("timeout test".to_owned()), false)
+                .await;
+            let mut timeout = timeout_for_test(&rt, permit);
+
+            let ready = timeout
+                .with_release_permit(PauseReason::UdfInitialize, future::ready(Ok("ready")))
+                .await
+                .expect("ready future failed");
+            assert_eq!(ready, "ready");
+            assert_eq!(limiter.active_permits(), 1);
+            {
+                let inner = timeout.inner.lock();
+                assert!(matches!(inner.state, TimeoutState::Running));
+                assert_eq!(inner.pause_elapsed, Duration::ZERO);
+                assert!(inner.pause_breakdown.is_empty());
+            }
+
+            let mut polls = 0;
+            let pending_once = std::future::poll_fn(|cx| {
+                polls += 1;
+                match polls {
+                    1 => {
+                        assert_eq!(limiter.active_permits(), 1);
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    },
+                    2 => {
+                        assert_eq!(limiter.active_permits(), 0);
+                        Poll::Ready(Ok("pending"))
+                    },
+                    _ => panic!("future was polled after completion"),
+                }
+            });
+            let pending = timeout
+                .with_release_permit(PauseReason::LoadModule, pending_once)
+                .await
+                .expect("pending future failed");
+            assert_eq!(pending, "pending");
+            assert_eq!(limiter.active_permits(), 1);
+            {
+                let inner = timeout.inner.lock();
+                assert!(matches!(inner.state, TimeoutState::Running));
+                assert_eq!(
+                    inner
+                        .pause_breakdown
+                        .get(&PauseReason::LoadModule)
+                        .map(|(count, _)| *count),
+                    Some(1)
+                );
+                assert_eq!(
+                    inner
+                        .pause_breakdown
+                        .get(&PauseReason::ConcurrencyPermitReacquire)
+                        .map(|(count, _)| *count),
+                    Some(1)
+                );
+            }
+
+            drop(
+                timeout
+                    .finish_with_permit()
+                    .expect("timeout lost reacquired permit"),
+            );
+            assert_eq!(limiter.active_permits(), 0);
+        });
+    }
+
+    #[test]
+    fn cancelling_pending_release_drops_the_permit() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let block_rt = rt.clone();
+        block_rt.block_on("conditional_permit_cancellation_test", async move {
+            let limiter = ConcurrencyLimiter::new(1);
+            let permit = limiter
+                .acquire(Arc::new("timeout test".to_owned()), false)
+                .await;
+            let mut timeout = timeout_for_test(&rt, permit);
+
+            let mut release = Box::pin(timeout.with_release_permit(
+                PauseReason::UdfInitialize,
+                future::pending::<anyhow::Result<()>>(),
+            ));
+            assert!(matches!(poll!(release.as_mut()), Poll::Pending));
+            assert_eq!(limiter.active_permits(), 0);
+            drop(release);
+
+            assert!(timeout.permit.is_none());
+            {
+                let inner = timeout.inner.lock();
+                assert!(matches!(inner.state, TimeoutState::Running));
+                assert_eq!(
+                    inner
+                        .pause_breakdown
+                        .get(&PauseReason::UdfInitialize)
+                        .map(|(count, _)| *count),
+                    Some(1)
+                );
+            }
+            drop(timeout);
+            assert_eq!(limiter.active_permits(), 0);
+        });
+    }
+}

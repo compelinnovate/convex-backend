@@ -1,4 +1,3 @@
-use ::metrics::IntoLabel;
 use astral_future::AstralBody;
 use common::{
     self,
@@ -18,14 +17,6 @@ use common::{
     errors::report_error_sync,
     execution_context::ExecutionContext,
     knobs::ISOLATE_MAX_USER_HEAP_SIZE,
-};
-use fastrace::local::LocalSpan;
-use futures::{
-    future::{
-        self,
-        BoxFuture,
-    },
-    FutureExt,
 };
 use itertools::Either;
 use model::{
@@ -53,8 +44,11 @@ use udf::{
 
 use crate::{
     context_cache::{
+        context_cache_key,
         ContextCache,
         ContextReadSet,
+        ReusableContextToken,
+        TakenContext,
     },
     environment::udf::{
         astral_future::RecursiveExecutor,
@@ -123,7 +117,6 @@ use database::{
     BiggestDocumentWrites,
     FunctionExecutionSize,
     Transaction,
-    TransactionReadSet,
     OVER_LIMIT_HELP,
 };
 use deno_core::{
@@ -171,6 +164,7 @@ use self::{
 use super::ModuleCodeCacheResult;
 use crate::{
     client::{
+        CancellationSignal,
         EnvironmentData,
         UdfCallback,
         UdfRequest,
@@ -195,6 +189,7 @@ use crate::{
     metrics::{
         self,
         log_isolate_request_cancelled,
+        DatabaseUdfContextReuseLookupOutcome,
     },
     request_scope::{
         RequestScope,
@@ -287,14 +282,18 @@ impl<RT: Runtime> OpProvider for DatabaseUdfSyscallProvider<RT> {
             // start of execution and doesn't observe elapsed time.
             UdfType::Query => self.phase.performance_now_fixed(),
             UdfType::Mutation => self.phase.performance_now_incrementing(),
-            _ => anyhow::bail!("Expected a query or mutation"),
+            UdfType::Action | UdfType::HttpAction => {
+                anyhow::bail!("Expected a query or mutation")
+            },
         }
     }
 
     fn performance_time_origin(&mut self) -> anyhow::Result<UnixTimestamp> {
         match self.udf_type {
             UdfType::Query | UdfType::Mutation => self.phase.performance_time_origin(),
-            _ => anyhow::bail!("Expected a query or mutation"),
+            UdfType::Action | UdfType::HttpAction => {
+                anyhow::bail!("Expected a query or mutation")
+            },
         }
     }
 
@@ -491,7 +490,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
     ) -> anyhow::Result<Option<ContextReadSet>> {
         let read_set = self.phase.finish_snoop()?;
         Ok(if should_capture {
-            capture_context_read_set(read_set, self.phase.tx_mut()?).await?
+            ContextCache::capture_context_read_set(read_set, self.phase.tx_mut()?).await?
         } else {
             None
         })
@@ -502,8 +501,47 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
     anyhow::Result<(
         DatabaseUdfEnvironment<RT>,
         anyhow::Result<Result<PendingValue, JsError>>,
+        Option<PendingReusableContext>,
     )>,
 >;
+
+struct PendingReusableContext {
+    module_path: CanonicalizedComponentModulePath,
+    context: v8::Global<v8::Context>,
+    module_map: ModuleMap,
+    read_set: ContextReadSet,
+    // Keep the token after the V8 roots so failed outer finalization releases
+    // shared capacity only after those roots are destroyed.
+    token: Option<ReusableContextToken>,
+}
+
+impl PendingReusableContext {
+    fn publish(
+        self,
+        context_cache: &mut ContextCache,
+        cancellation: &CancellationSignal,
+        execution_handle: &ExecutionHandle,
+    ) -> anyhow::Result<()> {
+        // Keep the V8 root and any pool token carried by a hit private until local
+        // result and transaction finalization have both succeeded. There is no
+        // await between these final request-state checks and cache publication.
+        execution_handle.check_terminated()?;
+        if cancellation.is_cancelled() {
+            log_isolate_request_cancelled();
+            anyhow::bail!("Cancelled");
+        }
+        let Self {
+            module_path,
+            context,
+            module_map,
+            read_set,
+            token,
+        } = self;
+        context_cache.save_context(module_path, context, module_map, read_set, token);
+        Ok(())
+    }
+}
+
 struct RunUdf<'a, 'b, RT: Runtime> {
     rt: &'a RT,
     v8_scope: &'a mut v8::Isolate,
@@ -511,6 +549,7 @@ struct RunUdf<'a, 'b, RT: Runtime> {
     context_cache: &'a mut ContextCache,
     execution_handle: &'a ExecutionHandle,
     executor: &'a UdfRecursiveExecutor<RT>,
+    cancellation: CancellationSignal,
 }
 
 impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
@@ -528,9 +567,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
             client_id,
             rng_seed,
         );
-        // it is not necessary to propagate cancellation as the parent will already
-        // cancel the entire tree of futures.
-        let cancellation = future::pending().boxed();
+        // Same-isolate nested JavaScript can complete synchronously before the parent
+        // select repolls cancellation, so its context-save boundary needs the shared
+        // caller-drop signal too.
+        let cancellation = self.cancellation.clone();
         // N.B.: `run_nested` calls the corresponding `pop_context`.
         // This may not happen in case of a system error, but in that case we
         // are going to throw away the entire context stack anyway.
@@ -541,24 +581,26 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
         // User code is going to run again; regain the concurrency permit.
         let mut unpause_guard = self.paused_timeout.regain().await?;
         // Actually run the UDF.
-        let future = DatabaseUdfEnvironment::<RT>::run_nested(
-            self.executor,
-            &args,
-            self.v8_scope,
-            self.context_cache,
-            self.execution_handle.clone(),
-            request_state,
-            &mut *unpause_guard,
-            &mut isolate_clean,
-            cancellation,
-            None, /* udf_callback */
-        );
-        // Use an AstralFuture to move the responsibility of polling `future`
-        // to the `RecursiveExecutor` (created by DatabaseUdfEnvironment::run()).
-        // This avoids creating a deep stack of recursive `run_udf` calls.
-        let body = std::pin::pin!(AstralBody::new(future));
-        // safety: this future must not be leaked
-        let (nested_provider, result) = self.executor.spawn(unsafe { body.project() }).await??;
+        let (nested_provider, result, reusable_context) = {
+            let future = DatabaseUdfEnvironment::<RT>::run_nested(
+                self.executor,
+                &args,
+                self.v8_scope,
+                self.context_cache,
+                self.execution_handle.clone(),
+                request_state,
+                &mut *unpause_guard,
+                &mut isolate_clean,
+                cancellation,
+                None, /* udf_callback */
+            );
+            // Use an AstralFuture to move the responsibility of polling `future`
+            // to the `RecursiveExecutor` (created by DatabaseUdfEnvironment::run()).
+            // This avoids creating a deep stack of recursive `run_udf` calls.
+            let body = std::pin::pin!(AstralBody::new(future));
+            // safety: this future must not be leaked
+            self.executor.spawn(unsafe { body.project() }).await??
+        };
         let outcome = NestedUdfOutcome {
             observed_identity: nested_provider.syscall_provider.phase.observed_identity(),
             observed_rng: nested_provider.syscall_provider.phase.observed_rng(),
@@ -569,10 +611,15 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
             result: result?,
             syscall_trace: nested_provider.syscall_provider.syscall_trace,
         };
-        Ok((
-            nested_provider.syscall_provider.phase.into_transaction()?,
-            outcome,
-        ))
+        let transaction = nested_provider.syscall_provider.phase.into_transaction()?;
+        if let Some(reusable_context) = reusable_context {
+            reusable_context.publish(
+                self.context_cache,
+                &self.cancellation,
+                self.execution_handle,
+            )?;
+        }
+        Ok((transaction, outcome))
     }
 }
 
@@ -653,7 +700,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
             module_loader,
             deployment,
         } = environment_data;
-        let reuse_context = path_and_args.reuse_context();
+        let reuse_context = path_and_args.reuse_context(udf_type);
         let (path, arguments, udf_server_version) = path_and_args.consume();
         let component = path.component;
         let identity = transaction.inert_identity();
@@ -717,7 +764,7 @@ where
         context_cache: &mut ContextCache,
         permit: ConcurrencyPermit,
         isolate_clean: &mut bool,
-        cancellation: BoxFuture<'_, ()>,
+        cancellation: CancellationSignal,
         args: DatabaseUdfArgs,
         function_started: Option<oneshot::Sender<()>>,
         udf_callback: Option<IsolateClient<RT>>,
@@ -732,7 +779,7 @@ where
             // reject the function for capacity reasons.
             _ = tx.send(());
         }
-        let (this, mut result) = executor
+        let (this, mut result, reusable_context) = executor
             .run_until(Self::run_nested(
                 &executor,
                 &args,
@@ -742,7 +789,7 @@ where
                 state,
                 &mut timeout,
                 isolate_clean,
-                cancellation,
+                cancellation.clone(),
                 udf_callback,
             ))
             .await?;
@@ -758,10 +805,20 @@ where
             Err(e) => result = Err(e),
         }
         let result = result?;
+        let reusable_context = if result.is_ok() {
+            reusable_context
+        } else {
+            None
+        };
 
         let execution_time = timeout.into_function_execution_time(this.syscall_provider.udf_type());
-        this.syscall_provider
-            .into_outcome(args, result, execution_time)
+        let outcome = this
+            .syscall_provider
+            .into_outcome(args, result, execution_time)?;
+        if let Some(reusable_context) = reusable_context {
+            reusable_context.publish(context_cache, &cancellation, &handle)?;
+        }
+        Ok(outcome)
     }
 
     /// Runs a query or mutation, possibly nested via `runQuery`/`runMutation`.
@@ -774,17 +831,26 @@ where
         mut request_state: RequestState<RT, Self>,
         timeout: &mut Timeout<RT>,
         isolate_clean: &mut bool,
-        cancellation: BoxFuture<'_, ()>,
+        cancellation: CancellationSignal,
         udf_callback: Option<IsolateClient<RT>>,
-    ) -> anyhow::Result<(Self, anyhow::Result<Result<PendingValue, JsError>>)> {
+    ) -> anyhow::Result<(
+        Self,
+        anyhow::Result<Result<PendingValue, JsError>>,
+        Option<PendingReusableContext>,
+    )> {
+        // Declare token ownership before the V8 scopes so failure paths drop the
+        // active context and module roots before returning the pool permit.
+        let mut reusable_context_token = None;
         scope!(let handle_scope, isolate);
         let mut context_scope;
         let (mut isolate_context, mut context_read_set) = if args.reuse_context
-            && let Some((context, module_map, read_set)) = request_state
+            && let Some(taken_context) = request_state
                 .environment
-                .take_and_validate_reused_context(context_cache)
+                .take_and_validate_reused_context(context_cache, timeout)
                 .await?
         {
+            let (context, module_map, read_set, token) = taken_context.into_parts();
+            reusable_context_token = Some(token);
             let v8_context = v8::Local::new(handle_scope, context);
             context_scope = v8::ContextScope::new(handle_scope, v8_context);
             (
@@ -830,11 +896,17 @@ where
                 .await;
                 if snoop {
                     let mut scope = RequestScope::<RT, Self>::enter(v8_scope);
-                    context_read_set = scope
-                        .state_mut()?
-                        .environment
-                        .syscall_provider
-                        .finish_snoop(matches!(initialize_result, Ok(Ok(_))))
+                    // Read-set hashing is the final system-owned part of
+                    // initialization, even though module evaluation has completed.
+                    context_read_set = timeout
+                        .with_release_permit(
+                            PauseReason::UdfInitialize,
+                            scope
+                                .state_mut()?
+                                .environment
+                                .syscall_provider
+                                .finish_snoop(matches!(initialize_result, Ok(Ok(_)))),
+                        )
                         .await?;
                 }
                 initialize_result
@@ -847,7 +919,7 @@ where
                         &mut *v8_scope,
                         context_cache,
                         timeout,
-                        cancellation,
+                        &cancellation,
                         args,
                         module,
                         udf_callback,
@@ -863,9 +935,32 @@ where
         // to ensure the microtask queue is empty. Otherwise, JS from this request may
         // leak to a subsequent one on isolate reuse.
         isolate_context.checkpoint();
+        // The final checkpoint can run user code and trigger termination after
+        // `run_inner` performed its last check. Preserve that failure through the
+        // context-save gate; the top-level request will extract the specific error.
+        if let Err(e) = execution_handle.check_terminated() {
+            result = Err(e);
+        }
         *isolate_clean = true;
 
+        let has_pending_request_work = if args.reuse_context {
+            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
+            !scope
+                .pending_unhandled_promise_rejections()
+                .exceptions
+                .is_empty()
+                || !scope.pending_dynamic_imports_mut().imports.is_empty()
+                || scope.state()?.has_pending_stream_work_for_context_reuse()
+        } else {
+            false
+        };
         let request_state = isolate_context.take_state().context("Lost RequestState?")?;
+        // The final checkpoint can run user microtasks after `run_inner` has
+        // observed an empty queue. Such a microtask may enqueue a native
+        // syscall; dropping its resolver is safe, but retaining the context
+        // would preserve request work that the next invocation cannot finish.
+        let has_pending_syscalls =
+            args.reuse_context && !request_state.environment.pending_syscalls.is_empty();
         let this = request_state.environment;
         // Override the returned result if we hit a termination error.
         match execution_handle.pop_context(request_state.context_id)? {
@@ -873,29 +968,43 @@ where
             Err(e) => result = Ok(Err(e)),
         }
 
-        // Only reuse contexts if the execution was successful, in case
-        // there are any promises hanging around
+        // Database UDFs do not poll cancellation while synchronous JavaScript runs.
+        // Check again at the save boundary so a dropped caller cannot retain the
+        // context of an execution whose result it will never receive.
         if args.reuse_context
+            && context_read_set.is_some()
+            && matches!(result, Ok(Ok(_)))
+            && cancellation.is_cancelled()
+        {
+            log_isolate_request_cancelled();
+            result = Err(anyhow!("Cancelled"));
+        }
+
+        // Hold a successful candidate out of the scheduler mirror until the caller
+        // finishes its fallible local outcome and transaction extraction.
+        let reusable_context = if args.reuse_context
             && let Ok(Ok(_)) = result
             && let Some(read_set) = context_read_set
+            && !has_pending_request_work
+            && !has_pending_syscalls
         {
             let module_map = isolate_context
                 .take_module_map()
                 .context("Lost ModuleMap?")?;
             let v8_scope = isolate_context.scope();
             let context = v8_scope.get_current_context();
-            context_cache.save_context(
-                CanonicalizedComponentModulePath {
-                    component: this.syscall_provider.path().component,
-                    module_path: this.syscall_provider.path().udf_path.module().clone(),
-                },
-                v8::Global::new(v8_scope, context),
+            Some(PendingReusableContext {
+                module_path: context_cache_key(this.syscall_provider.path()),
+                context: v8::Global::new(v8_scope, context),
                 module_map,
                 read_set,
-            );
-        }
+                token: reusable_context_token.take(),
+            })
+        } else {
+            None
+        };
 
-        Ok((this, result))
+        Ok((this, result, reusable_context))
     }
 
     #[fastrace::trace(properties = {"reusable_context": "{reusable_context}", "is_reused": "{is_reused}"})]
@@ -963,7 +1072,7 @@ where
         v8_scope: &mut v8::PinScope<'_, '_>,
         context_cache: &mut ContextCache,
         timeout: &mut Timeout<RT>,
-        cancellation: BoxFuture<'_, ()>,
+        cancellation: &CancellationSignal,
         args: &DatabaseUdfArgs,
         module: v8::Local<'_, v8::Module>,
         udf_callback: Option<IsolateClient<RT>>,
@@ -1090,7 +1199,6 @@ where
             Ok(None) => anyhow::bail!("Successful invocation returned None"),
             Err(e) => return Ok(Err(e)),
         };
-        let mut cancellation = cancellation;
         loop {
             // Advance the user's promise as far as it can go by draining the microtask
             // queue.
@@ -1178,6 +1286,7 @@ where
                                 context_cache,
                                 execution_handle: handle,
                                 executor,
+                                cancellation: (*cancellation).clone(),
                             };
                             let udf_callback = if let Some(callback) = &udf_callback {
                                 Either::Left(callback)
@@ -1186,7 +1295,7 @@ where
                             };
                             select! {
                                 biased;
-                                _ = &mut cancellation => {
+                                _ = cancellation.cancelled() => {
                                     log_isolate_request_cancelled();
                                     anyhow::bail!("Cancelled");
                                 },
@@ -1260,23 +1369,50 @@ where
     async fn take_and_validate_reused_context(
         &mut self,
         context_cache: &mut ContextCache,
-    ) -> anyhow::Result<Option<(v8::Global<v8::Context>, ModuleMap, ContextReadSet)>> {
-        let module_path = CanonicalizedComponentModulePath {
-            component: self.syscall_provider.path().component,
-            module_path: self.syscall_provider.path().udf_path.module().clone(),
-        };
-        let Some((context, module_map, read_set)) = context_cache.take_reused_context(&module_path)
-        else {
+        timeout: &mut Timeout<RT>,
+    ) -> anyhow::Result<Option<TakenContext>> {
+        let module_path = context_cache_key(self.syscall_provider.path());
+        let Some(taken_context) = context_cache.take_reused_context(&module_path) else {
+            metrics::log_database_udf_context_reuse_lookup(
+                self.syscall_provider.udf_type(),
+                DatabaseUdfContextReuseLookupOutcome::NotFound,
+            );
             return Ok(None);
         };
-        if !self
-            .syscall_provider
-            .validate_reused_context(&read_set)
-            .await?
-        {
-            return Ok(None);
+        // A found context has one terminal lookup outcome even if the request
+        // transaction cannot validate its saved read set.
+        // Validation hashing is initialization work. If it blocks, release the
+        // active-JavaScript permit and exclude only that interval from user time.
+        let validation_result = timeout
+            .with_release_permit(
+                PauseReason::UdfInitialize,
+                self.syscall_provider
+                    .validate_reused_context(taken_context.read_set()),
+            )
+            .await;
+        match validation_result {
+            Ok(true) => {
+                metrics::log_database_udf_context_reuse_lookup(
+                    self.syscall_provider.udf_type(),
+                    DatabaseUdfContextReuseLookupOutcome::Hit,
+                );
+            },
+            Ok(false) => {
+                metrics::log_database_udf_context_reuse_lookup(
+                    self.syscall_provider.udf_type(),
+                    DatabaseUdfContextReuseLookupOutcome::ValidationFailed,
+                );
+                return Ok(None);
+            },
+            Err(error) => {
+                metrics::log_database_udf_context_reuse_lookup(
+                    self.syscall_provider.udf_type(),
+                    DatabaseUdfContextReuseLookupOutcome::ValidationError,
+                );
+                return Err(error);
+            },
         }
-        Ok(Some((context, module_map, read_set)))
+        Ok(Some(taken_context))
     }
 }
 
@@ -1523,71 +1659,6 @@ pub fn add_warnings_to_log_lines(
 impl<RT: Runtime> ValidateContext for DatabaseUdfSyscallProvider<RT> {
     #[fastrace::trace]
     async fn validate_reused_context(&mut self, read_set: &ContextReadSet) -> anyhow::Result<bool> {
-        let mut reusable = scopeguard::guard(false, |reusable| {
-            LocalSpan::add_property(|| ("reuse_success", reusable.as_label()));
-        });
-        let tx = self.phase.tx_mut()?;
-        for (namespace, tablet_index_name, table_name, intervals, hash) in &read_set.range_hashes {
-            let tablet = *tablet_index_name.table();
-            if !tx.table_mapping().tablet_id_exists(tablet) {
-                return Ok(false);
-            }
-            let (new_namespace, _, new_table_name) =
-                tx.table_mapping().get_table_metadata(tablet)?;
-            anyhow::ensure!(namespace == new_namespace, "{tablet} changed namespace?");
-            anyhow::ensure!(table_name == new_table_name, "{tablet} changed name?");
-            let Some(new_hash) = tx
-                .hash_index_interval_no_deps(tablet_index_name, table_name, intervals)
-                .await?
-            else {
-                return Ok(false);
-            };
-            if new_hash != *hash {
-                return Ok(false);
-            }
-        }
-        *reusable = true;
-        // All hashes match, so make sure to merge the saved read set into `tx`
-        tx.apply_reads(read_set.read_set.clone());
-        Ok(true)
+        ContextCache::validate_and_apply_context_read_set(self.phase.tx_mut()?, read_set).await
     }
-}
-
-#[fastrace::trace]
-async fn capture_context_read_set<RT: Runtime>(
-    read_set: TransactionReadSet,
-    tx: &mut Transaction<RT>,
-) -> anyhow::Result<Option<ContextReadSet>> {
-    anyhow::ensure!(
-        read_set.read_set().iter_search().count() == 0,
-        "searches can't be done during init"
-    );
-    let mut range_hashes = vec![];
-    for (tablet_index_name, reads) in read_set.read_set().iter_indexed() {
-        let &(namespace, _table_number, ref table_name) = tx
-            .table_mapping()
-            .get_table_metadata(*tablet_index_name.table())?;
-        anyhow::ensure!(
-            table_name.is_system(),
-            "context init read non-system table {table_name}?"
-        );
-        let table_name = table_name.clone();
-        let Some(hash) = tx
-            .hash_index_interval_no_deps(tablet_index_name, &table_name, &reads.intervals)
-            .await?
-        else {
-            return Ok(None);
-        };
-        range_hashes.push((
-            namespace,
-            tablet_index_name.clone(),
-            table_name,
-            reads.intervals.clone(),
-            hash,
-        ));
-    }
-    Ok(Some(ContextReadSet {
-        read_set,
-        range_hashes,
-    }))
 }

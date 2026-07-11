@@ -68,6 +68,21 @@ Trim failure is an optional-recovery failure. It is counted and logged, but it d
 shared pressure signal or the Node consumer. A diagnostic or allocator failure must not disable the
 remaining reclamation actions while cgroup headroom is low.
 
+## Context-reuse integration
+
+This patch defines and publishes the process-wide pressure signal but does not add a dependency on
+context reuse. The separate [`context_reuse`](../context_reuse/README.md) patch is applied on top of
+this patch and consumes the signal.
+
+When both patches are carried, each idle isolate drops its separate fresh context, evicts the
+probationary resident, removes the weakest protected residents until only the two strongest remain,
+and requests V8 low-memory collection after removing roots. The context patch also suppresses new
+and probationary reusable admission while pressure is active and owns the corresponding cache
+operation, clear-reason, and cardinality contracts.
+
+This ordering keeps the generic memory controller useful without context reuse and keeps V8 cache
+policy in the patch that owns the cache.
+
 ## Local Node reclamation
 
 The local Node watchdog observes the same pressure signal. After continuous pressure for
@@ -116,9 +131,11 @@ backend restart.
 
 Focused tests cover hysteresis, pressure-signal publication after trim evaluation, trim cooldown and
 signed results, bounded live glibc arena counting, Node RSS and grace requirements, and ordinary-RSS
-decision priority. Runtime verification must use emitted metrics to measure trim latency and memory
-changes, owner reclamation, Node retirement, and cgroup recovery. No fixed reclaimed-byte or latency
-benefit is assumed.
+decision priority. The dependent context patch separately tests six-entry admission, pressure
+convergence to two hot protected contexts, admission suppression, and in-flight protected return.
+Runtime verification must use emitted metrics to measure trim latency and memory changes, owner
+reclamation, Node retirement, and cgroup recovery. No fixed reclaimed-byte or latency benefit is
+assumed.
 
 Removing the patch restores the previous backend memory behavior. No schema or data change is
 involved, but an older image does not understand the new environment variables or emit the new
