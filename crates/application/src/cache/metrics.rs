@@ -85,6 +85,7 @@ pub fn log_plan_wait() {
 pub enum GoReason {
     NoCacheResult,
     PeerTimestampTooNew,
+    DependencyCannotWaitForIndependentPeer,
 }
 register_convex_counter!(
     CACHE_PLAN_GO_TOTAL,
@@ -95,6 +96,9 @@ pub fn log_plan_go(reason: GoReason) {
     let label = match reason {
         GoReason::NoCacheResult => StaticMetricLabel::new("reason", "no_cache_result"),
         GoReason::PeerTimestampTooNew => StaticMetricLabel::new("reason", "peer_timestamp_too_new"),
+        GoReason::DependencyCannotWaitForIndependentPeer => {
+            StaticMetricLabel::new("reason", "dependency_cannot_wait_for_independent_peer")
+        },
     };
     log_counter_with_labels(&CACHE_PLAN_GO_TOTAL, 1, vec![label]);
 }

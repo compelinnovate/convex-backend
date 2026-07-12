@@ -131,6 +131,18 @@ impl HeapSize for UdfType {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedulerDependencyClass {
+    Independent,
+    UnblocksAncestor,
+}
+
+impl SchedulerDependencyClass {
+    pub fn unblocks_ancestor(&self) -> bool {
+        matches!(self, Self::UnblocksAncestor)
+    }
+}
+
 impl From<UdfType> for UdfTypeProto {
     fn from(u: UdfType) -> UdfTypeProto {
         match u {

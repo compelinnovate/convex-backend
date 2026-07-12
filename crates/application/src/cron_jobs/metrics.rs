@@ -82,3 +82,25 @@ register_convex_counter!(
 pub fn log_cron_job_executor_error() {
     log_counter(&CRON_JOB_EXECUTOR_ERRORS_TOTAL, 1)
 }
+
+register_convex_gauge!(
+    CRON_JOB_NUM_RUNNING_INFO,
+    "Current number of executing registered cron jobs"
+);
+pub fn set_num_running_jobs(num_running: usize) {
+    log_gauge(&CRON_JOB_NUM_RUNNING_INFO, num_running as f64);
+}
+
+/// Resets process-global occupancy if the executor future is canceled or exits.
+pub struct NumRunningJobsGaugeGuard;
+
+impl Drop for NumRunningJobsGaugeGuard {
+    fn drop(&mut self) {
+        set_num_running_jobs(0);
+    }
+}
+
+pub fn initialize_num_running_jobs() -> NumRunningJobsGaugeGuard {
+    set_num_running_jobs(0);
+    NumRunningJobsGaugeGuard
+}

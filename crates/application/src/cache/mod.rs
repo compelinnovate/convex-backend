@@ -41,6 +41,7 @@ use common::{
         AllowedVisibility,
         FunctionCaller,
         QueryInvocation,
+        SchedulerDependencyClass,
         TableName,
         TableStats,
         Timestamp,
@@ -278,6 +279,7 @@ enum CacheEntry {
         receiver: Receiver<CacheResult>,
         // The UDF is being executed at this timestamp.
         ts: Timestamp,
+        scheduler_dependency: SchedulerDependencyClass,
     },
 }
 
@@ -349,6 +351,7 @@ impl<RT: Runtime> CacheManager<RT> {
         caller: FunctionCaller,
         usage_tracker: FunctionUsageTracker,
         query_invocation: QueryInvocation,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<QueryReturn> {
         let timer = get_timer();
         let result = self
@@ -362,6 +365,7 @@ impl<RT: Runtime> CacheManager<RT> {
                 caller,
                 usage_tracker,
                 query_invocation,
+                scheduler_dependency,
             )
             .await;
         match &result {
@@ -390,6 +394,7 @@ impl<RT: Runtime> CacheManager<RT> {
         caller: FunctionCaller,
         usage_tracker: FunctionUsageTracker,
         query_invocation: QueryInvocation,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(QueryReturn, bool)> {
         let start = self.rt.monotonic_now();
         let identity_cache_key = identity.cache_key();
@@ -437,6 +442,7 @@ impl<RT: Runtime> CacheManager<RT> {
                 &identity,
                 ts,
                 context.clone(),
+                scheduler_dependency,
             );
             let (op, stored_key) = match maybe_op {
                 Some(op_key) => op_key,
@@ -476,6 +482,7 @@ impl<RT: Runtime> CacheManager<RT> {
                     op,
                     usage_tracker.clone(),
                     &identity,
+                    scheduler_dependency,
                 )
                 .await?
             {
@@ -608,6 +615,7 @@ impl<RT: Runtime> CacheManager<RT> {
         op: CacheOp<'_>,
         usage_tracker: FunctionUsageTracker,
         requester_identity: &Identity,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<Option<(CacheResult, BTreeMap<TableName, TableStats>)>> {
         let pause_client = self.rt.pause_client();
         pause_client.wait("perform_cache_op").await;
@@ -705,6 +713,7 @@ impl<RT: Runtime> CacheManager<RT> {
                                 UdfType::Query,
                                 journal.clone(),
                                 context,
+                                scheduler_dependency,
                             )
                             .await?;
                         let FunctionOutcome::Query(mut query_outcome) = outcome else {
@@ -893,6 +902,7 @@ impl QueryCache {
         identity: &'a Identity,
         ts: Timestamp,
         context: ExecutionContext,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> Option<(CacheOp<'a>, StoredCacheKey)> {
         let go = |sender: Option<(Sender<_>, u64)>| {
             let (sender, waiting_entry_id) = match sender {
@@ -938,10 +948,20 @@ impl QueryCache {
                 started: peer_started,
                 receiver,
                 ts: peer_ts,
+                scheduler_dependency: peer_scheduler_dependency,
             }) => {
                 let entry_id = *id;
                 if *peer_ts > ts {
                     log_plan_go(GoReason::PeerTimestampTooNew);
+                    return Some((go(None), stored_key));
+                }
+                if scheduler_dependency.unblocks_ancestor()
+                    && !peer_scheduler_dependency.unblocks_ancestor()
+                {
+                    // The independent peer may be queued outside the worker
+                    // reserve. A side-effect-free duplicate keeps this action
+                    // callback attached to the dependency lane.
+                    log_plan_go(GoReason::DependencyCannotWaitForIndependentPeer);
                     return Some((go(None), stored_key));
                 }
                 // We don't serialize sampling `now` under the cache lock, and since it can
@@ -971,7 +991,8 @@ impl QueryCache {
             },
             None => {
                 tracing::debug!("No cache value for {:?}, executing UDF...", stored_key);
-                let (sender, executor_id) = inner.put_waiting(stored_key.clone(), now, ts);
+                let (sender, executor_id) =
+                    inner.put_waiting(stored_key.clone(), now, ts, scheduler_dependency);
                 log_plan_go(GoReason::NoCacheResult);
                 go(Some((sender, executor_id)))
             },
@@ -1027,6 +1048,7 @@ impl Inner {
         key: StoredCacheKey,
         now: tokio::time::Instant,
         ts: Timestamp,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> (Sender<CacheResult>, u64) {
         let id = self.next_waiting_id;
         self.next_waiting_id += 1;
@@ -1038,6 +1060,7 @@ impl Inner {
             receiver,
             started: now,
             ts,
+            scheduler_dependency,
         };
         let new_size = key.size() + new_entry.size();
         let old_size = self

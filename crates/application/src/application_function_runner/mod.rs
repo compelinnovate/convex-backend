@@ -46,6 +46,7 @@ use common::{
         APPLICATION_MAX_CONCURRENT_QUERIES,
         APPLICATION_MAX_CONCURRENT_V8_ACTIONS,
         DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY,
+        ISOLATE_DEPENDENCY_WORKER_RESERVE,
         ISOLATE_MAX_USER_HEAP_SIZE,
         UDF_EXECUTOR_OCC_INITIAL_BACKOFF,
         UDF_EXECUTOR_OCC_MAX_BACKOFF,
@@ -62,10 +63,6 @@ use common::{
         UnixTimestamp,
     },
     schemas::DatabaseSchema,
-    tokio::sync::{
-        Semaphore,
-        SemaphorePermit,
-    },
     types::{
         AllowedVisibility,
         AttributedCaller,
@@ -75,6 +72,7 @@ use common::{
         ModuleEnvironment,
         NodeDependency,
         QueryInvocation,
+        SchedulerDependencyClass,
         Timestamp,
         UdfIdentifier,
         UdfType,
@@ -218,6 +216,7 @@ use crate::{
     application_function_runner::metrics::{
         function_run_timer,
         function_total_timer,
+        initialize_function_wait_timeout,
         log_function_wait_timeout,
         log_mutation_already_committed,
     },
@@ -239,8 +238,14 @@ use crate::{
     QueryReturn,
 };
 
+mod dependency_overflow;
 mod http_routing;
 mod metrics;
+
+use self::dependency_overflow::{
+    DependencyOverflowGate,
+    DependencyOverflowPermit,
+};
 
 static BUILD_DEPS_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| Duration::from_secs(600));
 
@@ -272,6 +277,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
             *APPLICATION_MAX_CONCURRENT_QUERIES,
             *APPLICATION_FUNCTION_RUNNER_SEMAPHORE_TIMEOUT,
             function_log.clone(),
+            *ISOLATE_DEPENDENCY_WORKER_RESERVE,
         ));
         let mutation_limiter = Arc::new(Limiter::new(
             ModuleEnvironment::Isolate,
@@ -279,6 +285,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
             *APPLICATION_MAX_CONCURRENT_MUTATIONS,
             *APPLICATION_FUNCTION_RUNNER_SEMAPHORE_TIMEOUT,
             function_log.clone(),
+            *ISOLATE_DEPENDENCY_WORKER_RESERVE,
         ));
         let action_limiter = Arc::new(Limiter::new(
             ModuleEnvironment::Isolate,
@@ -286,6 +293,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
             *APPLICATION_MAX_CONCURRENT_V8_ACTIONS,
             *APPLICATION_FUNCTION_RUNNER_ACTION_SEMAPHORE_TIMEOUT,
             function_log,
+            *ISOLATE_DEPENDENCY_WORKER_RESERVE,
         ));
         Self {
             function_runner,
@@ -299,6 +307,13 @@ impl<RT: Runtime> FunctionRouter<RT> {
     }
 }
 
+fn node_action_gate_dependency(
+    caller: &FunctionCaller,
+    scheduler_dependency: SchedulerDependencyClass,
+) -> bool {
+    scheduler_dependency.unblocks_ancestor() || !caller.is_root()
+}
+
 impl<RT: Runtime> FunctionRouter<RT> {
     #[fastrace::trace]
     pub(crate) async fn execute_query_or_mutation(
@@ -308,6 +323,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         udf_type: UdfType,
         journal: QueryJournal,
         context: ExecutionContext,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
         anyhow::ensure!(udf_type == UdfType::Query || udf_type == UdfType::Mutation);
         // All queries and mutations are run in the isolate environment.
@@ -323,6 +339,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                     path_and_args,
                 }),
                 None,
+                scheduler_dependency,
                 false,
             )
             .await?;
@@ -339,6 +356,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         log_line_sender: mpsc::UnboundedSender<LogLine>,
         context: ExecutionContext,
         wait_for_permit: bool,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<ActionOutcome> {
         let (_, outcome) = self
             .function_runner_execute(
@@ -351,6 +369,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                     path_and_args,
                 }),
                 None,
+                scheduler_dependency,
                 wait_for_permit,
             )
             .await?;
@@ -379,6 +398,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 Some(log_line_sender),
                 None,
                 Some(http_action_metadata),
+                SchedulerDependencyClass::Independent,
                 false,
             )
             .await?;
@@ -392,7 +412,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
 
     /// Waits to acquire action permit
     pub async fn acquire_action_permit(&self) -> anyhow::Result<RequestGuard<'_, RT>> {
-        self.action_limiter.acquire_permit().await
+        self.action_limiter.acquire_permit(false).await
     }
 
     // Drain the v8 action concurrency permits to deterministically
@@ -408,6 +428,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
         function_metadata: Option<FunctionMetadata>,
         http_action_metadata: Option<HttpActionMetadata>,
+        scheduler_dependency: SchedulerDependencyClass,
         wait_for_permit: bool,
     ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
         let in_memory_index_last_modified = self
@@ -423,9 +444,13 @@ impl<RT: Runtime> FunctionRouter<RT> {
         };
 
         let permit = if wait_for_permit {
-            limiter.acquire_permit().await?
+            limiter
+                .acquire_permit(scheduler_dependency.unblocks_ancestor())
+                .await?
         } else {
-            limiter.acquire_permit_with_timeout(&self.rt).await?
+            limiter
+                .acquire_permit_with_timeout(&self.rt, scheduler_dependency.unblocks_ancestor())
+                .await?
         };
 
         let timer = function_run_timer(udf_type);
@@ -444,6 +469,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 self.default_system_env_vars.clone(),
                 in_memory_index_last_modified,
                 context,
+                scheduler_dependency,
             )
             .await?;
         timer.finish();
@@ -485,14 +511,15 @@ struct Limiter<RT: Runtime> {
     udf_type: UdfType,
     env: ModuleEnvironment,
 
-    // Used to limit running functions.
-    semaphore: Semaphore,
+    // Every request uses shared base capacity. Only ancestor-unblocking
+    // dependencies may run in the overflow range above it.
+    concurrency_gate: DependencyOverflowGate,
     total_permits: usize,
 
     // How long to wait for a permit before rejecting the request.
     semaphore_timeout: Duration,
 
-    // Total function requests, including ones still waiting on the semaphore.
+    // Total function requests, including ones still waiting for admission.
     total_outstanding: AtomicUsize,
 
     // Function execution log for recording outstanding function gauges.
@@ -506,11 +533,15 @@ impl<RT: Runtime> Limiter<RT> {
         total_permits: usize,
         semaphore_timeout: Duration,
         function_log: FunctionExecutionLog<RT>,
+        dependency_reserve: usize,
     ) -> Self {
+        initialize_function_wait_timeout(env, udf_type);
+        let effective_reserve = dependency_reserve.min(total_permits.saturating_sub(1));
+        let base_permits = total_permits - effective_reserve;
         let limiter = Self {
             udf_type,
             env,
-            semaphore: Semaphore::new(total_permits),
+            concurrency_gate: DependencyOverflowGate::new(base_permits, total_permits),
             total_permits,
             semaphore_timeout,
             total_outstanding: AtomicUsize::new(0),
@@ -525,14 +556,14 @@ impl<RT: Runtime> Limiter<RT> {
     async fn acquire_permit_with_timeout<'a>(
         &'a self,
         rt: &'a RT,
+        is_dependency: bool,
     ) -> anyhow::Result<RequestGuard<'a, RT>> {
         let mut request_guard = self.start();
         select! {
             biased;
-            _ = request_guard.acquire_permit() => {},
+            _ = request_guard.acquire_permit(is_dependency) => {},
             x = async {
-                // Report metrics while waiting for a permit. This captures the
-                // queued state only when the semaphore is actually full.
+                // Report metrics once permit acquisition is pending.
                 self.report_metrics();
                 future::pending::<!>().await
             } => match x {},
@@ -557,9 +588,9 @@ impl<RT: Runtime> Limiter<RT> {
     }
 
     /// Waits to acquire a permit
-    async fn acquire_permit(&self) -> anyhow::Result<RequestGuard<'_, RT>> {
+    async fn acquire_permit(&self, is_dependency: bool) -> anyhow::Result<RequestGuard<'_, RT>> {
         let mut request_guard = self.start();
-        request_guard.acquire_permit().await?;
+        request_guard.acquire_permit(is_dependency).await?;
         Ok(request_guard)
     }
 
@@ -571,19 +602,13 @@ impl<RT: Runtime> Limiter<RT> {
         }
     }
 
-    // Permanently remove all permits so the next acquisition hits the concurrency
-    // limit, simulating a saturated backend. Use `add_permits` to make capacity
-    // available again. Test-only.
     // Reports metrics for the current waiting and running function gauges.
     fn report_metrics(&self) {
-        let num_running_functions = self.total_permits - self.semaphore.available_permits();
-        let num_queued_functions = if self.semaphore.available_permits() > 0 {
-            0
-        } else {
-            self.total_outstanding
-                .load(Ordering::SeqCst)
-                .saturating_sub(num_running_functions)
-        };
+        let num_running_functions = self.concurrency_gate.active();
+        let num_queued_functions = self
+            .total_outstanding
+            .load(Ordering::SeqCst)
+            .saturating_sub(num_running_functions);
 
         // Log to prometheus
         log_outstanding_functions(
@@ -620,17 +645,17 @@ impl<RT: Runtime> Limiter<RT> {
 // gauges even if dropped.
 pub struct RequestGuard<'a, RT: Runtime> {
     limiter: &'a Limiter<RT>,
-    permit: Option<SemaphorePermit<'a>>,
+    permit: Option<DependencyOverflowPermit>,
 }
 
 impl<RT: Runtime> RequestGuard<'_, RT> {
-    async fn acquire_permit(&mut self) -> anyhow::Result<()> {
+    async fn acquire_permit(&mut self, is_dependency: bool) -> anyhow::Result<()> {
         let timer = function_waiter_timer(self.limiter.udf_type);
         assert!(
             self.permit.is_none(),
             "Called `acquire_permit` more than once"
         );
-        self.permit = Some(self.limiter.semaphore.acquire().await?);
+        self.permit = Some(self.limiter.concurrency_gate.acquire(is_dependency).await);
         timer.finish();
         // Report metrics to account for the newly running function.
         self.limiter.report_metrics();
@@ -640,7 +665,7 @@ impl<RT: Runtime> RequestGuard<'_, RT> {
 
 impl<RT: Runtime> Drop for RequestGuard<'_, RT> {
     fn drop(&mut self) {
-        // Drop the semaphore permit before reporting metrics.
+        // Drop the admission permit before reporting metrics.
         drop(self.permit.take());
         // Remove the request from the running ones.
         self.limiter
@@ -719,6 +744,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             *APPLICATION_MAX_CONCURRENT_NODE_ACTIONS,
             *APPLICATION_FUNCTION_RUNNER_ACTION_SEMAPHORE_TIMEOUT,
             function_log.clone(),
+            *ISOLATE_DEPENDENCY_WORKER_RESERVE,
         );
 
         Self {
@@ -824,6 +850,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         UdfType::Query,
                         QueryJournal::new(),
                         context.clone(),
+                        SchedulerDependencyClass::Independent,
                     )
                     .await?
             },
@@ -892,6 +919,31 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         caller: FunctionCaller,
         mutation_queue_length: Option<usize>,
     ) -> anyhow::Result<Result<MutationReturn, MutationError>> {
+        self.retry_mutation_with_scheduler_dependency(
+            request_context,
+            path,
+            arguments,
+            identity,
+            mutation_identifier,
+            caller,
+            mutation_queue_length,
+            SchedulerDependencyClass::Independent,
+        )
+        .await
+    }
+
+    /// Runs a mutations and retries on OCC errors.
+    pub(crate) async fn retry_mutation_with_scheduler_dependency(
+        &self,
+        request_context: RequestContext,
+        path: PublicFunctionPath,
+        arguments: SerializedArgs,
+        identity: Identity,
+        mutation_identifier: Option<SessionRequestIdentifier>,
+        caller: FunctionCaller,
+        mutation_queue_length: Option<usize>,
+        scheduler_dependency: SchedulerDependencyClass,
+    ) -> anyhow::Result<Result<MutationReturn, MutationError>> {
         let timer = mutation_timer();
         let result = self
             ._retry_mutation(
@@ -902,6 +954,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 mutation_identifier,
                 caller,
                 mutation_queue_length,
+                scheduler_dependency,
             )
             .await;
         match &result {
@@ -922,6 +975,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         mutation_identifier: Option<SessionRequestIdentifier>,
         caller: FunctionCaller,
         mutation_queue_length: Option<usize>,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<Result<MutationReturn, MutationError>> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
             anyhow::bail!(unauthorized_error("mutation"));
@@ -973,6 +1027,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     caller.allowed_visibility(),
                     context.clone(),
                     mutation_queue_length,
+                    scheduler_dependency,
                 )
                 .await;
             let (mut tx, mut outcome) = match result {
@@ -1160,6 +1215,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         allowed_visibility: AllowedVisibility,
         context: ExecutionContext,
         mutation_queue_length: Option<usize>,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(Transaction<RT>, ValidatedUdfOutcome)> {
         self.database.check_write_throughput_limit()?;
         let result = self
@@ -1170,6 +1226,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 allowed_visibility,
                 context,
                 mutation_queue_length,
+                scheduler_dependency,
             )
             .await;
         match result.as_ref() {
@@ -1201,6 +1258,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         allowed_visibility: AllowedVisibility,
         context: ExecutionContext,
         mutation_queue_length: Option<usize>,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(Transaction<RT>, ValidatedUdfOutcome)> {
         if path.is_system() && !(tx.identity().is_admin() || tx.identity().is_system()) {
             anyhow::bail!(unauthorized_error("mutation"));
@@ -1240,6 +1298,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 UdfType::Mutation,
                 QueryJournal::new(),
                 context.clone(),
+                scheduler_dependency,
             )
             .await?;
         let mutation_outcome = match outcome {
@@ -1279,6 +1338,26 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         identity: Identity,
         caller: FunctionCaller,
     ) -> anyhow::Result<Result<ActionReturn, ActionError>> {
+        self.run_action_with_scheduler_dependency(
+            request_context,
+            path,
+            arguments,
+            identity,
+            caller,
+            SchedulerDependencyClass::Independent,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_action_with_scheduler_dependency(
+        &self,
+        request_context: RequestContext,
+        path: PublicFunctionPath,
+        arguments: SerializedArgs,
+        identity: Identity,
+        caller: FunctionCaller,
+        scheduler_dependency: SchedulerDependencyClass,
+    ) -> anyhow::Result<Result<ActionReturn, ActionError>> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
             anyhow::bail!(unauthorized_error("action"));
         }
@@ -1294,6 +1373,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 usage_tracking.clone(),
                 context.clone(),
                 false,
+                scheduler_dependency,
             )
             .await;
         let completion = match completion_result {
@@ -1342,6 +1422,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         usage_tracking: FunctionUsageTracker,
         context: ExecutionContext,
         wait_for_permit: bool,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<ActionCompletion> {
         let result = self
             .run_action_inner(
@@ -1352,6 +1433,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 usage_tracking,
                 context,
                 wait_for_permit,
+                scheduler_dependency,
             )
             .await;
         match result.as_ref() {
@@ -1384,6 +1466,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         usage_tracking: FunctionUsageTracker,
         context: ExecutionContext,
         wait_for_permit: bool,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<ActionCompletion> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
             anyhow::bail!(unauthorized_error("action"));
@@ -1459,6 +1542,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         log_line_sender,
                         context.clone(),
                         wait_for_permit,
+                        scheduler_dependency,
                     )
                     .boxed();
                 let (outcome_result, log_lines) = run_function_and_collect_log_lines(
@@ -1517,11 +1601,18 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     }
                     Ok(source_maps)
                 };
+                // A nested Node action must be able to pass the same application
+                // gate whose permit is retained by its parent. This is independent
+                // from isolate ancestry: do not propagate it to the isolate scheduler.
+                let is_node_action_dependency =
+                    node_action_gate_dependency(&caller, scheduler_dependency);
                 let _permit = if wait_for_permit {
-                    self.node_action_limiter.acquire_permit().await?
+                    self.node_action_limiter
+                        .acquire_permit(is_node_action_dependency)
+                        .await?
                 } else {
                     self.node_action_limiter
-                        .acquire_permit_with_timeout(&self.runtime)
+                        .acquire_permit_with_timeout(&self.runtime, is_node_action_dependency)
                         .await?
                 };
 
@@ -1577,6 +1668,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     environment_variables,
                     callback_token: self.key_broker.issue_action_token(path.component),
                     context: context.clone(),
+                    has_isolate_worker_ancestor: scheduler_dependency.unblocks_ancestor(),
                     encoded_parent_trace: EncodedSpan::from_parent().0,
                 };
 
@@ -1957,6 +2049,32 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         caller: FunctionCaller,
         invocation: QueryInvocation,
     ) -> anyhow::Result<QueryReturn> {
+        self.run_query_at_ts_with_scheduler_dependency(
+            request_context,
+            path,
+            args,
+            identity,
+            ts,
+            journal,
+            caller,
+            invocation,
+            SchedulerDependencyClass::Independent,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_query_at_ts_with_scheduler_dependency(
+        &self,
+        request_context: RequestContext,
+        path: PublicFunctionPath,
+        args: SerializedArgs,
+        identity: Identity,
+        ts: Timestamp,
+        journal: Option<QueryJournal>,
+        caller: FunctionCaller,
+        invocation: QueryInvocation,
+        scheduler_dependency: SchedulerDependencyClass,
+    ) -> anyhow::Result<QueryReturn> {
         let result = self
             .run_query_at_ts_inner(
                 request_context,
@@ -1967,6 +2085,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 journal,
                 caller,
                 invocation,
+                scheduler_dependency,
             )
             .await;
         match result.as_ref() {
@@ -1999,6 +2118,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         journal: Option<QueryJournal>,
         caller: FunctionCaller,
         invocation: QueryInvocation,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<QueryReturn> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
             anyhow::bail!(unauthorized_error("query"));
@@ -2018,6 +2138,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 caller.clone(),
                 usage_tracker.clone(),
                 invocation,
+                scheduler_dependency,
             )
             .await;
 
@@ -2116,6 +2237,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
     }
 }
 
+// In-process V8 and HTTP actions keep an isolate worker while these callbacks
+// wait. Node callbacks enter through HTTP and do not use this boundary.
 #[async_trait]
 impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
     #[fastrace::trace]
@@ -2137,8 +2260,9 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
         context: ExecutionContext,
     ) -> anyhow::Result<FunctionResult> {
         let ts = self.database.now_ts_for_reads();
+        let scheduler_dependency = SchedulerDependencyClass::UnblocksAncestor;
         let result = self
-            .run_query_at_ts(
+            .run_query_at_ts_with_scheduler_dependency(
                 RequestContext::new(context.request_id, context.request_metadata),
                 PublicFunctionPath::Component(path),
                 args,
@@ -2150,6 +2274,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
                     parent_execution_id: Some(context.execution_id),
                 },
                 QueryInvocation::Fresh,
+                scheduler_dependency,
             )
             .await?
             .result;
@@ -2164,8 +2289,9 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
         args: SerializedArgs,
         context: ExecutionContext,
     ) -> anyhow::Result<FunctionResult> {
+        let scheduler_dependency = SchedulerDependencyClass::UnblocksAncestor;
         let result = self
-            .retry_mutation(
+            .retry_mutation_with_scheduler_dependency(
                 RequestContext::new(context.request_id, context.request_metadata),
                 PublicFunctionPath::Component(path),
                 args,
@@ -2176,6 +2302,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
                     parent_execution_id: Some(context.execution_id),
                 },
                 None,
+                scheduler_dependency,
             )
             .await
             .map(|r| match r {
@@ -2195,7 +2322,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
     ) -> anyhow::Result<FunctionResult> {
         let _tx = self.database.begin(identity.clone()).await?;
         let result = self
-            .run_action(
+            .run_action_with_scheduler_dependency(
                 RequestContext::new(context.request_id, context.request_metadata),
                 PublicFunctionPath::Component(path),
                 args,
@@ -2204,6 +2331,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
                     parent_scheduled_job: context.parent_scheduled_job,
                     parent_execution_id: Some(context.execution_id),
                 },
+                SchedulerDependencyClass::UnblocksAncestor,
             )
             .await
             .map(|r| match r {
@@ -2419,5 +2547,34 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
         FunctionHandlesModel::new(&mut tx)
             .get_with_component_path(path)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::types::{
+        FunctionCaller,
+        SchedulerDependencyClass,
+    };
+
+    use super::node_action_gate_dependency;
+
+    #[test]
+    fn nested_node_actions_use_application_overflow_without_false_isolate_ancestry() {
+        assert!(!node_action_gate_dependency(
+            &FunctionCaller::Cron,
+            SchedulerDependencyClass::Independent,
+        ));
+        assert!(node_action_gate_dependency(
+            &FunctionCaller::Action {
+                parent_scheduled_job: None,
+                parent_execution_id: None,
+            },
+            SchedulerDependencyClass::Independent,
+        ));
+        assert!(node_action_gate_dependency(
+            &FunctionCaller::Cron,
+            SchedulerDependencyClass::UnblocksAncestor,
+        ));
     }
 }

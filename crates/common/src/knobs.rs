@@ -29,6 +29,45 @@ use cmd_util::env::env_config;
 
 use crate::fastrace_helpers::SamplingConfig;
 
+fn parse_usize_strict(name: &str, value: &str) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+        "Invalid value for {name}: expected an unsigned decimal integer"
+    );
+    value
+        .parse::<usize>()
+        .map_err(|e| anyhow::anyhow!("Invalid value for {name}: {e:?}"))
+}
+
+fn env_config_usize_strict(name: &str, default: usize) -> usize {
+    let value = match std::env::var(name) {
+        Ok(var_s) => parse_usize_strict(name, &var_s).unwrap_or_else(|e| panic!("{e}")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(..)) => {
+            panic!("Invalid non-Unicode value for {name}")
+        },
+    };
+    if value != default {
+        tracing::info!("Overriding {name} to {value:?} from environment");
+    }
+    value
+}
+
+fn env_config_usize_strict_nonzero(name: &str, default: usize) -> usize {
+    let value = env_config_usize_strict(name, default);
+    validate_usize_strict_nonzero(name, value).unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn validate_usize_strict_nonzero(name: &str, value: usize) -> anyhow::Result<usize> {
+    anyhow::ensure!(value > 0, "{name} must be greater than zero");
+    anyhow::ensure!(
+        value <= tokio::sync::Semaphore::MAX_PERMITS,
+        "{name} must not exceed {}",
+        tokio::sync::Semaphore::MAX_PERMITS,
+    );
+    Ok(value)
+}
+
 /// This exists solely to allow knobs to have separate defaults for local
 /// execution and prod (running in Nomad). Don't export this outside of
 /// this module. We assume that if we're running in Nomad, we're in production
@@ -495,12 +534,13 @@ pub static TRANSACTION_MAX_SCHEDULED_TOTAL_ARGUMENT_SIZE_BYTES: LazyLock<usize> 
         ) // 16 MiB
     });
 
-/// Number of scheduled jobs that can execute in parallel.
+/// Number of jobs that the ordinary scheduled-function executor and the
+/// registered-cron executor can each execute in parallel.
 // Note that the current algorithm for executing ready jobs has up to
 // SCHEDULED_JOB_EXECUTION_PARALLELISM overhead for every executed job, so we
 // don't want to set this number too high.
 pub static SCHEDULED_JOB_EXECUTION_PARALLELISM: LazyLock<usize> =
-    LazyLock::new(|| env_config("SCHEDULED_JOB_EXECUTION_PARALLELISM", 8));
+    LazyLock::new(|| env_config_usize_strict_nonzero("SCHEDULED_JOB_EXECUTION_PARALLELISM", 8));
 
 /// Initial backoff in milliseconds on a system error from a scheduled job.
 pub static SCHEDULED_JOB_INITIAL_BACKOFF: LazyLock<Duration> =
@@ -922,13 +962,29 @@ pub static DATABASE_UDF_SYSTEM_TIMEOUT: LazyLock<Duration> =
 pub static ISOLATE_ANALYZE_USER_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_ANALYZE_USER_TIMEOUT_SECONDS", 4)));
 
+fn env_config_isolate_scheduler_usize_strict(name: &str, default: usize) -> usize {
+    let value = match std::env::var(name) {
+        Ok(var_s) => var_s
+            .parse::<usize>()
+            .unwrap_or_else(|e| panic!("Invalid value for {name}: {e:?}")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(..)) => {
+            panic!("Invalid non-Unicode value for {name}")
+        },
+    };
+    if value != default {
+        tracing::info!("Overriding {name} to {value:?} from environment");
+    }
+    value
+}
+
 /// Increasing the size of the queue helps us deal with bursty requests. This is
 /// a CoDel queue [https://queue.acm.org/detail.cfm?id=2209336], which will
 /// switch from FIFO to LIFO queue when overloaded, in order to process as much
 /// as possible and avoid a congestion collapse. The primary downside of
 /// increasing this is memory usage from the UDF arguments.
 pub static ISOLATE_QUEUE_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("ISOLATE_QUEUE_SIZE", 2000));
+    LazyLock::new(|| env_config_isolate_scheduler_usize_strict("ISOLATE_QUEUE_SIZE", 2000));
 
 /// The maximum length of time to wait to start running a function when the
 /// isolate scheduler is idle.
@@ -942,7 +998,21 @@ pub static ISOLATE_QUEUE_CONGESTED_TIMEOUT: LazyLock<Duration> =
 
 /// Maximum number of isolate worker threads in a function runner process.
 pub static MAX_ISOLATE_WORKERS: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_ISOLATE_WORKERS", 300));
+    LazyLock::new(|| env_config_isolate_scheduler_usize_strict("MAX_ISOLATE_WORKERS", 300));
+
+/// Dependency-only worker overflow above shared base capacity. All request
+/// classes share `MAX_ISOLATE_WORKERS - ISOLATE_DEPENDENCY_WORKER_RESERVE`
+/// base slots; only requests unblocking an isolate-holding ancestor may raise
+/// total occupancy above that point. The isolate client validates that this is
+/// smaller than MAX_ISOLATE_WORKERS.
+pub static ISOLATE_DEPENDENCY_WORKER_RESERVE: LazyLock<usize> = LazyLock::new(|| {
+    env_config_isolate_scheduler_usize_strict("ISOLATE_DEPENDENCY_WORKER_RESERVE", 1)
+});
+
+/// Maximum independent V8 and HTTP actions assigned to isolate workers. Zero
+/// derives the limit from shared base worker capacity.
+pub static MAX_ISOLATE_ACTION_WORKERS: LazyLock<usize> =
+    LazyLock::new(|| env_config_isolate_scheduler_usize_strict("MAX_ISOLATE_ACTION_WORKERS", 0));
 
 /// The size of the pending commits in the committer queue. This is a FIFO
 /// queue, so if the queue is too large, we run into a risk of all requests
@@ -1358,7 +1428,7 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
 /// The maximum number of CPU cores that can be used simultaneously by the
 /// isolates. Zero means no limit.
 pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> =
-    LazyLock::new(|| env_config("FUNRUN_ISOLATE_ACTIVE_THREADS", 0));
+    LazyLock::new(|| env_config_isolate_scheduler_usize_strict("FUNRUN_ISOLATE_ACTIVE_THREADS", 0));
 
 /// Isolate worker usage at which the funrun load reporter's
 /// `effective_load` saturates to 1.0.
@@ -2020,3 +2090,27 @@ pub static HTTP2_CLIENT_KEEPALIVE_INTERVAL: LazyLock<Duration> = LazyLock::new(|
 /// dropped.
 pub static HTTP2_CLIENT_KEEPALIVE_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("HTTP2_CLIENT_KEEPALIVE_TIMEOUT_SECONDS", 15)));
+
+#[cfg(test)]
+mod strict_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn usize_capacity_parser_is_strict() {
+        assert_eq!(parse_usize_strict("CAP", "17").unwrap(), 17);
+        for invalid in ["", "0x10", "+1", "-1", "1_0", " 1", "1 ", "１２"] {
+            assert!(parse_usize_strict("CAP", invalid).is_err(), "{invalid:?}");
+        }
+        let overflow = format!("{}0", usize::MAX);
+        assert!(parse_usize_strict("CAP", &overflow).is_err());
+    }
+
+    #[test]
+    fn semaphore_capacity_rejects_zero_and_oversized_values() {
+        assert_eq!(validate_usize_strict_nonzero("CAP", 17).unwrap(), 17);
+        assert!(validate_usize_strict_nonzero("CAP", 0).is_err());
+        assert!(
+            validate_usize_strict_nonzero("CAP", tokio::sync::Semaphore::MAX_PERMITS + 1).is_err()
+        );
+    }
+}

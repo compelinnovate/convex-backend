@@ -37,6 +37,7 @@ use common::{
     runtime::Runtime,
     types::{
         FunctionCaller,
+        SchedulerDependencyClass,
         UdfType,
     },
     RequestId,
@@ -114,6 +115,7 @@ pub struct CronJobExecutor<RT: Runtime> {
     next_job_ready_time: Option<Timestamp>,
     job_finished_tx: mpsc::Sender<ResolvedDocumentId>,
     job_finished_rx: mpsc::Receiver<ResolvedDocumentId>,
+    execution_parallelism: usize,
 }
 
 #[derive(Clone)]
@@ -126,15 +128,37 @@ pub struct CronJobContext<RT: Runtime> {
 }
 
 impl<RT: Runtime> CronJobExecutor<RT> {
-    pub async fn run(
+    pub fn run(
         rt: RT,
         deployment_name: String,
         database: Database<RT>,
         runner: Arc<ApplicationFunctionRunner<RT>>,
         function_log: FunctionExecutionLog<RT>,
+    ) -> impl Future<Output = ()> {
+        // Resolve strict configuration before the future is spawned. A panic inside the
+        // executor task would otherwise leave the backend running without
+        // registered cron work.
+        let execution_parallelism = *SCHEDULED_JOB_EXECUTION_PARALLELISM;
+        Self::run_with_parallelism(
+            rt,
+            deployment_name,
+            database,
+            runner,
+            function_log,
+            execution_parallelism,
+        )
+    }
+
+    async fn run_with_parallelism(
+        rt: RT,
+        deployment_name: String,
+        database: Database<RT>,
+        runner: Arc<ApplicationFunctionRunner<RT>>,
+        function_log: FunctionExecutionLog<RT>,
+        execution_parallelism: usize,
     ) {
-        let (job_finished_tx, job_finished_rx) =
-            mpsc::channel(*SCHEDULED_JOB_EXECUTION_PARALLELISM);
+        let (job_finished_tx, job_finished_rx) = mpsc::channel(execution_parallelism);
+        let _num_running_jobs_gauge = metrics::initialize_num_running_jobs();
         let mut executor = Self {
             context: CronJobContext {
                 rt,
@@ -147,6 +171,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
             next_job_ready_time: None,
             job_finished_tx,
             job_finished_rx,
+            execution_parallelism,
         };
         let mut backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
         tracing::info!("Starting cron job executor");
@@ -176,7 +201,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
 
         self.next_job_ready_time = if is_backend_stopped {
             None
-        } else if self.running_job_ids.len() == *SCHEDULED_JOB_EXECUTION_PARALLELISM {
+        } else if self.running_job_ids.len() == self.execution_parallelism {
             self.next_job_ready_time
         } else {
             self.query_and_start_jobs(&mut tx).await?
@@ -212,7 +237,12 @@ impl<RT: Runtime> CronJobExecutor<RT> {
             job_id = self.job_finished_rx.recv().fuse() => {
                 if let Some(job_id) = job_id {
                     self.context.rt.pause_client().wait(CRON_JOB_EXECUTED).await;
-                    self.running_job_ids.remove(&job_id);
+                    let job_was_owned = self.running_job_ids.remove(&job_id);
+                    metrics::set_num_running_jobs(self.running_job_ids.len());
+                    anyhow::ensure!(
+                        job_was_owned,
+                        "Cron job executor received a completion for an unowned job"
+                    );
                 } else {
                     anyhow::bail!("Job results channel closed, this is unexpected!");
                 }
@@ -241,7 +271,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
             // caught up, we can sleep until the timestamp. If we're behind and
             // at our concurrency limit, we can use the timestamp to log how far
             // behind we get.
-            if next_ts > now || self.running_job_ids.len() == *SCHEDULED_JOB_EXECUTION_PARALLELISM {
+            if next_ts > now || self.running_job_ids.len() == self.execution_parallelism {
                 return Ok(Some(next_ts));
             }
             let sentry_hub = sentry::Hub::with(|hub| sentry::Hub::new_from_top(hub));
@@ -262,7 +292,9 @@ impl<RT: Runtime> CronJobExecutor<RT> {
                 }
                 .bind_hub(sentry_hub),
             );
-            self.running_job_ids.insert(job_id);
+            let inserted = self.running_job_ids.insert(job_id);
+            assert!(inserted, "running cron job was checked before spawn");
+            metrics::set_num_running_jobs(self.running_job_ids.len());
         }
         Ok(None)
     }
@@ -464,6 +496,7 @@ impl<RT: Runtime> CronJobContext<RT> {
                         caller.allowed_visibility(),
                         context.clone(),
                         None,
+                        SchedulerDependencyClass::Independent,
                     )
                     .await
             };
@@ -679,6 +712,7 @@ impl<RT: Runtime> CronJobContext<RT> {
                         usage_tracker.clone(),
                         context.clone(),
                         true,
+                        SchedulerDependencyClass::Independent,
                     )
                     .await?;
                 let execution_time_f64 = completion.execution_time.as_secs_f64();

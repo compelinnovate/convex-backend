@@ -612,6 +612,7 @@ impl TryFrom<ExecutorRequest> for JsonValue {
                     "environmentVariables": JsonValue::Array(environment_variables),
                     "npmVersion": npm_version.map(|v| v.to_string()),
                     "executionContext": JsonValue::from(r.context),
+                    "hasIsolateWorkerAncestor": r.has_isolate_worker_ancestor,
                     "encodedParentTrace": JsonValue::from(r.encoded_parent_trace),
                     "deployment": {
                         "name": deployment.name,
@@ -712,6 +713,7 @@ pub struct ExecuteRequest {
 
     pub callback_token: ActionCallbackToken,
     pub context: ExecutionContext,
+    pub has_isolate_worker_ancestor: bool,
     pub encoded_parent_trace: Option<String>,
 }
 

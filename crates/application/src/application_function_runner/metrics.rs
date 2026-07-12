@@ -122,7 +122,16 @@ register_convex_counter!(
     APPLICATION_FUNCTION_RUNNER_WAIT_TIMEOUT_TOTAL,
     "Total number with running a function has timed out due to instance concurrency limits.",
     &["udf_type", "env_type"],
+    std::time::Duration::MAX,
 );
+pub fn initialize_function_wait_timeout(env: ModuleEnvironment, udf_type: UdfType) {
+    log_counter_with_labels(
+        &APPLICATION_FUNCTION_RUNNER_WAIT_TIMEOUT_TOTAL,
+        0,
+        vec![udf_type.metric_label(), env.metric_label()],
+    );
+}
+
 pub fn log_function_wait_timeout(env: ModuleEnvironment, udf_type: UdfType) {
     log_counter_with_labels(
         &APPLICATION_FUNCTION_RUNNER_WAIT_TIMEOUT_TOTAL,

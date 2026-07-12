@@ -284,6 +284,9 @@ export type ExecuteRequest = {
   timeoutSecs: number;
   npmVersion: string | null;
   executionContext: ExecutionContext;
+  // Optional during backend/executor rolling upgrades. Missing means the
+  // backend did not report an isolate-holding ancestor.
+  hasIsolateWorkerAncestor?: boolean;
   encodedParentTrace: string | null;
   deployment: DeploymentMetadata;
 };
@@ -363,6 +366,7 @@ export async function execute(
       request.authHeader,
       request.userIdentity,
       request.executionContext,
+      request.hasIsolateWorkerAncestor ?? false,
       request.encodedParentTrace,
       request.deployment,
     );

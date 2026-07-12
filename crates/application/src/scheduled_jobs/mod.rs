@@ -64,6 +64,7 @@ use common::{
     types::{
         FunctionCaller,
         QueryInvocation,
+        SchedulerDependencyClass,
         UdfType,
     },
     RequestId,
@@ -179,6 +180,7 @@ pub struct ScheduledJobExecutor<RT: Runtime> {
     next_job_ready_time: Option<Timestamp>,
     job_finished_tx: mpsc::Sender<ResolvedDocumentId>,
     job_finished_rx: mpsc::Receiver<ResolvedDocumentId>,
+    execution_parallelism: usize,
     /// The last time we logged stats, used to rate limit logging
     last_stats_log: SystemTime,
     /// The last logged value of `next_job_ready_time`
@@ -196,19 +198,39 @@ pub struct ScheduledJobContext<RT: Runtime> {
     function_log: FunctionExecutionLog<RT>,
 }
 
-impl<RT: Runtime> ScheduledJobContext<RT> {
-}
-
 impl<RT: Runtime> ScheduledJobExecutor<RT> {
-    pub async fn run(
+    pub fn run(
         rt: RT,
         deployment_name: String,
         database: Database<RT>,
         runner: Arc<ApplicationFunctionRunner<RT>>,
         function_log: FunctionExecutionLog<RT>,
+    ) -> impl Future<Output = ()> {
+        // Resolve strict configuration before the future is spawned. A panic inside the
+        // executor task would otherwise leave the backend running without
+        // scheduled execution.
+        let execution_parallelism = *SCHEDULED_JOB_EXECUTION_PARALLELISM;
+        Self::run_with_parallelism(
+            rt,
+            deployment_name,
+            database,
+            runner,
+            function_log,
+            execution_parallelism,
+        )
+    }
+
+    async fn run_with_parallelism(
+        rt: RT,
+        deployment_name: String,
+        database: Database<RT>,
+        runner: Arc<ApplicationFunctionRunner<RT>>,
+        function_log: FunctionExecutionLog<RT>,
+        execution_parallelism: usize,
     ) {
-        let (job_finished_tx, job_finished_rx) =
-            mpsc::channel(*SCHEDULED_JOB_EXECUTION_PARALLELISM);
+        let (job_finished_tx, job_finished_rx) = mpsc::channel(execution_parallelism);
+        metrics::log_scheduled_job_execution_parallelism(execution_parallelism);
+        let _num_running_jobs_gauge = metrics::initialize_num_running_jobs();
         let mut executor = Self {
             context: ScheduledJobContext {
                 rt: rt.clone(),
@@ -221,6 +243,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
             next_job_ready_time: None,
             job_finished_tx,
             job_finished_rx,
+            execution_parallelism,
             last_stats_log: rt.system_time(),
             // This value will force the first call to `run_once` to log
             last_logged_ready_time: Some(SystemTime::UNIX_EPOCH),
@@ -272,7 +295,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
             // If the backend is stopped we shouldn't poll. Our subscription will notify us
             // when the backend is started again.
             None
-        } else if self.running_job_ids.len() == *SCHEDULED_JOB_EXECUTION_PARALLELISM {
+        } else if self.running_job_ids.len() == self.execution_parallelism {
             // A scheduled job may have been added, but we can't do anything because we're
             // still running jobs at our concurrency limit.
             self.next_job_ready_time
@@ -337,15 +360,25 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
         };
         select_biased! {
             num_jobs = self.job_finished_rx
-                .recv_many(&mut job_ids, *SCHEDULED_JOB_EXECUTION_PARALLELISM)
+                .recv_many(&mut job_ids, self.execution_parallelism)
                 .fuse() => {
                 // `recv_many()` returns the number of jobs received. If this number is 0,
                 // then the channel has been closed.
                 if num_jobs > 0 {
+                    let mut all_jobs_were_owned = true;
                     for job_id in job_ids {
                         pause_client.wait(SCHEDULED_JOB_EXECUTED).await;
-                        self.running_job_ids.remove(&job_id);
+                        if !self.running_job_ids.remove(&job_id) {
+                            all_jobs_were_owned = false;
+                        }
                     }
+                    metrics::set_num_running_jobs(self.running_job_ids.len());
+                    // Apply every valid completion before reporting a malformed batch so the retry
+                    // loop does not retain slots for jobs that have already finished.
+                    anyhow::ensure!(
+                        all_jobs_were_owned,
+                        "Scheduled job executor received a duplicate or unowned completion"
+                    );
                 } else {
                     anyhow::bail!("Job results channel closed, this is unexpected!");
                 }
@@ -403,7 +436,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
             // caught up, we can sleep until the timestamp. If we're behind and
             // at our concurrency limit, we can use the timestamp to log how far
             // behind we get.
-            if next_ts > now || self.running_job_ids.len() == *SCHEDULED_JOB_EXECUTION_PARALLELISM {
+            if next_ts > now || self.running_job_ids.len() == self.execution_parallelism {
                 return Ok(Some(next_ts));
             }
 
@@ -432,7 +465,9 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
                 .bind_hub(sentry_hub),
             );
 
-            self.running_job_ids.insert(job_id);
+            let inserted = self.running_job_ids.insert(job_id);
+            assert!(inserted, "running scheduled job was checked before spawn");
+            metrics::set_num_running_jobs(self.running_job_ids.len());
 
             // We might have hit the concurrency limit by adding the new job, so
             // we could check and break immediately if we have.
@@ -783,6 +818,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                         caller.allowed_visibility(),
                         context.clone(),
                         None,
+                        SchedulerDependencyClass::Independent,
                     )
                     .await
             };
@@ -986,6 +1022,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                         usage_tracker.clone(),
                         context.clone(),
                         true,
+                        SchedulerDependencyClass::Independent,
                     )
                     .await?;
                 let state = match &completion.outcome.result {
