@@ -211,6 +211,7 @@ export class SyscallsImpl {
   backendCallbackToken: string;
   authHeader: string | null;
   executionContext: ExecutionContext;
+  hasIsolateWorkerAncestor: boolean;
 
   // The `userIdentity` is determined from `authHeader`, but we only want to implement parsing in
   // Rust, so we'll unpack it there and send both to JS.
@@ -250,6 +251,7 @@ export class SyscallsImpl {
     authHeader: string | null,
     userIdentity: UserIdentity | null,
     executionContext: ExecutionContext,
+    hasIsolateWorkerAncestor: boolean,
     encodedParentTrace: string | null,
     deployment: DeploymentMetadata,
   ) {
@@ -262,6 +264,7 @@ export class SyscallsImpl {
     this.syscallTrace = {};
     this.pendingSyscallCount = {};
     this.executionContext = executionContext;
+    this.hasIsolateWorkerAncestor = hasIsolateWorkerAncestor;
     this.encodedParentTrace = encodedParentTrace;
     this.deployment = deployment;
     this.mutationSessionId = randomUUID();
@@ -391,6 +394,9 @@ export class SyscallsImpl {
     }
     if (this.executionContext.isRoot !== undefined) {
       headers["Convex-Root-Request"] = this.executionContext.isRoot.toString();
+    }
+    if (this.hasIsolateWorkerAncestor) {
+      headers["Convex-Isolate-Worker-Ancestor"] = "true";
     }
     if (this.authHeader !== null) {
       headers["Authorization"] = this.authHeader;

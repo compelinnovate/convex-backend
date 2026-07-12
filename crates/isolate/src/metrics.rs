@@ -15,6 +15,7 @@ use fastrace::{
     Event,
 };
 use metrics::{
+    add_to_gauge_with_labels,
     log_counter,
     log_counter_with_labels,
     log_distribution,
@@ -25,6 +26,7 @@ use metrics::{
     register_convex_gauge,
     register_convex_gauge_evictable,
     register_convex_histogram,
+    subtract_from_gauge_with_labels,
     CancelableTimer,
     IntoLabel,
     MetricLabel,
@@ -69,6 +71,137 @@ pub fn log_pool_max(name: &'static str, count: usize) {
         &ISOLATE_POOL_MAX_INFO,
         count as f64,
         vec![StaticMetricLabel::new("pool_name", name)],
+    );
+}
+
+fn scheduler_class_labels(
+    name: &'static str,
+    scheduler_class: &'static str,
+) -> Vec<StaticMetricLabel> {
+    vec![
+        StaticMetricLabel::new("pool_name", name),
+        StaticMetricLabel::new("scheduler_class", scheduler_class),
+    ]
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_REQUESTS_ENQUEUED_TOTAL,
+    "Number of requests accepted by the isolate scheduler queue",
+    &["pool_name", "scheduler_class"]
+);
+pub fn log_scheduler_request_enqueued(name: &'static str, scheduler_class: &'static str) {
+    log_counter_with_labels(
+        &ISOLATE_SCHEDULER_REQUESTS_ENQUEUED_TOTAL,
+        1,
+        scheduler_class_labels(name, scheduler_class),
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_REQUESTS_DISPATCHED_TOTAL,
+    "Number of requests dispatched by the isolate scheduler",
+    &["pool_name", "scheduler_class"]
+);
+pub fn log_scheduler_request_dispatched(name: &'static str, scheduler_class: &'static str) {
+    log_counter_with_labels(
+        &ISOLATE_SCHEDULER_REQUESTS_DISPATCHED_TOTAL,
+        1,
+        scheduler_class_labels(name, scheduler_class),
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_REQUESTS_EXPIRED_TOTAL,
+    "Number of isolate scheduler requests that expired in the queue",
+    &["pool_name", "scheduler_class"],
+    std::time::Duration::MAX,
+);
+pub fn log_scheduler_request_expired(name: &'static str, scheduler_class: &'static str) {
+    log_counter_with_labels(
+        &ISOLATE_SCHEDULER_REQUESTS_EXPIRED_TOTAL,
+        1,
+        scheduler_class_labels(name, scheduler_class),
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL,
+    "Number of isolate scheduler requests rejected before dispatch",
+    &["pool_name", "scheduler_class", "reason"],
+    std::time::Duration::MAX,
+);
+pub fn log_scheduler_request_rejected(
+    name: &'static str,
+    scheduler_class: &'static str,
+    reason: &'static str,
+) {
+    let mut labels = scheduler_class_labels(name, scheduler_class);
+    labels.push(StaticMetricLabel::new("reason", reason));
+    log_counter_with_labels(&ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL, 1, labels);
+}
+
+register_convex_gauge!(
+    ISOLATE_SCHEDULER_ACTIVE_REQUESTS_INFO,
+    "How many isolate scheduler requests are currently active by scheduler class",
+    &["pool_name", "scheduler_class"]
+);
+pub fn log_scheduler_active_request_started(name: &'static str, scheduler_class: &'static str) {
+    add_to_gauge_with_labels(
+        &ISOLATE_SCHEDULER_ACTIVE_REQUESTS_INFO,
+        1.0,
+        scheduler_class_labels(name, scheduler_class),
+    );
+}
+
+pub fn log_scheduler_active_request_finished(name: &'static str, scheduler_class: &'static str) {
+    subtract_from_gauge_with_labels(
+        &ISOLATE_SCHEDULER_ACTIVE_REQUESTS_INFO,
+        1.0,
+        scheduler_class_labels(name, scheduler_class),
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_DEPENDENCY_RESERVE_DISPATCH_TOTAL,
+    "Number of dependency requests dispatched while global occupancy was at or above shared base \
+     capacity",
+    &["pool_name"]
+);
+pub fn log_scheduler_dependency_reserve_dispatch(name: &'static str) {
+    log_counter_with_labels(
+        &ISOLATE_SCHEDULER_DEPENDENCY_RESERVE_DISPATCH_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("pool_name", name)],
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_DEPENDENCY_QUEUE_RESERVE_ENQUEUE_TOTAL,
+    "Number of dependency requests enqueued using CoDel capacity unavailable to non-dependency \
+     work",
+    &["pool_name"]
+);
+pub fn log_scheduler_dependency_queue_reserve_enqueue(name: &'static str) {
+    log_counter_with_labels(
+        &ISOLATE_SCHEDULER_DEPENDENCY_QUEUE_RESERVE_ENQUEUE_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("pool_name", name)],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_SCHEDULER_CAPACITY_INFO,
+    "Configured isolate scheduler capacity by kind",
+    &["pool_name", "capacity_kind"]
+);
+pub fn log_scheduler_capacity(name: &'static str, capacity_kind: &'static str, capacity: usize) {
+    log_gauge_with_labels(
+        &ISOLATE_SCHEDULER_CAPACITY_INFO,
+        capacity as f64,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("capacity_kind", capacity_kind),
+        ],
     );
 }
 
@@ -129,6 +262,30 @@ pub(crate) fn rejected_before_execution_error(
         vec![StaticMetricLabel::new("reason", label)],
     );
     reason.error_metadata()
+}
+
+pub fn initialize_capacity_counters(name: &'static str) {
+    const SCHEDULER_CLASSES: [&str; 4] = [
+        "independent",
+        "descendant_holder",
+        "dependency",
+        "dependency_descendant_holder",
+    ];
+    const SCHEDULER_REJECTION_REASONS: [&str; 3] = ["queue_full", "scheduler_closed", "no_worker"];
+
+    for scheduler_class in SCHEDULER_CLASSES {
+        log_counter_with_labels(
+            &ISOLATE_SCHEDULER_REQUESTS_EXPIRED_TOTAL,
+            0,
+            scheduler_class_labels(name, scheduler_class),
+        );
+        for reason in SCHEDULER_REJECTION_REASONS {
+            let mut labels = scheduler_class_labels(name, scheduler_class);
+            labels.push(StaticMetricLabel::new("reason", reason));
+            log_counter_with_labels(&ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL, 0, labels);
+        }
+    }
+    log_counter(&UDF_EXECUTE_FULL_TOTAL, 0);
 }
 
 pub fn execute_full_error() -> ErrorMetadata {
@@ -790,4 +947,45 @@ pub fn log_normalize_id_old_format(format: &'static str) {
         1,
         vec![StaticMetricLabel::new("format", format)],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use prometheus::core::Collector;
+
+    use super::{
+        initialize_capacity_counters,
+        ISOLATE_SCHEDULER_REQUESTS_EXPIRED_TOTAL,
+        ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL,
+    };
+
+    fn zero_series_for_pool<C: Collector>(collector: &C, pool_name: &str) -> usize {
+        let families = collector.collect();
+        families
+            .iter()
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "pool_name" && label.value() == pool_name)
+            })
+            .inspect(|metric| assert_eq!(metric.get_counter().value(), 0.0))
+            .count()
+    }
+
+    #[test]
+    fn capacity_counter_initialization_covers_closed_label_sets() {
+        const POOL_NAME: &str = "capacity_counter_initialization_test";
+        initialize_capacity_counters(POOL_NAME);
+
+        assert_eq!(
+            zero_series_for_pool(&*ISOLATE_SCHEDULER_REQUESTS_EXPIRED_TOTAL, POOL_NAME),
+            4
+        );
+        assert_eq!(
+            zero_series_for_pool(&*ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL, POOL_NAME),
+            12
+        );
+    }
 }

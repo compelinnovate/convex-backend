@@ -270,3 +270,102 @@ impl SuspendedPermit {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Arc,
+        task::Poll,
+    };
+
+    use futures::poll;
+
+    use super::ConcurrencyLimiter;
+
+    #[tokio::test]
+    async fn high_priority_waiter_overtakes_older_low_priority_waiter() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let initial_permit = limiter.acquire(Arc::new("initial".to_owned()), false).await;
+        let mut low_priority = Box::pin(limiter.acquire(Arc::new("low".to_owned()), false));
+        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
+        let mut high_priority = Box::pin(limiter.acquire(Arc::new("high".to_owned()), true));
+        assert!(matches!(poll!(high_priority.as_mut()), Poll::Pending));
+
+        drop(initial_permit);
+
+        let Poll::Ready(high_priority_permit) = poll!(high_priority.as_mut()) else {
+            panic!("high-priority waiter was not notified first");
+        };
+        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
+        drop(high_priority_permit);
+        let Poll::Ready(low_priority_permit) = poll!(low_priority.as_mut()) else {
+            panic!("low-priority waiter was not notified after the high-priority permit dropped");
+        };
+        drop(low_priority_permit);
+
+        let tracker = limiter.inner.tracker.lock();
+        assert_eq!(tracker.active_permits.len(), 0);
+        assert_eq!(tracker.waiting_high_priority, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_unnotified_high_priority_waiter_preserves_capacity() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let initial_permit = limiter.acquire(Arc::new("initial".to_owned()), false).await;
+        let mut high_priority = Box::pin(limiter.acquire(Arc::new("high".to_owned()), true));
+        assert!(matches!(poll!(high_priority.as_mut()), Poll::Pending));
+        let mut low_priority = Box::pin(limiter.acquire(Arc::new("low".to_owned()), false));
+        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
+        assert_eq!(limiter.inner.tracker.lock().waiting_high_priority, 1);
+
+        drop(high_priority);
+        assert_eq!(limiter.inner.tracker.lock().waiting_high_priority, 0);
+        drop(initial_permit);
+
+        let Poll::Ready(low_priority_permit) = poll!(low_priority.as_mut()) else {
+            panic!("cancelling an unnotified high-priority waiter lost capacity");
+        };
+        drop(low_priority_permit);
+
+        let tracker = limiter.inner.tracker.lock();
+        assert_eq!(tracker.active_permits.len(), 0);
+        assert_eq!(tracker.waiting_high_priority, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_notified_high_priority_waiter_transfers_notification() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let initial_permit = limiter.acquire(Arc::new("initial".to_owned()), false).await;
+        let mut first_high_priority =
+            Box::pin(limiter.acquire(Arc::new("first high".to_owned()), true));
+        assert!(matches!(poll!(first_high_priority.as_mut()), Poll::Pending));
+        let mut second_high_priority =
+            Box::pin(limiter.acquire(Arc::new("second high".to_owned()), true));
+        assert!(matches!(
+            poll!(second_high_priority.as_mut()),
+            Poll::Pending
+        ));
+        let mut low_priority = Box::pin(limiter.acquire(Arc::new("low".to_owned()), false));
+        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
+        assert_eq!(limiter.inner.tracker.lock().waiting_high_priority, 2);
+
+        drop(initial_permit);
+        drop(first_high_priority);
+
+        assert_eq!(limiter.inner.tracker.lock().waiting_high_priority, 1);
+        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
+        let Poll::Ready(second_high_priority_permit) = poll!(second_high_priority.as_mut()) else {
+            panic!("notification was not transferred to the next high-priority waiter");
+        };
+        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
+        drop(second_high_priority_permit);
+        let Poll::Ready(low_priority_permit) = poll!(low_priority.as_mut()) else {
+            panic!("notification was not transferred to the low-priority waiter");
+        };
+        drop(low_priority_permit);
+
+        let tracker = limiter.inner.tracker.lock();
+        assert_eq!(tracker.active_permits.len(), 0);
+        assert_eq!(tracker.waiting_high_priority, 0);
+    }
+}

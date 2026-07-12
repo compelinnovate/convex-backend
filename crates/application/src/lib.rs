@@ -150,6 +150,7 @@ use common::{
         ObjectKey,
         QueryInvocation,
         RepeatableTimestamp,
+        SchedulerDependencyClass,
         TableName,
         Timestamp,
         UdfType,
@@ -1230,8 +1231,30 @@ impl<RT: Runtime> Application<RT> {
         caller: FunctionCaller,
         invocation: QueryInvocation,
     ) -> anyhow::Result<RedactedQueryReturn> {
+        self.read_only_udf_with_scheduler_dependency(
+            request_context,
+            path,
+            args,
+            identity,
+            caller,
+            invocation,
+            SchedulerDependencyClass::Independent,
+        )
+        .await
+    }
+
+    pub async fn read_only_udf_with_scheduler_dependency(
+        &self,
+        request_context: RequestContext,
+        path: PublicFunctionPath,
+        args: SerializedArgs,
+        identity: Identity,
+        caller: FunctionCaller,
+        invocation: QueryInvocation,
+        scheduler_dependency: SchedulerDependencyClass,
+    ) -> anyhow::Result<RedactedQueryReturn> {
         let ts = *self.now_ts_for_reads();
-        self.read_only_udf_at_ts(
+        self.read_only_udf_at_ts_with_scheduler_dependency(
             request_context,
             path,
             args,
@@ -1240,6 +1263,7 @@ impl<RT: Runtime> Application<RT> {
             None,
             caller,
             invocation,
+            scheduler_dependency,
         )
         .await
     }
@@ -1255,6 +1279,32 @@ impl<RT: Runtime> Application<RT> {
         journal: Option<Option<String>>,
         caller: FunctionCaller,
         invocation: QueryInvocation,
+    ) -> anyhow::Result<RedactedQueryReturn> {
+        self.read_only_udf_at_ts_with_scheduler_dependency(
+            request_context,
+            path,
+            args,
+            identity,
+            ts,
+            journal,
+            caller,
+            invocation,
+            SchedulerDependencyClass::Independent,
+        )
+        .await
+    }
+
+    async fn read_only_udf_at_ts_with_scheduler_dependency(
+        &self,
+        request_context: RequestContext,
+        path: PublicFunctionPath,
+        args: SerializedArgs,
+        identity: Identity,
+        ts: Timestamp,
+        journal: Option<Option<String>>,
+        caller: FunctionCaller,
+        invocation: QueryInvocation,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<RedactedQueryReturn> {
         let request_id = request_context.request_id.clone();
         let persistence_version = self.database.persistence_version();
@@ -1275,7 +1325,7 @@ impl<RT: Runtime> Application<RT> {
                 })
                 .transpose()?;
             self.runner
-                .run_query_at_ts(
+                .run_query_at_ts_with_scheduler_dependency(
                     request_context.clone(),
                     path,
                     args,
@@ -1284,6 +1334,7 @@ impl<RT: Runtime> Application<RT> {
                     journal,
                     caller,
                     invocation,
+                    scheduler_dependency,
                 )
                 .await?
         });
@@ -1331,6 +1382,30 @@ impl<RT: Runtime> Application<RT> {
         caller: FunctionCaller,
         mutation_queue_length: Option<usize>,
     ) -> anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>> {
+        self.mutation_udf_with_scheduler_dependency(
+            request_context,
+            path,
+            args,
+            identity,
+            mutation_identifier,
+            caller,
+            mutation_queue_length,
+            SchedulerDependencyClass::Independent,
+        )
+        .await
+    }
+
+    pub async fn mutation_udf_with_scheduler_dependency(
+        &self,
+        request_context: RequestContext,
+        path: PublicFunctionPath,
+        args: SerializedArgs,
+        identity: Identity,
+        mutation_identifier: Option<SessionRequestIdentifier>,
+        caller: FunctionCaller,
+        mutation_queue_length: Option<usize>,
+        scheduler_dependency: SchedulerDependencyClass,
+    ) -> anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>> {
         let block_logging = self
             .log_visibility
             .should_redact_logs_and_error(
@@ -1342,7 +1417,7 @@ impl<RT: Runtime> Application<RT> {
         let request_id = request_context.request_id.clone();
         let result = match self
             .runner
-            .retry_mutation(
+            .retry_mutation_with_scheduler_dependency(
                 request_context,
                 path,
                 args,
@@ -1350,6 +1425,7 @@ impl<RT: Runtime> Application<RT> {
                 mutation_identifier,
                 caller,
                 mutation_queue_length,
+                scheduler_dependency,
             )
             .await
         {
@@ -1394,6 +1470,26 @@ impl<RT: Runtime> Application<RT> {
         identity: Identity,
         caller: FunctionCaller,
     ) -> anyhow::Result<Result<RedactedActionReturn, RedactedActionError>> {
+        self.action_udf_with_scheduler_dependency(
+            request_context,
+            name,
+            args,
+            identity,
+            caller,
+            SchedulerDependencyClass::Independent,
+        )
+        .await
+    }
+
+    pub async fn action_udf_with_scheduler_dependency(
+        &self,
+        request_context: RequestContext,
+        name: PublicFunctionPath,
+        args: SerializedArgs,
+        identity: Identity,
+        caller: FunctionCaller,
+        scheduler_dependency: SchedulerDependencyClass,
+    ) -> anyhow::Result<Result<RedactedActionReturn, RedactedActionError>> {
         let block_logging = self
             .log_visibility
             .should_redact_logs_and_error(
@@ -1411,7 +1507,14 @@ impl<RT: Runtime> Application<RT> {
             .unwrap_or(Span::noop());
         let run_action = async move {
             runner
-                .run_action(request_context, name, args, identity, caller)
+                .run_action_with_scheduler_dependency(
+                    request_context,
+                    name,
+                    args,
+                    identity,
+                    caller,
+                    scheduler_dependency,
+                )
                 .in_span(span)
                 .await
         };
