@@ -8,7 +8,11 @@ use cmd_util::env::{
 use common::{
     errors::MainError,
     http::ConvexHttpService,
-    knobs::HTTP_SERVER_TIMEOUT_DURATION,
+    knobs::{
+        HTTP_SERVER_DEPENDENCY_RESERVE,
+        HTTP_SERVER_MAX_CONCURRENT_REQUESTS,
+        HTTP_SERVER_TIMEOUT_DURATION,
+    },
     runtime::Runtime,
     sentry::set_sentry_tags,
     shutdown::ShutdownSignal,
@@ -41,7 +45,6 @@ use local_backend::{
     proxy::dev_site_proxy,
     router::router,
     HttpActionRouteMapper,
-    MAX_CONCURRENT_REQUESTS,
 };
 use runtime::prod::ProdRuntime;
 use tokio::{
@@ -60,6 +63,12 @@ fn main() -> Result<(), MainError> {
         return run_subcommand(subcommand);
     }
     let _guard = config_service();
+    let max_concurrent_requests = *HTTP_SERVER_MAX_CONCURRENT_REQUESTS;
+    let dependency_reserve = *HTTP_SERVER_DEPENDENCY_RESERVE;
+    assert!(
+        dependency_reserve < max_concurrent_requests,
+        "HTTP_SERVER_DEPENDENCY_RESERVE must be smaller than HTTP_SERVER_MAX_CONCURRENT_REQUESTS"
+    );
     tracing::info!("Starting a Convex backend");
     if !config.disable_beacon {
         tracing::info!(
@@ -99,7 +108,13 @@ fn main() -> Result<(), MainError> {
 
     let runtime_ = runtime.clone();
     let server_future = async {
-        run_server(runtime_, config).await?;
+        run_server(
+            runtime_,
+            config,
+            max_concurrent_requests,
+            dependency_reserve,
+        )
+        .await?;
         Ok(())
     };
 
@@ -122,8 +137,16 @@ fn generate_admin_key(args: &AdminKeyArgs) -> Result<(), MainError> {
     Ok(())
 }
 
-async fn run_server(runtime: ProdRuntime, config: LocalConfig) -> anyhow::Result<()> {
-    let serve_future = async move { run_server_inner(runtime, config).await }.fuse();
+async fn run_server(
+    runtime: ProdRuntime,
+    config: LocalConfig,
+    max_concurrent_requests: usize,
+    dependency_reserve: usize,
+) -> anyhow::Result<()> {
+    let serve_future = async move {
+        run_server_inner(runtime, config, max_concurrent_requests, dependency_reserve).await
+    }
+    .fuse();
     futures::pin_mut!(serve_future);
 
     futures::select! {
@@ -136,7 +159,12 @@ async fn run_server(runtime: ProdRuntime, config: LocalConfig) -> anyhow::Result
     Ok(())
 }
 
-async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::Result<()> {
+async fn run_server_inner(
+    runtime: ProdRuntime,
+    config: LocalConfig,
+    max_concurrent_requests: usize,
+    dependency_reserve: usize,
+) -> anyhow::Result<()> {
     // Used to receive fatal errors from the database or /preempt endpoint.
     let (preempt_tx, preempt_rx) = oneshot::channel();
     let preempt_signal = ShutdownSignal::new(preempt_tx);
@@ -168,11 +196,13 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     .await?;
     let router = router(st.clone());
     let mut shutdown_rx_ = shutdown_rx.clone();
-    let http_service = ConvexHttpService::new(
+    let http_service = ConvexHttpService::new_with_dependency_reserve(
         router,
         "backend",
         SERVER_VERSION_STR.to_string(),
-        MAX_CONCURRENT_REQUESTS,
+        max_concurrent_requests,
+        dependency_reserve,
+        &["/api/actions/"],
         *HTTP_SERVER_TIMEOUT_DURATION,
         HttpActionRouteMapper,
     );
@@ -182,6 +212,7 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     let proxy_future = dev_site_proxy(
         config.site_bind_address(),
         config.site_forward_prefix(),
+        max_concurrent_requests,
         shutdown_rx,
     );
 

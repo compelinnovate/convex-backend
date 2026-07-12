@@ -9,6 +9,7 @@ use axum::{
     response::IntoResponse,
     RequestPartsExt,
 };
+pub use common::http::CONVEX_ACTIONS_CALLBACK_TOKEN;
 use common::{
     components::{
         ComponentFunctionPath,
@@ -628,8 +629,6 @@ pub async fn audit_log(
     ))
     .into())
 }
-
-pub static CONVEX_ACTIONS_CALLBACK_TOKEN: &str = "Convex-Action-Callback-Token";
 
 async fn check_actions_token(
     st: &LocalAppState,

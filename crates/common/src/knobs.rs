@@ -395,10 +395,22 @@ pub static TABLE_ITERATOR_MAX_RETRIES: LazyLock<u32> =
 pub static HTTP_SERVER_TCP_BACKLOG: LazyLock<u32> =
     LazyLock::new(|| env_config("HTTP_SERVER_TCP_BACKLOG", 256));
 
-/// The max concurrent of concurrent HTTP requests. This also limits Node.js
-/// action callbacks concurrency since those go over http.
+/// The maximum number of concurrent HTTP requests. Node.js action callbacks
+/// share this admission limit with their parent requests because the callbacks
+/// re-enter the backend over HTTP, so small values must leave callback
+/// capacity. This knob is strict so malformed self-hosted values fail startup
+/// instead of silently falling back to a different concurrency gate. Values
+/// above the supported admission limit are also rejected before server
+/// construction.
 pub static HTTP_SERVER_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
-    LazyLock::new(|| env_config("HTTP_SERVER_MAX_CONCURRENT_REQUESTS", 1024));
+    LazyLock::new(|| env_config_usize_strict_nonzero("HTTP_SERVER_MAX_CONCURRENT_REQUESTS", 1024));
+
+/// Dependency-only HTTP overflow above shared base capacity. Node action
+/// callbacks may use the overflow because their parent request can retain a
+/// base permit while waiting for them. This knob is parsed strictly so invalid
+/// operator configuration fails startup.
+pub static HTTP_SERVER_DEPENDENCY_RESERVE: LazyLock<usize> =
+    LazyLock::new(|| env_config_usize_strict("HTTP_SERVER_DEPENDENCY_RESERVE", 1));
 
 /// Max number of user writes in a transaction. Make sure to also increase
 /// `MAX_INSERT_SIZE` in mysql/src/lib.rs and postgres/src/lib.rs.
@@ -997,6 +1009,8 @@ pub static ISOLATE_QUEUE_CONGESTED_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_millis(env_config("ISOLATE_QUEUE_CONGESTED_TIMEOUT_MS", 200)));
 
 /// Maximum number of isolate worker threads in a function runner process.
+/// For self-hosted tuning guidance, see
+/// patches/isolate_concurrency_knobs.md.
 pub static MAX_ISOLATE_WORKERS: LazyLock<usize> =
     LazyLock::new(|| env_config_isolate_scheduler_usize_strict("MAX_ISOLATE_WORKERS", 300));
 
@@ -1426,7 +1440,8 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("PROBER_PROBE_TIMEOUT", 30)));
 
 /// The maximum number of CPU cores that can be used simultaneously by the
-/// isolates. Zero means no limit.
+/// isolates. Zero means no limit. For self-hosted tuning guidance, see
+/// patches/isolate_concurrency_knobs.md.
 pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> =
     LazyLock::new(|| env_config_isolate_scheduler_usize_strict("FUNRUN_ISOLATE_ACTIVE_THREADS", 0));
 
