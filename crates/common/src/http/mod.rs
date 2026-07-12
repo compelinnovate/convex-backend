@@ -90,7 +90,6 @@ use serde::{
 };
 use tokio::net::TcpSocket;
 use tower::{
-    limit::GlobalConcurrencyLimitLayer,
     timeout::TimeoutLayer,
     Layer,
     Service,
@@ -142,13 +141,22 @@ pub use sync_types::headers::{
     DEPRECATION_STATE_HEADER_NAME,
 };
 use value::heap_size::HeapSize;
+
+/// Header carrying the authenticated token on Node action callback requests.
+pub const CONVEX_ACTIONS_CALLBACK_TOKEN: &str = "Convex-Action-Callback-Token";
+
 mod metrics {
     use std::time::Duration;
 
     use metrics::{
+        add_to_gauge_with_labels,
         log_distribution_with_labels,
+        log_gauge_with_labels,
+        register_convex_gauge,
         register_convex_histogram,
+        subtract_from_gauge_with_labels,
         MetricLabel,
+        StaticMetricLabel,
     };
 
     register_convex_histogram!(
@@ -181,6 +189,92 @@ mod metrics {
             labels,
         );
     }
+
+    register_convex_gauge!(
+        HTTP_ADMISSION_WAITERS_INFO,
+        "Number of HTTP requests waiting for service admission",
+        &["service_name", "is_dependency"]
+    );
+    register_convex_histogram!(
+        HTTP_ADMISSION_WAIT_SECONDS,
+        "Time HTTP requests spent waiting for service admission",
+        &["service_name", "is_dependency"]
+    );
+
+    fn http_admission_labels(
+        service_name: &'static str,
+        is_dependency: &'static str,
+    ) -> Vec<StaticMetricLabel> {
+        vec![
+            StaticMetricLabel::new("service_name", service_name),
+            StaticMetricLabel::new("is_dependency", is_dependency),
+        ]
+    }
+
+    pub fn initialize_http_admission_metrics(service_name: &'static str) {
+        for is_dependency in ["false", "true"] {
+            log_gauge_with_labels(
+                &HTTP_ADMISSION_WAITERS_INFO,
+                0.0,
+                http_admission_labels(service_name, is_dependency),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub fn http_admission_waiters(service_name: &'static str, is_dependency: &'static str) -> f64 {
+        HTTP_ADMISSION_WAITERS_INFO
+            .with_label_values(&[service_name, is_dependency])
+            .get()
+    }
+
+    #[cfg(test)]
+    pub fn http_admission_wait_observations(
+        service_name: &'static str,
+        is_dependency: &'static str,
+    ) -> u64 {
+        use prometheus::core::Metric as _;
+
+        HTTP_ADMISSION_WAIT_SECONDS
+            .with_label_values(&[service_name, is_dependency])
+            .metric()
+            .get_vm_histogram()
+            .sample_count()
+    }
+
+    pub struct HttpAdmissionWaitGuard {
+        service_name: &'static str,
+        is_dependency: &'static str,
+        started: std::time::Instant,
+    }
+
+    impl HttpAdmissionWaitGuard {
+        pub fn new(service_name: &'static str, is_dependency: bool) -> Self {
+            let is_dependency = if is_dependency { "true" } else { "false" };
+            let labels = http_admission_labels(service_name, is_dependency);
+            add_to_gauge_with_labels(&HTTP_ADMISSION_WAITERS_INFO, 1.0, labels);
+            Self {
+                service_name,
+                is_dependency,
+                started: std::time::Instant::now(),
+            }
+        }
+
+        fn labels(&self) -> Vec<StaticMetricLabel> {
+            http_admission_labels(self.service_name, self.is_dependency)
+        }
+    }
+
+    impl Drop for HttpAdmissionWaitGuard {
+        fn drop(&mut self) {
+            subtract_from_gauge_with_labels(&HTTP_ADMISSION_WAITERS_INFO, 1.0, self.labels());
+            log_distribution_with_labels(
+                &HTTP_ADMISSION_WAIT_SECONDS,
+                self.started.elapsed().as_secs_f64(),
+                self.labels(),
+            );
+        }
+    }
 }
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -210,9 +304,6 @@ impl From<HttpRequest> for HttpRequestStream {
             signal: Box::pin(futures::future::pending()),
         }
     }
-}
-
-impl HttpRequestStream {
 }
 
 impl HeapSize for HttpRequest {
@@ -504,6 +595,40 @@ pub struct ConvexHttpService {
     version: String,
     service_name: &'static str,
     _concurrency_gauge: Option<PullingGauge>,
+    _base_concurrency_gauge: Option<PullingGauge>,
+}
+
+#[derive(Clone)]
+struct HttpConcurrencyLimiter {
+    gate: crate::dependency_overflow::DependencyOverflowGate,
+    dependency_path_prefixes: &'static [&'static str],
+    service_name: &'static str,
+}
+
+async fn dependency_aware_concurrency_middleware(
+    State(limiter): State<HttpConcurrencyLimiter>,
+    request: http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    // Every callback can be waiting behind the HTTP permit retained by its
+    // parent Node action request. Isolate-worker ancestry remains a separate
+    // downstream classification carried by a different request header.
+    let is_dependency = limiter
+        .dependency_path_prefixes
+        .iter()
+        .any(|prefix| request.uri().path().starts_with(prefix))
+        && request
+            .headers()
+            .contains_key(CONVEX_ACTIONS_CALLBACK_TOKEN);
+    let permit = limiter
+        .gate
+        .acquire_with_waiter(is_dependency, || {
+            metrics::HttpAdmissionWaitGuard::new(limiter.service_name, is_dependency)
+        })
+        .await;
+    let response = next.run(request).await;
+    drop(permit);
+    response
 }
 
 impl ConvexHttpService {
@@ -515,16 +640,73 @@ impl ConvexHttpService {
         request_timeout: Duration,
         route_metric_mapper: RM,
     ) -> Self {
+        Self::new_with_dependency_reserve(
+            router,
+            service_name,
+            version,
+            max_concurrency,
+            0,
+            &[],
+            request_timeout,
+            route_metric_mapper,
+        )
+    }
+
+    pub fn new_with_dependency_reserve<RM: RouteMapper>(
+        router: Router,
+        service_name: &'static str,
+        version: String,
+        max_concurrency: usize,
+        dependency_reserve: usize,
+        dependency_path_prefixes: &'static [&'static str],
+        request_timeout: Duration,
+        route_metric_mapper: RM,
+    ) -> Self {
+        assert!(
+            max_concurrency <= tokio::sync::Semaphore::MAX_PERMITS,
+            "HTTP concurrency must not exceed Tokio's supported semaphore capacity"
+        );
+        assert!(
+            dependency_reserve < max_concurrency,
+            "HTTP dependency reserve must be smaller than total concurrency"
+        );
         let sentry_layer = ServiceBuilder::new()
             .layer(sentry_tower::NewSentryLayer::<_>::new_from_top())
             .layer(sentry_tower::SentryHttpLayer::new());
+        metrics::initialize_http_admission_metrics(service_name);
         log_http_service_max_concurrent_requests(service_name, max_concurrency);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
-        let semaphore_ = semaphore.clone();
+        let base_capacity = max_concurrency - dependency_reserve;
+        let concurrency_gate =
+            crate::dependency_overflow::DependencyOverflowGate::new(base_capacity, max_concurrency);
+        let concurrency_gate_for_base_gauge = concurrency_gate.clone();
+        let base_concurrency_gauge = (dependency_reserve > 0).then(|| {
+            PullingGauge::new(
+                format!(
+                    "{}_http_service_base_concurrent_requests",
+                    service_name.replace('-', "_")
+                ),
+                "The amount of shared base HTTP admission capacity in use",
+                Box::new(move || concurrency_gate_for_base_gauge.base_in_use() as f64),
+            )
+            .expect("Invalid base concurrency gauge initialization")
+        });
+        if let Some(gauge) = &base_concurrency_gauge
+            && let Err(e) = CONVEX_METRICS_REGISTRY.register(Box::new(gauge.clone()))
+        {
+            tracing::error!(
+                "Failed to register base request concurrency gauge for {service_name}: {e}"
+            );
+        }
+        let concurrency_gate_for_total_gauge = concurrency_gate.clone();
+        let concurrency_limiter = HttpConcurrencyLimiter {
+            gate: concurrency_gate,
+            dependency_path_prefixes,
+            service_name,
+        };
         let concurrency_gauge = PullingGauge::new(
             concurrency_metric_name(service_name, &SERVICE_NAME),
             "The number of currently outstanding requests on the ConvexHttpService",
-            Box::new(move || (max_concurrency - semaphore_.available_permits()) as f64),
+            Box::new(move || concurrency_gate_for_total_gauge.active() as f64),
         )
         .expect("Invalid gauge initialization");
         if let Err(e) = CONVEX_METRICS_REGISTRY.register(Box::new(concurrency_gauge.clone())) {
@@ -534,6 +716,12 @@ impl ConvexHttpService {
         let router = router
             .layer(
                 ServiceBuilder::new()
+                    // Admission stays outside request instrumentation and timeout
+                    // so queued requests do not consume their budgets before starting.
+                    .layer(axum::middleware::from_fn_with_state(
+                        concurrency_limiter,
+                        dependency_aware_concurrency_middleware,
+                    ))
                     // Order important. Log/stats first because they are infallible.
                     .layer(axum::middleware::from_fn(tokio_instrumentation_middleware))
                     .layer(axum::middleware::from_fn(log_middleware))
@@ -542,7 +730,6 @@ impl ConvexHttpService {
                         stats_middleware::<RM>,
                     ))
                     .layer(axum::middleware::from_fn(client_version_state_middleware))
-                    .layer(GlobalConcurrencyLimitLayer::with_semaphore(semaphore))
                     .layer(tower_cookies::CookieManagerLayer::new())
                     .layer(HandleErrorLayer::new(|_: BoxError| async {
                         StatusCode::REQUEST_TIMEOUT
@@ -555,6 +742,7 @@ impl ConvexHttpService {
             router,
             version,
             _concurrency_gauge: Some(concurrency_gauge),
+            _base_concurrency_gauge: base_concurrency_gauge,
             service_name,
             meta_routes_enabled: true,
         }
@@ -634,7 +822,6 @@ impl ConvexHttpService {
             .await
         }
     }
-
 }
 
 /// Serves an HTTP server using the given service.
@@ -1393,4 +1580,208 @@ where
             .expect("HeaderMap should not have a None key without a previous Some key");
         (key, value)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Arc,
+        time::Duration,
+    };
+
+    use axum::{
+        extract::State,
+        routing::get,
+        Router,
+    };
+    use http::Request;
+    use tokio::sync::{
+        mpsc,
+        Semaphore,
+    };
+    use tower::ServiceExt as _;
+
+    use super::{
+        dependency_aware_concurrency_middleware,
+        metrics::{
+            http_admission_wait_observations,
+            http_admission_waiters,
+            initialize_http_admission_metrics,
+            HttpAdmissionWaitGuard,
+        },
+        Body,
+        HttpConcurrencyLimiter,
+        StatusCode,
+    };
+    use crate::dependency_overflow::DependencyOverflowGate;
+
+    #[derive(Clone)]
+    struct BlockingHandlerState {
+        started: mpsc::UnboundedSender<&'static str>,
+        release: Arc<Semaphore>,
+    }
+
+    async fn ordinary_handler(State(state): State<BlockingHandlerState>) -> StatusCode {
+        state.started.send("ordinary").unwrap();
+        state.release.acquire().await.unwrap().forget();
+        StatusCode::OK
+    }
+
+    async fn dependency_handler(State(state): State<BlockingHandlerState>) -> StatusCode {
+        state.started.send("dependency").unwrap();
+        state.release.acquire().await.unwrap().forget();
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn dependencies_share_base_before_using_http_overflow() {
+        let limiter = HttpConcurrencyLimiter {
+            gate: DependencyOverflowGate::new(2, 3),
+            dependency_path_prefixes: &["/api/actions/"],
+            service_name: "test",
+        };
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let app = Router::new()
+            .route("/ordinary", get(ordinary_handler))
+            .route("/api/actions/query", get(dependency_handler))
+            .with_state(BlockingHandlerState {
+                started: started_tx,
+                release: release.clone(),
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                limiter,
+                dependency_aware_concurrency_middleware,
+            ));
+
+        let first_dependency = tokio::spawn(
+            app.clone().oneshot(
+                Request::get("/api/actions/query")
+                    .header("Convex-Action-Callback-Token", "token")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        assert_eq!(started_rx.recv().await, Some("dependency"));
+
+        let first_ordinary = tokio::spawn(
+            app.clone()
+                .oneshot(Request::get("/ordinary").body(Body::empty()).unwrap()),
+        );
+        assert_eq!(started_rx.recv().await, Some("ordinary"));
+
+        let second_ordinary = tokio::spawn(
+            app.clone().oneshot(
+                Request::get("/ordinary")
+                    .header("Convex-Action-Callback-Token", "forged")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), started_rx.recv())
+                .await
+                .is_err()
+        );
+
+        let unmarked_callback = tokio::spawn(
+            app.clone().oneshot(
+                Request::get("/api/actions/query")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), started_rx.recv())
+                .await
+                .is_err()
+        );
+
+        let overflow_dependency = tokio::spawn(
+            app.oneshot(
+                Request::get("/api/actions/query")
+                    .header("Convex-Action-Callback-Token", "token")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .unwrap(),
+            Some("dependency")
+        );
+
+        release.add_permits(5);
+        first_dependency.await.unwrap().unwrap();
+        first_ordinary.await.unwrap().unwrap();
+        overflow_dependency.await.unwrap().unwrap();
+        second_ordinary.await.unwrap().unwrap();
+        unmarked_callback.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dependency_http_requests_still_obey_total_capacity() {
+        let limiter = HttpConcurrencyLimiter {
+            gate: DependencyOverflowGate::new(1, 1),
+            dependency_path_prefixes: &["/api/actions/"],
+            service_name: "test",
+        };
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let app = Router::new()
+            .route("/api/actions/query", get(dependency_handler))
+            .with_state(BlockingHandlerState {
+                started: started_tx,
+                release: release.clone(),
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                limiter,
+                dependency_aware_concurrency_middleware,
+            ));
+        let request = || {
+            Request::get("/api/actions/query")
+                .header("Convex-Action-Callback-Token", "token")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = tokio::spawn(app.clone().oneshot(request()));
+        assert_eq!(started_rx.recv().await, Some("dependency"));
+        let second = tokio::spawn(app.oneshot(request()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), started_rx.recv())
+                .await
+                .is_err()
+        );
+
+        release.add_permits(1);
+        first.await.unwrap().unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .unwrap(),
+            Some("dependency")
+        );
+        release.add_permits(1);
+        second.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn short_http_admission_waits_emit_histogram_observations() {
+        const SERVICE_NAME: &str = "short_http_admission_wait_test";
+        initialize_http_admission_metrics(SERVICE_NAME);
+        for is_dependency in ["false", "true"] {
+            assert_eq!(http_admission_waiters(SERVICE_NAME, is_dependency), 0.0);
+        }
+
+        let before = http_admission_wait_observations(SERVICE_NAME, "false");
+        drop(HttpAdmissionWaitGuard::new(SERVICE_NAME, false));
+
+        assert_eq!(http_admission_waiters(SERVICE_NAME, "false"), 0.0);
+        assert_eq!(
+            http_admission_wait_observations(SERVICE_NAME, "false"),
+            before + 1
+        );
+    }
 }

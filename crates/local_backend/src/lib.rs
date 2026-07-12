@@ -115,8 +115,6 @@ pub mod streaming_import;
 pub mod subs;
 pub mod usage_limits;
 
-pub const MAX_CONCURRENT_REQUESTS: usize = 128;
-
 #[derive(Clone)]
 pub struct LocalAppState {
     // Origin for the server (e.g. http://127.0.0.1:3210, https://demo.convex.cloud)
