@@ -47,9 +47,13 @@ number of response bodies being streamed concurrently.
 
 Requests above the limit enter an unbounded in-process permit wait instead of
 being rejected immediately. `HTTP_SERVER_TIMEOUT_SECONDS` and request handling
-metrics start after permit acquisition, so they do not bound or measure this
-admission wait. Use an upstream proxy or load balancer with bounded request
-queues and timeouts when overload must be rejected within a fixed time.
+metrics start after permit acquisition, so they do not bound this admission
+wait. `http_admission_waiters_info{service_name,is_dependency}` reports actual
+queued waiters, and
+`http_admission_wait_seconds{service_name,is_dependency}` records waits ending
+in handoff or cancellation. Immediate admissions are not histogram samples.
+Use an upstream proxy or load balancer with bounded request queues and timeouts
+when overload must be rejected within a fixed time.
 
 ## `HTTP_SERVER_DEPENDENCY_RESERVE`
 
@@ -113,11 +117,82 @@ HTTP actions that retain workers. `0` derives this cap from shared base worker
 capacity. An explicit value cannot exceed base capacity. Queries, mutations,
 and child actions that unblock an ancestor are not subject to this cap.
 
-`ISOLATE_QUEUE_SIZE` is the shared base capacity of the bounded CoDel queue and
-must be nonzero. Dependencies can use
-`ISOLATE_DEPENDENCY_WORKER_RESERVE` additional queue entries. Once both parts
-are full, another enqueue fails immediately instead of waiting in an unbounded
-queue.
+`ISOLATE_QUEUE_SIZE` is the shared base capacity of the finite external isolate
+queue and must be nonzero. Dependencies can use
+`ISOLATE_DEPENDENCY_WORKER_RESERVE` additional queue entries. Other requests
+cannot use that extra capacity. Once the applicable capacity is full, another
+enqueue fails immediately. Direct internal nested-UDF callbacks bypass this
+queue but still share its scheduler's physical workers and active permits.
+
+The default isolate queue policy remains generic CoDel. It uses FIFO while idle,
+LIFO while congested, and the existing CoDel deadlines. Set
+`ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=true` to opt into the isolate-only
+lane-aware policy. That policy keeps FIFO queue order, selects the oldest
+request eligible under worker and client constraints, never adaptively sheds a
+dependency, and hard-expires every lane at a finite maximum age.
+
+The lane-aware timing knobs are:
+
+- `ISOLATE_QUEUE_DELAY_TARGET_MILLIS`, default `150`;
+- `ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS`, default `1000`;
+- `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS`, default twice the configured
+  target (`300` with the default target);
+- `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`, default `5000`.
+
+The target and interval must be nonzero. The adaptive-shed threshold must be
+greater than the target, hard maximum age must be greater than the
+adaptive-shed threshold, and every duration must fit the runtime timer. Numeric
+values must contain only ASCII decimal digits; empty, signed, malformed,
+non-Unicode, overflowed, and inconsistent settings fail startup. The timing
+values are validated even when lane control is disabled.
+
+`ISOLATE_CONTROL_PLANE_LANE_ENABLED=true` classifies isolate module analysis,
+schema evaluation, auth configuration evaluation, app definition evaluation,
+and component initializer evaluation into a `control_plane` lane. It does not
+match application module or component names. The lane remains in the same FIFO
+and uses only shared-base queue and worker capacity. It does not use dependency
+reserve, receive dispatch priority, or reserve a worker. It is exempt from
+adaptive delay shedding but retains a finite hard queue deadline.
+
+The control-plane settings are:
+
+- `ISOLATE_CONTROL_PLANE_LANE_ENABLED`, default `false`;
+- `ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY`, default `16`;
+- `ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS`, default `30000`.
+
+The capacity is a positive sub-cap inside `ISOLATE_QUEUE_SIZE`, not reserved
+capacity. The deadline bounds time from external queue enqueue through initial
+active-permit acquisition, not execution or the complete push. All three
+settings are parsed and intrinsically validated when the lane is disabled.
+`ANALYZE_CONCURRENCY` must also be greater than zero because
+zero would stall isolate analysis before enqueue. When enabled, lane-aware
+delay control must also be enabled, the lane capacity must be at least
+`ANALYZE_CONCURRENCY` and no greater than `ISOLATE_QUEUE_SIZE`, and the lane
+deadline must be greater than the ordinary hard queue age. A queued control-
+plane request is discarded before worker assignment if its response receiver
+has already closed. Immediate physical-queue and lane-cap admission errors
+return directly; the isolate client's bounded retry loops cover only errors
+received after successful enqueue.
+
+`isolate_control_plane_lane_enabled_info{pool_name}` is `1` only when this
+classification is effective and `0` when the five request variants retain
+ordinary queue behavior. When lane-aware queueing is active, capacity and
+deadline metrics report parsed settings even when classification is disabled;
+those series are absent on the legacy queue path. Use the enabled gauge for
+rollout confirmation. See
+[`patches/isolate_queue_control/README.md`](../../patches/isolate_queue_control/README.md)
+for the exact classification, capacity, deadline, metrics, and rollout contract.
+
+Lane control publishes pool-scoped queue policy, configuration, capacity,
+depth, oldest age, dispatch sojourn, overload, rejection, and ineligibility
+metrics. To roll back only queue behavior, set
+`ISOLATE_CONTROL_PLANE_LANE_ENABLED=false` to return analysis and evaluation to
+ordinary queue behavior, or set `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=false`
+after disabling the control-plane lane to restore generic CoDel. Worker
+reserves, application and HTTP admission, action caps, and HTTP action context
+reuse are unchanged. See
+[`patches/isolate_queue_control/README.md`](../../patches/isolate_queue_control/README.md) for
+the exact policy and rollout guidance.
 
 A one-worker pool cannot run a function and a separately scheduled descendant
 at the same time. Use at least two workers and a reserve of at least one for
@@ -129,5 +204,9 @@ parallel fanout can still consume every worker and queue entry.
 This caps isolates actively executing JavaScript. `0` means unlimited. A
 request can release this permit while waiting for asynchronous work, so this is
 not the same as assigned isolate workers and does not provide dependency-only
-overflow. Use it to control CPU oversubscription, and raise it only after
-checking backend CPU headroom and throttling.
+overflow. Initial external requests acquire a low-priority permit before worker
+assignment, bounded by their original queue deadline. Direct nested
+transactional callbacks and requests reacquiring a released permit use high
+priority. The tiers change handoff order but add no permits. Use the setting to
+control CPU oversubscription, and raise it only after checking backend CPU
+headroom and throttling.

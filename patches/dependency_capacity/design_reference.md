@@ -166,10 +166,10 @@ admission setting are forwarded and fail startup.
 The self-hosted backend has one in-process function runner inside the backend
 process. `MAX_ISOLATE_WORKERS` caps the isolate worker threads allocated by that
 runner and the isolate requests assigned to workers concurrently. It does not
-cap external requests waiting in the CoDel queue or direct nested UDF callbacks
-waiting in upstream's internal priority channel.
+cap external requests waiting in the bounded isolate queue or direct nested UDF
+callbacks waiting in upstream's internal priority channel.
 `ISOLATE_DEPENDENCY_WORKER_RESERVE` sets both dependency-only overflow above the
-shared worker base and the additional external dependency-only CoDel capacity.
+shared worker base and the additional external dependency-only queue capacity.
 `ISOLATE_QUEUE_SIZE` remains the external shared base queue capacity. The worker
 threads share the backend container's CPU quota with the HTTP and application
 runtime.
@@ -212,13 +212,21 @@ action cap. There is no additional first-caller or role-combination policy.
 Upstream splits scheduler ingress by ownership boundary. A direct nested UDF
 callback enters an internal unbounded channel, is polled before the external
 stream, has no CoDel deadline, and requests its active-JavaScript permit at high
-priority before worker assignment. Externally submitted requests retain bounded
-CoDel admission and its FIFO-while-idle/LIFO-while-congested policy. This patch
-adds class-aware admission and selection to that external queue so Node/action
-callback chains and other externally propagated dependencies can use `Q + R`
-without allowing ordinary work above `Q`. Both ingress paths then use the same
-worker scheduler, global and per-client fences, physical `T`, and worker reserve
-`R`; internal priority does not create another reserve.
+priority before worker assignment. The scheduler buffers internal arrivals,
+discards closed callers, and selects the oldest callback eligible in one worker
+snapshot. It can therefore skip a per-client-ineligible callback without letting
+newer eligible callbacks from other clients lose otherwise usable physical
+capacity. Externally submitted requests retain bounded admission. Its default
+policy retains CoDel's FIFO-while-idle and
+LIFO-while-congested behavior; the opt-in lane policy selects the oldest eligible
+request and preserves FIFO among eligible work. Both policies let externally
+propagated dependencies use `Q + R` without allowing ordinary work above `Q`.
+Both ingress paths then use the same worker scheduler, global and per-client
+fences, physical `T`, and worker reserve `R`; internal priority does not create
+another reserve. Once either path selects a request, response-channel closure
+cancels a pending active-permit acquisition. The limiter transfers any consumed
+notification on cancellation, so abandoned work neither serializes the ingress
+until permit availability nor leaks active capacity.
 
 The worker policy has three capacities:
 
@@ -277,7 +285,7 @@ independent cache miss whose isolate request may be outside the worker reserve.
 It runs a side-effect-free duplicate query with dependency scheduling instead.
 
 `ISOLATE_QUEUE_SIZE` must be greater than zero. Every externally submitted
-request class can fill that many shared base CoDel entries. External dependency
+request class can fill that many shared base queue entries. External dependency
 sends can use `R` additional bounded entries, so a base-full queue can admit a
 callback burst matching worker overflow capacity before eligibility-aware
 selection. The physical queue can still reject a dependency when all
@@ -287,14 +295,21 @@ errors and release their callers rather than hanging forever. Direct internal
 nested UDF callbacks do not consume these CoDel entries and instead retain
 upstream's non-expiring priority-channel semantics.
 
-Upstream's improved CoDel implementation assigns monotonically ordered
-deadlines using the later of the queue's idle-to-congested transition and the
-request's congested expiry. The front is therefore the earliest deadline.
-Class-aware selection drains an expired front before serving non-expired work,
-then applies the upstream FIFO/LIFO rule among entries with the best eligible
-class. A separate expiry stream wakes at the current head deadline so a request
-that is temporarily ineligible for worker assignment still expires without
-requiring another enqueue or worker-completion event.
+Under the default policy, upstream's improved CoDel implementation assigns
+monotonically ordered deadlines using the later of the queue's idle-to-congested
+transition and the request's congested expiry. The front is therefore the
+earliest deadline. Class-aware selection drains an expired front before serving
+non-expired work, then applies the upstream FIFO/LIFO rule among eligible
+entries. The opt-in lane policy derives a hard deadline from enqueue time for
+every entry and waits for the earliest deadline across lanes. Both policies'
+consuming receivers arm their deadline while scheduler eligibility blocks
+dispatch, so an ineligible entry can expire without another enqueue or
+worker-completion event.
+Each policy also exposes a non-consuming expiry companion that the scheduler
+continues polling while a selected external request waits for its initial
+active-JavaScript permit. Thus one selected request cannot suspend the hard
+deadline of a different retained dependency, and the companion does not create
+another consuming receiver or keep admission open after scheduler shutdown.
 
 A one-worker pool cannot run a caller and a separately scheduled descendant
 concurrently. Configure `R >= 1` and `T >= 2` for applications using these call
@@ -305,16 +320,14 @@ failure signal rather than successful progress. Construction rejects
 knobs and `FUNRUN_ISOLATE_ACTIVE_THREADS` fail startup instead of falling back
 to defaults.
 
-For runners that do not advertise dependency-aware scheduling, the application
-layer keeps the older compatibility fallback: V8/HTTP action admission is capped
-below `MAX_ISOLATE_WORKERS` when the pool has more than one worker and that
-local worker count is the real capacity contract. This is only a best-effort
-cap. Ordinary work can still consume the presumed remaining worker, so an
-unsupported runner cannot claim the scheduler patch's liveness guarantee.
+The standard tree has one dependency-aware in-process runner. A custom runner
+must enforce the same bounded dependency-admission contract at its real worker
+pool. The application layer does not infer a custom runner's capacity from the
+local `MAX_ISOLATE_WORKERS` knob or apply a best-effort compatibility cap.
 
 ## Request Admission and Wait Stages
 
-The isolate CoDel queue is not the backend's only wait point. A request can wait
+The isolate queue is not the backend's only wait point. A request can wait
 at several stages, and each stage has a different capacity, timeout, fairness
 policy, and overload response:
 
@@ -324,11 +337,12 @@ policy, and overload response:
    each Convex HTTP service. Application requests above the limit enter an
    in-process wait without a configured queue-size bound.
    `HTTP_SERVER_TIMEOUT_SECONDS` and request metrics start after permit
-   acquisition. The main service gauge reports permits in use but not admission
-   waiters. The `/version` and `/metrics` service routes retain their existing
-   admission bypass. Traffic through the port `3211` proxy acquires a proxy
-   permit and then a main-service permit; direct `/http` traffic uses only the
-   main permit. Node callbacks carrying the callback-token header can use
+   acquisition. The service concurrency gauge reports permits in use; separate
+   admission metrics report waiters and wait duration. The `/version` and
+   `/metrics` service routes retain their existing admission bypass. Traffic
+   through the port `3211` proxy acquires a proxy permit and then a main-service
+   permit; direct `/http` traffic uses only the main permit. Node callbacks
+   carrying the callback-token header can use
    `HTTP_SERVER_DEPENDENCY_RESERVE` dependency-only overflow once shared base
    occupancy is full.
 3. The application function limiters independently gate queries, mutations,
@@ -340,16 +354,17 @@ policy, and overload response:
 4. Equal query cache misses can coalesce, making followers wait for one peer
    computation without entering the isolate queue. A protected direct action
    query bypasses an independent peer and may duplicate the query instead.
-5. Externally submitted isolate work shares the bounded CoDel queue. Its shared
-   base capacity is `ISOLATE_QUEUE_SIZE`, with `R` extra external
-   dependency-only slots. Queue-full sends fail immediately. Entries normally
-   receive the `5` second idle deadline or the `50` ms congested deadline.
-   CoDel depth is combined across external classes; scheduler counters separate
-   class-specific enqueue, dispatch, expiry, and rejection. Direct nested UDF
-   callbacks bypass CoDel through upstream's internal high-priority channel and
-   have no queue expiry.
+5. Externally submitted isolate work shares one bounded queue. Its shared base
+   capacity is `ISOLATE_QUEUE_SIZE`, with `R` extra external dependency-only
+   slots. Queue-full sends fail immediately. The default policy assigns the `5`
+   second idle deadline or the `50` ms congested deadline and exposes combined
+   generic CoDel depth. The opt-in lane policy uses its configured hard age and
+   lane-specific depth, delay, overload, and rejection metrics. Scheduler
+   counters separate class-specific enqueue, dispatch, expiry, and rejection in
+   both modes. Direct nested UDF callbacks bypass this queue through upstream's
+   internal high-priority channel and have no queue expiry.
 6. The isolate scheduler assigns at most `MAX_ISOLATE_WORKERS` requests to
-   workers. This is not another backlog: eligible work remains in CoDel until a
+   workers. This is not another backlog: eligible work remains in the queue until a
    worker is available. Every class shares occupancy below `B`; only
    ancestor-unblocking work can raise occupancy from `B` to `T`; independent
    V8/HTTP actions are additionally capped by
@@ -364,13 +379,12 @@ policy, and overload response:
    suspended-permit reacquisition use the high-priority tier; initial external
    root and action requests use the low-priority tier. The tiers add no active
    permits and do not preempt JavaScript already running. Permit acquisition
-   latency and backend CPU throttling identify this stage.
-   `FUNRUN_INITIAL_PERMIT_TIMEOUT_MS` bounds only the initial permit wait for a
-   root-style function, including an action callback that is a scheduler
-   dependency. Separately scheduled nested transactional functions wait without
-   this timeout because they cannot be retried safely. Raising the knob
-   therefore retains root-style assigned workers longer during CPU saturation;
-   it neither adds active capacity nor bounds nested transactional wait.
+   latency and backend CPU throttling identify this stage. The original external
+   queue deadline continues to bound low-priority initial permit acquisition
+   after queue selection: the applicable CoDel expiration or lane hard deadline.
+   An action callback retains this bound even when it is a scheduler dependency.
+   Separately scheduled nested transactional functions use the internal path and
+   wait without an external deadline because they cannot be retried safely.
    Scheduler dependency ownership and active-permit priority are deliberately
    separate: an action callback can use scheduler overflow but start at low
    priority, while an already-started independent root reacquires at high
@@ -395,8 +409,8 @@ count requests that may be suspended on I/O or waiting downstream;
 `FUNRUN_ISOLATE_ACTIVE_THREADS` counts JavaScript currently eligible to consume
 CPU. A high upstream limit does not create worker or CPU capacity. It changes
 where overload waits and which timeout or rejection policy handles it. Lowering
-an application limit can move work from CoDel's short class-aware congestion
-expiry into a longer FIFO admission wait, so related knobs should be compared as
+an application limit can move work from legacy CoDel's short congested expiry
+into a longer FIFO admission wait, so related knobs should be compared as
 a complete admission path rather than normalized to the same number.
 
 ## Evidence
@@ -413,7 +427,7 @@ was colocated. Common settings for the successful scheduler runs were:
 - `30s` load runs for the steady-state samples
 
 These measurements predate the review hardening that prevents independent work
-from using dependency overflow, reserves application and CoDel admission, avoids
+from using dependency overflow, reserves application and queue admission, avoids
 dependency query-cache waits behind independent work, and caps independent
 action shells. They remain useful workload-tuning evidence, but they are not a
 load-test validation of the final scheduler policy. The final policy is covered
@@ -526,7 +540,7 @@ Keep `HTTP_SERVER_MAX_CONCURRENT_REQUESTS` fixed while comparing isolate knobs.
 For the measured five-CPU candidate, `192` was enough to pass the clean
 `200 rps` point and raising it to `256` did not improve the overload result.
 That comparison predates the HTTP dependency reserve: with total capacity `192`
-and `HTTP_SERVER_DEPENDENCY_RESERVE=5`, the final gate admits at most `187`
+and `HTTP_SERVER_DEPENDENCY_RESERVE=1`, the final gate admits at most `191`
 requests before occupancy enters dependency-only overflow. Higher HTTP
 admission mainly creates a deeper queue unless backend CPU or runtime cost also
 changes.
@@ -545,32 +559,41 @@ another nested call. If dependency-role enqueue rises while dispatch stays flat,
 awaited functions are not getting workers.
 
 Use `isolate_scheduler_requests_expired_total{pool_name, scheduler_class}` to
-separate external CoDel queue expiry by class. Dependency expiry means a
-Convex-runtime action, HTTP action, query, or mutation may fail because the
-function it awaited timed out in the external isolate queue. Direct internal
-nested UDF callbacks have no CoDel expiry.
+separate external pre-dispatch deadline failures by class. It includes both an
+entry hard-expired while retained in the queue and a selected entry that
+reached the same original deadline while acquiring its initial active permit.
+Dependency expiry means a Convex-runtime action, HTTP action, query, or mutation
+may fail because the function it awaited timed out before isolate dispatch.
+Direct internal nested UDF callbacks have no external queue deadline.
 
 Use
 `isolate_scheduler_requests_rejected_total{pool_name, scheduler_class, reason}`
-to distinguish queue-full rejection from an unexpected no-worker rejection.
-`reason="queue_full"` points at admission pressure before the scheduler can
-choose a worker. `reason="no_worker"` should be rare; it means a request
-selected for dispatch no longer satisfied scheduler capacity checks.
-`reason="scheduler_closed"` means the scheduler already exited,
-for example after an isolate worker or worker channel failed. New sends after
-the receiver closes increment this reason. Requests already queued are dropped
-so their callers receive a shutdown error rather than hanging, but those drops
-are not individually added to the rejection counter.
+to distinguish queue-full or lane-full admission rejection, delay-control
+shedding, a caller dropping a control-plane response before dispatch, and an
+unexpected no-worker rejection. `reason="queue_full"` or `reason="lane_full"`
+points at admission pressure before the scheduler can choose a worker.
+`reason="delay_control_shed"` is a queue delay-control decision and
+`reason="caller_dropped"` avoids dispatching abandoned control-plane work.
+`reason="no_worker"` should be rare; it means a request selected for dispatch no
+longer satisfied scheduler capacity checks.
+`reason="scheduler_closed"` means the scheduler already exited, for example
+after an isolate worker or worker channel failed. New sends after the receiver
+closes increment this reason. Requests already queued are dropped so their
+callers receive a shutdown error rather than hanging, but those drops are not
+individually added to the rejection counter. These six reason values and the
+five scheduler classes below are closed metric-label contracts.
 
-Use `isolate_scheduler_active_requests_info{pool_name, scheduler_class}` to see
-which role combinations occupy workers during the sample. The labels are
-`independent`, `descendant_holder`, `dependency`, and
-`dependency_descendant_holder`, and `control_plane`. Control-plane requests use
-shared base capacity rather than the dependency reserve or independent-action
-allowance. Active totals follow the worker-request lifetime, including worker or
-channel failure, so a failed scheduler does not leave these gauges permanently
-nonzero. Gauge updates use paired increments and decrements so concurrent worker
-completions cannot publish an older absolute count after a newer one.
+Use
+`isolate_scheduler_active_requests_info{pool_name,scheduler_class,is_isolate_action}`
+to see which role combinations occupy workers during the sample while retaining
+action identity separately. The `scheduler_class` values are `independent`,
+`descendant_holder`, `dependency`, `dependency_descendant_holder`, and
+`control_plane`. Control-plane requests use shared base capacity rather than the
+dependency reserve or independent-action allowance. Active totals follow the
+worker-request lifetime, including worker or channel failure, so a failed
+scheduler does not leave these gauges permanently nonzero. Gauge updates use
+paired increments and decrements so concurrent worker completions cannot publish
+an older absolute count after a newer one.
 
 Use `isolate_scheduler_capacity_info{pool_name,capacity_kind}` to confirm the
 resolved `physical`, `base`, and `independent_action` capacities. This is
@@ -606,10 +629,10 @@ dependency-only worker overflow admission, not the number or share of active
 dependencies.
 
 Use `isolate_scheduler_dependency_queue_reserve_enqueue_total{pool_name}` to
-count dependencies that entered the extra CoDel capacity after the shared base
+count dependencies that entered the extra queue capacity after the shared base
 `ISOLATE_QUEUE_SIZE` capacity was full. A rising value proves that the queue
 reserve prevented an immediate base-queue-full rejection; it does not mean
-the request eventually dispatched before its CoDel deadline.
+the request eventually dispatched before its applicable queue expiry.
 
 `cache_plan_go_total{reason="dependency_cannot_wait_for_independent_peer"}`
 counts dependency queries that duplicated an independent in-flight cache miss
@@ -618,11 +641,19 @@ instead of waiting behind it.
 When `HTTP_SERVER_DEPENDENCY_RESERVE` is nonzero, the main backend also exports
 `backend_http_service_base_concurrent_requests`; compare it with total HTTP
 concurrency to see whether occupancy is using dependency-only HTTP overflow.
+`http_admission_waiters_info{service_name,is_dependency}` counts requests that
+actually entered each HTTP admission wait, and
+`http_admission_wait_seconds{service_name,is_dependency}` records waits ending
+in permit handoff or cancellation. Immediate admission produces neither.
+When isolate queue delay control is enabled,
+`isolate_queue_ineligible_info{lane,reason="independent_action_cap"}` reports the
+latest queued count blocked by the action cap, but not the duration of that
+wait.
 Metrics still do not include queued depth by scheduler role, resolved per-client
-capacities, application-limit reserve use, a direct action-cap wait signal,
-call-chain depth, or time spent specifically waiting on a descendant.
+capacities, application-limit reserve use, call-chain depth, or time spent
+specifically waiting on a descendant.
 
-Externally submitted scheduler roles share one bounded CoDel queue.
+Externally submitted scheduler roles share one bounded isolate queue.
 Non-dependency work cannot use the `R` extra entries, but external dependencies
 can occupy shared base entries as well. A queue holding
 `ISOLATE_QUEUE_SIZE + R` entries still rejects subsequent external dependencies.
@@ -668,7 +699,7 @@ that code pattern.
 | A query calls `ctx.runQuery`, or a mutation calls `ctx.runQuery` or `ctx.runMutation`, with `SUBFUNCTIONS_IN_SAME_ISOLATE=false`                                    | Covered as a finite chain: every separately scheduled child is dependency-marked and may itself be a descendant-holder. Size `R` for expected nesting and fanout; a chain requiring more than `T` simultaneous workers can still fail. `useStaleSnapshot` and `transactionLimits` do not change isolate placement.                           |
 | The application runs many independent V8 or HTTP actions                                                                                                            | `MAX_ISOLATE_ACTION_WORKERS` limits assigned independent action shells without reducing query/mutation worker capacity. A lower value protects mixed traffic; a higher value can improve an action-only route. There is no universal ratio, so document whether the selected value is benchmarked or an informed starting point.             |
 | `HTTP_SERVER_MAX_CONCURRENT_REQUESTS <= HTTP_SERVER_DEPENDENCY_RESERVE`                                                                                             | The standard local backend does not start because the configured overflow would leave no shared base HTTP admission. Set the HTTP total above the HTTP reserve. This matters for `"use node"` chains; V8-only callbacks do not re-enter through HTTP.                                                                    |
-| `concurrency_permit_acquire_seconds` rises or root-style functions report `InitialPermitTimeoutError` while dependency work is queued                              | Worker reserve is available, but the shared active-JavaScript permits or CPU are saturated. Initial nested transactional waits and all permit reacquisitions use the high-priority tier; nested transactional initial waits have no timeout. Initial roots and actions, including action callbacks that are scheduler dependencies, use the low-priority tier and retain the initial-permit timeout. Check backend CPU throttling and long-running JavaScript. Reduce admitted CPU work or raise active permits only after confirming CPU headroom; tiering does not add active capacity. |
+| `concurrency_permit_acquire_seconds` rises or root-style functions report `InitialPermitTimeoutError` while dependency work is queued                              | Worker reserve is available, but the shared active-JavaScript permits or CPU are saturated. Initial nested transactional waits and all permit reacquisitions use the high-priority tier; nested transactional initial waits have no external deadline. Initial roots and actions, including action callbacks that are scheduler dependencies, use the low-priority tier and remain bounded by the original applicable CoDel or lane queue deadline. Check backend CPU throttling and long-running JavaScript. Reduce admitted CPU work or raise active permits only after confirming CPU headroom; tiering does not add active capacity. |
 | Public clients can reach `/api/actions/*`                                                                                                                           | Callback tokens protect operations, but the outer HTTP gate classifies reserve use before token authentication. Restrict this path to the backend or Node executor network source where practical, verify legitimate callbacks after the rule, and keep bounded public admission.                                                            |
 | `isolate_scheduler_requests_rejected_total{scheduler_class=~"dependency.*",reason="queue_full"}` or dependency expiry rises continuously during representative load | The bounded reserve is exhausted. Correlate with action failures, HTTP errors, backend CPU, active-permit wait, and dependency dispatch. Reduce or shape admitted traffic, reduce nesting/fanout, or add measured capacity. Do not increase queue depth alone: it can replace rejection with longer latency without increasing service rate. |
 
@@ -698,11 +729,10 @@ still execute actions, but an older executor omits the ancestry header from its
 callbacks and those callbacks use ordinary isolate admission until the executor
 is updated.
 
-Custom or remote function runners are a backend-integration concern, not a
-standard self-hosted operator check. Such a runner must advertise
-`supports_dependency_unblocking_scheduler` only after implementing equivalent
-capacity policy at its real worker pool; otherwise the application-layer action
-cap remains best effort.
+Custom function runners are a backend-integration concern, not a standard
+self-hosted operator check. Such a runner must implement equivalent bounded
+dependency admission at its real worker pool; the application layer has no
+best-effort fallback for a runner that does not honor this contract.
 
 ## Scope
 
@@ -723,6 +753,7 @@ requests beyond shared base capacity. This does not make overload lossless or
 guarantee call chains deeper than configured physical capacity. The patch does
 not remove CPU cost from JavaScript initialization, module metadata lookup,
 source loading, action setup, or application code.
+
 ## Interaction with isolate queue delay control
 
 The opt-in isolate queue policy in

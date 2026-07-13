@@ -26,6 +26,7 @@ pub mod helpers;
 mod http;
 mod is_instance_of_error;
 pub mod isolate;
+mod isolate_queue;
 pub mod isolate_worker;
 pub mod metrics;
 pub mod module_cache;
