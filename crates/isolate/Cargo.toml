@@ -73,6 +73,7 @@ deno_core_icudata = { workspace = true }
 derive_more = { workspace = true }
 encoding_rs = { workspace = true }
 errors = { workspace = true }
+event-listener = { workspace = true }
 fastrace = { workspace = true }
 file_storage = { workspace = true }
 futures = { workspace = true }

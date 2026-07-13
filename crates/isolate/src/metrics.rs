@@ -86,7 +86,7 @@ fn scheduler_class_labels(
 
 register_convex_counter!(
     ISOLATE_SCHEDULER_REQUESTS_ENQUEUED_TOTAL,
-    "Number of requests accepted by the isolate scheduler queue",
+    "Number of requests accepted through the isolate scheduler's external or internal ingress",
     &["pool_name", "scheduler_class"]
 );
 pub fn log_scheduler_request_enqueued(name: &'static str, scheduler_class: &'static str) {
@@ -112,7 +112,8 @@ pub fn log_scheduler_request_dispatched(name: &'static str, scheduler_class: &'s
 
 register_convex_counter!(
     ISOLATE_SCHEDULER_REQUESTS_EXPIRED_TOTAL,
-    "Number of isolate scheduler requests that expired in the queue",
+    "Number of isolate scheduler requests that reached their original queue deadline before \
+     dispatch",
     &["pool_name", "scheduler_class"],
     std::time::Duration::MAX,
 );
@@ -143,21 +144,41 @@ pub fn log_scheduler_request_rejected(
 register_convex_gauge!(
     ISOLATE_SCHEDULER_ACTIVE_REQUESTS_INFO,
     "How many isolate scheduler requests are currently active by scheduler class",
-    &["pool_name", "scheduler_class"]
+    &["pool_name", "scheduler_class", "is_isolate_action"]
 );
-pub fn log_scheduler_active_request_started(name: &'static str, scheduler_class: &'static str) {
+fn scheduler_active_labels(
+    name: &'static str,
+    scheduler_class: &'static str,
+    is_isolate_action: bool,
+) -> Vec<StaticMetricLabel> {
+    vec![
+        StaticMetricLabel::new("pool_name", name),
+        StaticMetricLabel::new("scheduler_class", scheduler_class),
+        StaticMetricLabel::new("is_isolate_action", is_isolate_action.as_label()),
+    ]
+}
+
+pub fn log_scheduler_active_request_started(
+    name: &'static str,
+    scheduler_class: &'static str,
+    is_isolate_action: bool,
+) {
     add_to_gauge_with_labels(
         &ISOLATE_SCHEDULER_ACTIVE_REQUESTS_INFO,
         1.0,
-        scheduler_class_labels(name, scheduler_class),
+        scheduler_active_labels(name, scheduler_class, is_isolate_action),
     );
 }
 
-pub fn log_scheduler_active_request_finished(name: &'static str, scheduler_class: &'static str) {
+pub fn log_scheduler_active_request_finished(
+    name: &'static str,
+    scheduler_class: &'static str,
+    is_isolate_action: bool,
+) {
     subtract_from_gauge_with_labels(
         &ISOLATE_SCHEDULER_ACTIVE_REQUESTS_INFO,
         1.0,
-        scheduler_class_labels(name, scheduler_class),
+        scheduler_active_labels(name, scheduler_class, is_isolate_action),
     );
 }
 
@@ -177,7 +198,7 @@ pub fn log_scheduler_dependency_reserve_dispatch(name: &'static str) {
 
 register_convex_counter!(
     ISOLATE_SCHEDULER_DEPENDENCY_QUEUE_RESERVE_ENQUEUE_TOTAL,
-    "Number of dependency requests enqueued using CoDel capacity unavailable to non-dependency \
+    "Number of dependency requests enqueued using queue capacity unavailable to non-dependency \
      work",
     &["pool_name"]
 );
@@ -201,6 +222,205 @@ pub fn log_scheduler_capacity(name: &'static str, capacity_kind: &'static str, c
         vec![
             StaticMetricLabel::new("pool_name", name),
             StaticMetricLabel::new("capacity_kind", capacity_kind),
+        ],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_CONTROL_PLANE_LANE_ENABLED_INFO,
+    "Whether control-plane isolate request classification is enabled",
+    &["pool_name"]
+);
+fn control_plane_lane_enabled_value(enabled: bool) -> f64 {
+    if enabled {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+pub fn log_control_plane_lane_enabled(name: &'static str, enabled: bool) {
+    log_gauge_with_labels(
+        &ISOLATE_CONTROL_PLANE_LANE_ENABLED_INFO,
+        control_plane_lane_enabled_value(enabled),
+        vec![StaticMetricLabel::new("pool_name", name)],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_QUEUE_DEPTH_INFO,
+    "Current number of queued isolate requests by scheduler lane",
+    &["pool_name", "lane"]
+);
+pub fn log_isolate_queue_depth(name: &'static str, lane: &'static str, depth: usize) {
+    log_gauge_with_labels(
+        &ISOLATE_QUEUE_DEPTH_INFO,
+        depth as f64,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("lane", lane),
+        ],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_QUEUE_OLDEST_AGE_SECONDS,
+    "Age of the oldest queued isolate request by scheduler lane",
+    &["pool_name", "lane"]
+);
+pub fn log_isolate_queue_oldest_age(name: &'static str, lane: &'static str, age: Duration) {
+    log_gauge_with_labels(
+        &ISOLATE_QUEUE_OLDEST_AGE_SECONDS,
+        age.as_secs_f64(),
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("lane", lane),
+        ],
+    );
+}
+
+register_convex_histogram!(
+    ISOLATE_QUEUE_SOJOURN_SECONDS,
+    "Time dispatched isolate requests spent in the scheduler queue",
+    &["pool_name", "lane"]
+);
+pub fn log_isolate_queue_sojourn(name: &'static str, lane: &'static str, sojourn: Duration) {
+    log_distribution_with_labels(
+        &ISOLATE_QUEUE_SOJOURN_SECONDS,
+        sojourn.as_secs_f64(),
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("lane", lane),
+        ],
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_QUEUE_REJECTIONS_TOTAL,
+    "Number of isolate queue requests rejected before dispatch",
+    &["pool_name", "lane", "reason"],
+    std::time::Duration::MAX,
+);
+pub fn log_isolate_queue_rejection(name: &'static str, lane: &'static str, reason: &'static str) {
+    log_counter_with_labels(
+        &ISOLATE_QUEUE_REJECTIONS_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("lane", lane),
+            StaticMetricLabel::new("reason", reason),
+        ],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_QUEUE_OVERLOADED_INFO,
+    "Whether an isolate queue scheduler lane is overloaded",
+    &["pool_name", "lane"]
+);
+pub fn log_isolate_queue_overloaded(name: &'static str, lane: &'static str, overloaded: bool) {
+    log_gauge_with_labels(
+        &ISOLATE_QUEUE_OVERLOADED_INFO,
+        if overloaded { 1.0 } else { 0.0 },
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("lane", lane),
+        ],
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_QUEUE_OVERLOAD_TRANSITIONS_TOTAL,
+    "Number of isolate queue scheduler lane overload transitions",
+    &["pool_name", "lane", "transition"],
+    std::time::Duration::MAX,
+);
+pub fn log_isolate_queue_overload_transition(
+    name: &'static str,
+    lane: &'static str,
+    transition: &'static str,
+) {
+    log_counter_with_labels(
+        &ISOLATE_QUEUE_OVERLOAD_TRANSITIONS_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("lane", lane),
+            StaticMetricLabel::new("transition", transition),
+        ],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_QUEUE_INELIGIBLE_INFO,
+    "Current queued isolate requests blocked by each scheduler eligibility limit",
+    &["pool_name", "lane", "reason"]
+);
+pub fn log_isolate_queue_ineligible(
+    name: &'static str,
+    lane: &'static str,
+    reason: &'static str,
+    count: usize,
+) {
+    log_gauge_with_labels(
+        &ISOLATE_QUEUE_INELIGIBLE_INFO,
+        count as f64,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("lane", lane),
+            StaticMetricLabel::new("reason", reason),
+        ],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_QUEUE_CAPACITY_INFO,
+    "Configured isolate scheduler queue capacity",
+    &["pool_name", "capacity_kind"]
+);
+pub fn log_isolate_queue_capacity(
+    name: &'static str,
+    capacity_kind: &'static str,
+    capacity: usize,
+) {
+    log_gauge_with_labels(
+        &ISOLATE_QUEUE_CAPACITY_INFO,
+        capacity as f64,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("capacity_kind", capacity_kind),
+        ],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_QUEUE_POLICY_INFO,
+    "Selected isolate scheduler queue policy",
+    &["pool_name", "policy"]
+);
+pub fn log_isolate_queue_policy(name: &'static str, policy: &'static str) {
+    log_gauge_with_labels(
+        &ISOLATE_QUEUE_POLICY_INFO,
+        1.0,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("policy", policy),
+        ],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_QUEUE_CONFIG_MILLIS_INFO,
+    "Configured isolate scheduler queue durations in milliseconds",
+    &["pool_name", "config_kind"]
+);
+pub fn log_isolate_queue_config(name: &'static str, config_kind: &'static str, duration: Duration) {
+    log_gauge_with_labels(
+        &ISOLATE_QUEUE_CONFIG_MILLIS_INFO,
+        duration.as_secs_f64() * 1000.0,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("config_kind", config_kind),
         ],
     );
 }
@@ -265,13 +485,35 @@ pub(crate) fn rejected_before_execution_error(
 }
 
 pub fn initialize_capacity_counters(name: &'static str) {
-    const SCHEDULER_CLASSES: [&str; 4] = [
+    const SCHEDULER_CLASSES: [&str; 5] = [
         "independent",
         "descendant_holder",
         "dependency",
         "dependency_descendant_holder",
+        "control_plane",
     ];
-    const SCHEDULER_REJECTION_REASONS: [&str; 3] = ["queue_full", "scheduler_closed", "no_worker"];
+    const SCHEDULER_REJECTION_REASONS: [&str; 6] = [
+        "queue_full",
+        "lane_full",
+        "scheduler_closed",
+        "delay_control_shed",
+        "caller_dropped",
+        "no_worker",
+    ];
+    const QUEUE_LANES: [&str; 4] = [
+        "dependency",
+        "control_plane",
+        "independent_action",
+        "ordinary",
+    ];
+    const QUEUE_REJECTION_REASONS: [&str; 6] = [
+        "queue_full",
+        "lane_full",
+        "scheduler_closed",
+        "hard_expired",
+        "delay_control_shed",
+        "caller_dropped",
+    ];
 
     for scheduler_class in SCHEDULER_CLASSES {
         log_counter_with_labels(
@@ -283,6 +525,30 @@ pub fn initialize_capacity_counters(name: &'static str) {
             let mut labels = scheduler_class_labels(name, scheduler_class);
             labels.push(StaticMetricLabel::new("reason", reason));
             log_counter_with_labels(&ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL, 0, labels);
+        }
+    }
+    for lane in QUEUE_LANES {
+        for reason in QUEUE_REJECTION_REASONS {
+            log_counter_with_labels(
+                &ISOLATE_QUEUE_REJECTIONS_TOTAL,
+                0,
+                vec![
+                    StaticMetricLabel::new("pool_name", name),
+                    StaticMetricLabel::new("lane", lane),
+                    StaticMetricLabel::new("reason", reason),
+                ],
+            );
+        }
+        for transition in ["entered", "cleared"] {
+            log_counter_with_labels(
+                &ISOLATE_QUEUE_OVERLOAD_TRANSITIONS_TOTAL,
+                0,
+                vec![
+                    StaticMetricLabel::new("pool_name", name),
+                    StaticMetricLabel::new("lane", lane),
+                    StaticMetricLabel::new("transition", transition),
+                ],
+            );
         }
     }
     log_counter(&UDF_EXECUTE_FULL_TOTAL, 0);
@@ -934,7 +1200,6 @@ pub fn log_reusable_context_init(udf_type: UdfType, reused: bool) {
         ],
     );
 }
-
 register_convex_counter!(
     NORMALIZE_ID_OLD_FORMAT_TOTAL,
     "Number of successful calls to normalizeId with old ID formats",
@@ -954,7 +1219,10 @@ mod tests {
     use prometheus::core::Collector;
 
     use super::{
+        control_plane_lane_enabled_value,
         initialize_capacity_counters,
+        ISOLATE_QUEUE_OVERLOAD_TRANSITIONS_TOTAL,
+        ISOLATE_QUEUE_REJECTIONS_TOTAL,
         ISOLATE_SCHEDULER_REQUESTS_EXPIRED_TOTAL,
         ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL,
     };
@@ -975,17 +1243,31 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_lane_enabled_metric_is_closed_boolean_state() {
+        assert_eq!(control_plane_lane_enabled_value(false), 0.0);
+        assert_eq!(control_plane_lane_enabled_value(true), 1.0);
+    }
+
+    #[test]
     fn capacity_counter_initialization_covers_closed_label_sets() {
         const POOL_NAME: &str = "capacity_counter_initialization_test";
         initialize_capacity_counters(POOL_NAME);
 
         assert_eq!(
             zero_series_for_pool(&*ISOLATE_SCHEDULER_REQUESTS_EXPIRED_TOTAL, POOL_NAME),
-            4
+            5
         );
         assert_eq!(
             zero_series_for_pool(&*ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL, POOL_NAME),
-            12
+            30
+        );
+        assert_eq!(
+            zero_series_for_pool(&*ISOLATE_QUEUE_REJECTIONS_TOTAL, POOL_NAME),
+            24
+        );
+        assert_eq!(
+            zero_series_for_pool(&*ISOLATE_QUEUE_OVERLOAD_TRANSITIONS_TOTAL, POOL_NAME),
+            8
         );
     }
 }

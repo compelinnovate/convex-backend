@@ -131,7 +131,9 @@ lane hard deadline. Direct separately scheduled nested transactional functions d
 external deadline because they cannot be retried safely. Both ingress paths cancel an outstanding
 permit acquisition when response-channel closure shows that the caller has disappeared; dropping
 that acquisition uses the limiter's cancellation-safe notification handoff and cannot leak a
-permit.
+permit. While one selected external request waits for its permit, a non-consuming queue expiry
+companion continues enforcing every other retained entry's own deadline without another enqueue or
+worker completion.
 
 Scheduler dependency ownership and active-permit priority intentionally differ at resource
 boundaries. A transactional descendant that retains an isolate-holding ancestor is eligible for
@@ -189,7 +191,8 @@ Use these bounded metric families together:
 - `isolate_scheduler_requests_enqueued_total{pool_name,scheduler_class}` and
   `isolate_scheduler_requests_dispatched_total{...}` for role progress;
 - `isolate_scheduler_requests_expired_total{...}` and
-  `isolate_scheduler_requests_rejected_total{...,reason}` for queue failure;
+  `isolate_scheduler_requests_rejected_total{...,reason}` for pre-dispatch deadline and admission
+  failure;
 - `isolate_scheduler_active_requests_info{pool_name,scheduler_class,is_isolate_action}` for current
   assigned-worker ownership;
 - `isolate_scheduler_dependency_reserve_dispatch_total{pool_name}` for dispatch above shared base;

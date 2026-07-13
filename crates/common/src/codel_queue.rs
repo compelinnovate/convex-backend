@@ -40,6 +40,15 @@ use crate::{
 #[error("Queue full")]
 pub struct QueueFull;
 
+/// Exact reason an asynchronous CoDel queue send was rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoDelQueueSendError {
+    /// The applicable base or base-plus-reserve capacity is occupied.
+    Full,
+    /// No receiver remains to consume the item.
+    Closed,
+}
+
 /// Instead of simply dropping items from the queue,
 /// we return expired items so the caller can dispose of them.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -137,8 +146,13 @@ impl<RT: Runtime, T> CoDelQueue<RT, T> {
     }
 
     fn push_with_limit(&mut self, item: T, capacity: usize) -> Result<(), (QueueFull, T)> {
+        self.try_push_with_limit(item, capacity)
+            .map_err(|item| (QueueFull, item))
+    }
+
+    fn try_push_with_limit(&mut self, item: T, capacity: usize) -> Result<(), T> {
         if self.len() >= capacity {
-            return Err((QueueFull, item));
+            return Err(item);
         }
         let now = self.rt.monotonic_now();
         self.update_last_time_empty(now);
@@ -267,6 +281,7 @@ impl<RT: Runtime, T> CoDelQueue<RT, T> {
             CoDelQueueReceiver {
                 inner,
                 listener: None,
+                expiration_wait: None,
             },
         )
     }
@@ -282,6 +297,11 @@ mod tests {
                 Ordering,
             },
             Arc,
+            Weak,
+        },
+        task::{
+            Context,
+            Poll,
         },
         time::{
             Duration,
@@ -298,7 +318,10 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha12Rng;
 
-    use super::CoDelQueue;
+    use super::{
+        CoDelQueue,
+        CoDelQueueSendError,
+    };
     use crate::{
         knobs::CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
         pause::PauseClient,
@@ -319,18 +342,51 @@ mod tests {
     #[derive(Clone)]
     struct QueueTestRuntime {
         now: Arc<Mutex<tokio::time::Instant>>,
+        timer_drop_probe: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     }
 
     impl QueueTestRuntime {
         fn new() -> Self {
             Self {
                 now: Arc::new(Mutex::new(tokio::time::Instant::now())),
+                timer_drop_probe: Arc::new(Mutex::new(None)),
             }
         }
 
         fn advance(&self, duration: Duration) {
             let mut now = self.now.lock();
             *now += duration;
+        }
+
+        fn set_timer_drop_probe(&self, probe: impl Fn() + Send + Sync + 'static) {
+            *self.timer_drop_probe.lock() = Some(Arc::new(probe));
+        }
+    }
+
+    struct QueueTestWait {
+        inner: Pin<Box<dyn FusedFuture<Output = ()> + Send + 'static>>,
+        drop_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl Future for QueueTestWait {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.inner.as_mut().poll(cx)
+        }
+    }
+
+    impl FusedFuture for QueueTestWait {
+        fn is_terminated(&self) -> bool {
+            self.inner.is_terminated()
+        }
+    }
+
+    impl Drop for QueueTestWait {
+        fn drop(&mut self) {
+            if let Some(probe) = self.drop_probe.take() {
+                probe();
+            }
         }
     }
 
@@ -340,14 +396,16 @@ mod tests {
             duration: Duration,
         ) -> Pin<Box<dyn FusedFuture<Output = ()> + Send + 'static>> {
             let now = self.now.clone();
-            Box::pin(
+            let inner = Box::pin(
                 async move {
                     tokio::time::sleep(duration).await;
                     let mut now = now.lock();
                     *now += duration;
                 }
                 .fuse(),
-            )
+            );
+            let drop_probe = self.timer_drop_probe.lock().clone();
+            Box::pin(QueueTestWait { inner, drop_probe })
         }
 
         fn spawn(
@@ -383,6 +441,20 @@ mod tests {
         }
     }
 
+    struct LockingDropProbe {
+        inner: Weak<Mutex<super::Inner<QueueTestRuntime, LockingDropProbe>>>,
+        unlocked_drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for LockingDropProbe {
+        fn drop(&mut self) {
+            let inner = self.inner.upgrade().expect("queue must still exist");
+            if inner.try_lock().is_some() {
+                self.unlocked_drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     #[test]
     fn pop_selecting_keeps_ineligible_items_queued() {
         let rt = QueueTestRuntime::new();
@@ -405,11 +477,97 @@ mod tests {
         sender.try_send(DropCounter(drops.clone())).unwrap();
 
         drop(receiver);
-        assert!(sender.is_closed());
         assert_eq!(drops.load(Ordering::Relaxed), 1);
 
-        assert!(sender.try_send(DropCounter(drops.clone())).is_err());
+        assert_eq!(
+            sender.try_send_detailed(DropCounter(drops.clone())),
+            Err(CoDelQueueSendError::Closed)
+        );
         assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn sender_rejections_drop_items_outside_queue_lock() {
+        let rt = QueueTestRuntime::new();
+        let queue = CoDelQueue::new_with_reserved_capacity(rt, 1, 1);
+        let (sender, receiver) = queue.into_sender_and_receiver();
+        let inner = Arc::downgrade(&sender.inner);
+        let unlocked_drops = Arc::new(AtomicUsize::new(0));
+
+        sender
+            .try_send(LockingDropProbe {
+                inner: inner.clone(),
+                unlocked_drops: unlocked_drops.clone(),
+            })
+            .unwrap();
+        assert!(sender
+            .try_send(LockingDropProbe {
+                inner: inner.clone(),
+                unlocked_drops: unlocked_drops.clone(),
+            })
+            .is_err());
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 1);
+
+        assert!(sender
+            .try_send_with_reserved_capacity(LockingDropProbe {
+                inner: inner.clone(),
+                unlocked_drops: unlocked_drops.clone(),
+            })
+            .unwrap());
+        assert!(sender
+            .try_send_with_reserved_capacity(LockingDropProbe {
+                inner: inner.clone(),
+                unlocked_drops: unlocked_drops.clone(),
+            })
+            .is_err());
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 2);
+
+        drop(receiver);
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 4);
+
+        assert!(sender
+            .try_send(LockingDropProbe {
+                inner: inner.clone(),
+                unlocked_drops: unlocked_drops.clone(),
+            })
+            .is_err());
+        assert!(sender
+            .try_send_with_reserved_capacity(LockingDropProbe {
+                inner,
+                unlocked_drops: unlocked_drops.clone(),
+            })
+            .is_err());
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn detailed_sender_errors_distinguish_full_from_closed() {
+        let rt = QueueTestRuntime::new();
+        let queue = CoDelQueue::new_with_reserved_capacity(rt, 1, 1);
+        let (sender, receiver) = queue.into_sender_and_receiver();
+
+        sender.try_send_detailed("ordinary").unwrap();
+        assert_eq!(
+            sender.try_send_detailed("ordinary full"),
+            Err(CoDelQueueSendError::Full)
+        );
+        assert!(sender
+            .try_send_with_reserved_capacity_detailed("reserved")
+            .unwrap());
+        assert_eq!(
+            sender.try_send_with_reserved_capacity_detailed("reserved full"),
+            Err(CoDelQueueSendError::Full)
+        );
+
+        drop(receiver);
+        assert_eq!(
+            sender.try_send_detailed("ordinary closed"),
+            Err(CoDelQueueSendError::Closed)
+        );
+        assert_eq!(
+            sender.try_send_with_reserved_capacity_detailed("reserved closed"),
+            Err(CoDelQueueSendError::Closed)
+        );
     }
 
     #[test]
@@ -521,6 +679,123 @@ mod tests {
             .expect("sender is still open");
         assert_eq!(item, "all_workers_busy");
     }
+
+    #[tokio::test]
+    async fn selecting_receiver_wakes_when_ineligible_head_expires() {
+        let rt = QueueTestRuntime::new();
+        let queue = CoDelQueue::new(rt, 1, Duration::from_millis(1), Duration::from_millis(1));
+        let (sender, mut receiver) = queue.into_sender_and_receiver();
+        sender.try_send("ineligible").unwrap();
+
+        let (item, expiration) = tokio::time::timeout(
+            Duration::from_secs(1),
+            receiver.recv_next_selecting(|_| None::<u8>),
+        )
+        .await
+        .expect("selecting receiver did not wake at the CoDel deadline")
+        .expect("sender is still open");
+
+        assert_eq!(item, "ineligible");
+        assert!(expiration.is_err());
+    }
+
+    #[tokio::test]
+    async fn selecting_receiver_keeps_ineligible_item_after_last_sender_closes() {
+        let rt = QueueTestRuntime::new();
+        let queue = CoDelQueue::new(rt, 1, Duration::from_millis(1), Duration::from_millis(1));
+        let (sender, mut receiver) = queue.into_sender_and_receiver();
+        sender.try_send("ineligible").unwrap();
+        drop(sender);
+
+        let (item, expiration) = tokio::time::timeout(
+            Duration::from_secs(1),
+            receiver.recv_next_selecting(|_| None::<u8>),
+        )
+        .await
+        .expect("closed queue did not retain its item until expiration")
+        .expect("queued item was lost when the last sender closed");
+
+        assert_eq!(item, "ineligible");
+        assert!(expiration.is_err());
+        assert!(receiver.recv_next_selecting(|_| Some(0)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_receiver_drains_item_after_last_sender_closes() {
+        let rt = QueueTestRuntime::new();
+        let queue = CoDelQueue::new(rt, 1, Duration::from_millis(1), Duration::from_millis(1));
+        let (sender, receiver) = queue.into_sender_and_receiver();
+        let mut expired_receiver = receiver.expired_receiver();
+        sender.try_send("ineligible").unwrap();
+        drop(sender);
+
+        let (item, _) = tokio::time::timeout(Duration::from_secs(1), expired_receiver.next())
+            .await
+            .expect("closed expiration receiver did not wait for the queued deadline")
+            .expect("queued item was lost when the last sender closed");
+        assert_eq!(item, "ineligible");
+        assert!(expired_receiver.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_receiver_closes_when_last_main_receiver_is_dropped() {
+        let rt = QueueTestRuntime::new();
+        let queue: CoDelQueue<_, &'static str> =
+            CoDelQueue::new(rt, 1, Duration::from_secs(60), Duration::from_secs(60));
+        let (sender, receiver) = queue.into_sender_and_receiver();
+        let mut expired_receiver = receiver.expired_receiver();
+        drop(receiver);
+
+        assert_eq!(
+            sender.try_send_detailed("closed"),
+            Err(CoDelQueueSendError::Closed)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), expired_receiver.next())
+                .await
+                .expect("expiration receiver did not observe main receiver closure")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_receiver_replaces_timer_outside_queue_lock() {
+        let rt = QueueTestRuntime::new();
+        let queue = CoDelQueue::new(
+            rt.clone(),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let (sender, mut receiver) = queue.into_sender_and_receiver();
+        let mut expired_receiver = receiver.expired_receiver();
+        sender.try_send("first").unwrap();
+
+        let inner = Arc::downgrade(&sender.inner);
+        let unlocked_drops = Arc::new(AtomicUsize::new(0));
+        let unlocked_drops_for_probe = unlocked_drops.clone();
+        rt.set_timer_drop_probe(move || {
+            let inner = inner.upgrade().expect("queue must still exist");
+            if inner.try_lock().is_some() {
+                unlocked_drops_for_probe.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let mut pending = Box::pin(expired_receiver.next());
+        assert!(futures::poll!(&mut pending).is_pending());
+
+        let (item, expiration) = receiver
+            .recv_with_expiration()
+            .await
+            .expect("sender is still open");
+        assert_eq!(item, "first");
+        assert!(expiration.is_ok());
+        rt.advance(Duration::from_millis(1));
+        sender.try_send("replacement").unwrap();
+
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 1);
+    }
 }
 
 /// Wrapper around CoDelQueue that makes it async.
@@ -548,9 +823,18 @@ struct Inner<RT: Runtime, T> {
     receivers: usize,
 }
 
+enum SendCapacity {
+    Base,
+    WithReserve,
+}
+
 pub struct CoDelQueueReceiver<RT: Runtime, T> {
     inner: Arc<Mutex<Inner<RT, T>>>,
     listener: Option<event_listener::EventListener>,
+    expiration_wait: Option<(
+        Instant,
+        Pin<Box<dyn FusedFuture<Output = ()> + Send + 'static>>,
+    )>,
 }
 
 impl<RT: Runtime, T> Clone for CoDelQueueReceiver<RT, T> {
@@ -559,6 +843,7 @@ impl<RT: Runtime, T> Clone for CoDelQueueReceiver<RT, T> {
         Self {
             inner: self.inner.clone(),
             listener: None,
+            expiration_wait: None,
         }
     }
 }
@@ -616,7 +901,7 @@ impl<RT: Runtime, T> Drop for CoDelQueueSender<RT, T> {
         let mut inner = self.inner.lock();
         inner.senders -= 1;
         if inner.senders == 0 {
-            // Queue is closed. Wake up all receivers so they return None.
+            // Queue is closed. Wake receivers to drain retained work or close.
             inner.event.notify(usize::MAX);
             inner.expired_event.notify(usize::MAX);
         }
@@ -625,42 +910,57 @@ impl<RT: Runtime, T> Drop for CoDelQueueSender<RT, T> {
 
 impl<RT: Runtime, T> CoDelQueueSender<RT, T> {
     pub fn try_send(&self, item: T) -> Result<(), QueueFull> {
-        // N.B.: on error, only drops `item` after releasing the lock
-        self.try_send_or_recover(item)
-            .map_err(|(QueueFull, _)| QueueFull)
+        self.try_send_detailed(item).map_err(|_| QueueFull)
     }
 
     pub fn try_send_or_recover(&self, item: T) -> Result<(), (QueueFull, T)> {
+        self.try_send_with_limit(item, SendCapacity::Base)
+            .map(|_| ())
+            .map_err(|(_, item)| (QueueFull, item))
+    }
+
+    pub fn try_send_detailed(&self, item: T) -> Result<(), CoDelQueueSendError> {
+        self.try_send_with_limit(item, SendCapacity::Base)
+            .map(|_| ())
+            .map_err(|(error, _)| error)
+    }
+
+    pub fn try_send_with_reserved_capacity(&self, item: T) -> Result<bool, QueueFull> {
+        self.try_send_with_reserved_capacity_detailed(item)
+            .map_err(|_| QueueFull)
+    }
+
+    pub fn try_send_with_reserved_capacity_detailed(
+        &self,
+        item: T,
+    ) -> Result<bool, CoDelQueueSendError> {
+        self.try_send_with_limit(item, SendCapacity::WithReserve)
+            .map_err(|(error, _)| error)
+    }
+
+    fn try_send_with_limit(
+        &self,
+        item: T,
+        send_capacity: SendCapacity,
+    ) -> Result<bool, (CoDelQueueSendError, T)> {
         let mut inner = self.inner.lock();
         if inner.receivers == 0 {
-            return Err((QueueFull, item));
+            return Err((CoDelQueueSendError::Closed, item));
         }
-        inner.queue.push(item)?;
+        let used_reserved_capacity = inner.queue.len() >= inner.queue.capacity;
+        let capacity = match send_capacity {
+            SendCapacity::Base => inner.queue.capacity,
+            SendCapacity::WithReserve => inner.queue.capacity_with_reserve,
+        };
+        if let Err(item) = inner.queue.try_push_with_limit(item, capacity) {
+            // Return ownership so callers recover or drop the item after the lock releases.
+            return Err((CoDelQueueSendError::Full, item));
+        }
         inner.event.notify_additional(1);
         // All `CoDelQueueExpiredReceiver`s need to be woken since they don't consume
         // the queue item
         inner.expired_event.notify(usize::MAX);
-        Ok(())
-    }
-
-    pub fn try_send_with_reserved_capacity(&self, item: T) -> Result<bool, QueueFull> {
-        let result = {
-            let mut inner = self.inner.lock();
-            if inner.receivers == 0 {
-                Err((QueueFull, item))
-            } else {
-                inner.queue.push_with_reserved_capacity(item).inspect(|_| {
-                    inner.event.notify_additional(1);
-                    inner.expired_event.notify(usize::MAX);
-                })
-            }
-        };
-        // Rejected items can own queue handles; drop them only after releasing the lock.
-        result.map_err(|(QueueFull, _)| QueueFull)
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.inner.lock().receivers == 0
+        Ok(used_reserved_capacity)
     }
 }
 
@@ -702,26 +1002,63 @@ impl<RT: Runtime, T> CoDelQueueReceiver<RT, T> {
         poll_fn(|cx| self.poll_next_with_expiration(cx)).await
     }
 
-    pub fn poll_next_selecting_with_expiration<K: Ord>(
+    fn poll_next_selecting_with_expiration<K: Ord>(
         &mut self,
         cx: &mut Context<'_>,
         select_key: &mut impl FnMut(&T) -> Option<K>,
     ) -> Poll<Option<(T, Result<Instant, ExpiredInQueue>)>> {
-        let mut inner = self.inner.lock();
-        if let Some(result) = inner.queue.pop_selecting(&mut *select_key) {
-            return Poll::Ready(Some(result));
-        } else if inner.senders == 0 {
-            return Poll::Ready(None);
-        }
-
         loop {
-            match Pin::new(self.listener.get_or_insert_with(|| inner.event.listen())).poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(()) => {
-                    self.listener.take();
-                    continue;
-                },
+            let mut inner = self.inner.lock();
+            if let Some(result) = inner.queue.pop_selecting(&mut *select_key) {
+                let expiration_wait = self.expiration_wait.take();
+                drop(inner);
+                drop(expiration_wait);
+                return Poll::Ready(Some(result));
+            } else if inner.senders == 0 && inner.queue.is_empty() {
+                let expiration_wait = self.expiration_wait.take();
+                drop(inner);
+                drop(expiration_wait);
+                return Poll::Ready(None);
             }
+
+            let next_expiry_time = inner
+                .queue
+                .buffer
+                .front()
+                .map(|(_, expiration)| *expiration);
+            let rt = inner.queue.rt.clone();
+            let queue_changed = Pin::new(self.listener.get_or_insert_with(|| inner.event.listen()))
+                .poll(cx)
+                .is_ready();
+            drop(inner);
+
+            if queue_changed {
+                self.listener.take();
+                continue;
+            }
+            if self
+                .expiration_wait
+                .as_ref()
+                .map(|(expiration, _)| *expiration)
+                != next_expiry_time
+            {
+                let previous = self.expiration_wait.take();
+                self.expiration_wait = next_expiry_time.map(|expiration| {
+                    let wait = rt.wait(expiration.saturating_duration_since(rt.monotonic_now()));
+                    (expiration, wait)
+                });
+                drop(previous);
+            }
+            if self
+                .expiration_wait
+                .as_mut()
+                .is_some_and(|(_, timer)| timer.as_mut().poll(cx).is_ready())
+            {
+                let completed = self.expiration_wait.take();
+                drop(completed);
+                continue;
+            }
+            return Poll::Pending;
         }
     }
 
@@ -766,12 +1103,18 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
         loop {
             let mut inner = this.inner.lock();
             if let Some(result) = inner.queue.pop_expired() {
-                this.listener.take();
-                this.next_expiry_timer.take();
+                let listener = this.listener.take();
+                let next_expiry_timer = this.next_expiry_timer.take();
+                drop(inner);
+                drop(listener);
+                drop(next_expiry_timer);
                 return Poll::Ready(Some(result));
-            } else if inner.senders == 0 {
-                this.listener.take();
-                this.next_expiry_timer.take();
+            } else if inner.receivers == 0 || (inner.senders == 0 && inner.queue.is_empty()) {
+                let listener = this.listener.take();
+                let next_expiry_timer = this.next_expiry_timer.take();
+                drop(inner);
+                drop(listener);
+                drop(next_expiry_timer);
                 return Poll::Ready(None);
             }
 
@@ -780,21 +1123,7 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
                 .buffer
                 .front()
                 .map(|(_, expiration)| *expiration);
-            if this
-                .next_expiry_timer
-                .as_ref()
-                .map(|(expiration, _)| *expiration)
-                != next_expiry_time
-            {
-                this.next_expiry_timer = next_expiry_time.map(|expiration| {
-                    let wait = inner
-                        .queue
-                        .rt
-                        .wait(expiration.saturating_duration_since(inner.queue.rt.monotonic_now()));
-                    (expiration, wait)
-                });
-            }
-
+            let rt = inner.queue.rt.clone();
             // Register for queue changes as well as the deadline. A new head
             // can replace the one associated with the current timer.
             let queue_changed = Pin::new(
@@ -803,19 +1132,32 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
             )
             .poll(cx)
             .is_ready();
+            drop(inner);
+
+            if queue_changed {
+                this.listener.take();
+                continue;
+            }
+            if this
+                .next_expiry_timer
+                .as_ref()
+                .map(|(expiration, _)| *expiration)
+                != next_expiry_time
+            {
+                let previous = this.next_expiry_timer.take();
+                this.next_expiry_timer = next_expiry_time.map(|expiration| {
+                    let wait = rt.wait(expiration.saturating_duration_since(rt.monotonic_now()));
+                    (expiration, wait)
+                });
+                drop(previous);
+            }
             let deadline_elapsed = this
                 .next_expiry_timer
                 .as_mut()
                 .is_some_and(|(_, timer)| timer.as_mut().poll(cx).is_ready());
-
-            if queue_changed {
-                this.listener.take();
-            }
             if deadline_elapsed {
-                this.next_expiry_timer.take();
-            }
-            if queue_changed || deadline_elapsed {
-                drop(inner);
+                let completed = this.next_expiry_timer.take();
+                drop(completed);
                 continue;
             }
             return Poll::Pending;

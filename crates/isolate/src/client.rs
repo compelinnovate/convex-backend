@@ -15,6 +15,7 @@ use std::{
         Arc,
         Once,
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -30,7 +31,9 @@ use common::{
     bootstrap_model::components::definition::ComponentDefinitionMetadata,
     codel_queue::{
         new_codel_queue_async_with_reserved_capacity,
+        CoDelQueueExpiredReceiver,
         CoDelQueueReceiver,
+        CoDelQueueSendError,
         CoDelQueueSender,
         ExpiredInQueue,
     },
@@ -55,11 +58,21 @@ use common::{
     },
     knobs::{
         ANALYZE_CONCURRENCY,
+        CODEL_QUEUE_CONGESTED_EXPIRATION_MILLIS,
+        CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
         HEAP_WORKER_REPORT_INTERVAL_SECONDS,
+        ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS,
+        ISOLATE_CONTROL_PLANE_LANE_ENABLED,
+        ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY,
         ISOLATE_DEPENDENCY_WORKER_RESERVE,
         ISOLATE_IDLE_TIMEOUT,
         ISOLATE_MAX_LIFETIME,
         ISOLATE_MAX_USER_HEAP_SIZE,
+        ISOLATE_QUEUE_DELAY_CONTROL_ENABLED,
+        ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS,
+        ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS,
+        ISOLATE_QUEUE_DELAY_TARGET_MILLIS,
+        ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS,
         ISOLATE_QUEUE_SIZE,
         MAX_ISOLATE_ACTION_WORKERS,
         REUSE_ISOLATES,
@@ -142,10 +155,7 @@ use tokio::sync::{
     mpsc,
     oneshot,
 };
-use tokio_stream::wrappers::{
-    ReceiverStream,
-    UnboundedReceiverStream,
-};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument as _;
 use udf::{
     validation::{
@@ -172,6 +182,19 @@ use crate::{
         Isolate,
         IsolateHeapStats,
     },
+    isolate_queue::{
+        new_isolate_queue,
+        IsolateQueueConfig,
+        IsolateQueueEligibility,
+        IsolateQueueExpiredReceiver,
+        IsolateQueueLane,
+        IsolateQueueMetricsReporter,
+        IsolateQueueOutput,
+        IsolateQueueReceiver,
+        IsolateQueueRejection,
+        IsolateQueueSendError,
+        IsolateQueueSender,
+    },
     metrics::{
         self,
         log_aggregated_heap_stats,
@@ -189,6 +212,8 @@ use crate::{
     ConcurrencyPermit,
 };
 
+const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
+
 pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
 pub const PAUSE_REQUEST: &str = "pause_request";
 pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
@@ -198,10 +223,36 @@ struct RequestSchedulingProperties {
     unblocks_ancestor: bool,
     can_block_on_descendant: bool,
     is_isolate_action: bool,
+    is_control_plane: bool,
+}
+
+impl RequestSchedulingProperties {
+    fn queue_lane(self) -> IsolateQueueLane {
+        assert!(
+            !self.is_control_plane || !self.unblocks_ancestor,
+            "control-plane isolate requests must not unblock an ancestor"
+        );
+        if self.is_control_plane {
+            IsolateQueueLane::ControlPlane
+        } else if self.unblocks_ancestor {
+            IsolateQueueLane::Dependency
+        } else if self.is_isolate_action {
+            IsolateQueueLane::IndependentAction
+        } else {
+            IsolateQueueLane::Ordinary
+        }
+    }
 }
 
 impl IntoLabel for RequestSchedulingProperties {
     fn as_label(&self) -> &'static str {
+        if self.is_control_plane {
+            assert!(
+                !self.unblocks_ancestor && !self.can_block_on_descendant && !self.is_isolate_action,
+                "control-plane isolate scheduling properties are inconsistent"
+            );
+            return "control_plane";
+        }
         match (self.unblocks_ancestor, self.can_block_on_descendant) {
             (false, false) => "independent",
             (false, true) => "descendant_holder",
@@ -209,6 +260,270 @@ impl IntoLabel for RequestSchedulingProperties {
             (true, true) => "dependency_descendant_holder",
         }
     }
+}
+
+fn log_scheduler_caller_dropped(
+    pool_name: &'static str,
+    scheduling_properties: RequestSchedulingProperties,
+) {
+    if !scheduling_properties.is_control_plane {
+        return;
+    }
+    metrics::log_scheduler_request_rejected(
+        pool_name,
+        scheduling_properties.as_label(),
+        "caller_dropped",
+    );
+    metrics::log_isolate_queue_rejection(
+        pool_name,
+        scheduling_properties.queue_lane().as_label(),
+        "caller_dropped",
+    );
+}
+
+enum SchedulerQueueSender<RT: Runtime, T> {
+    Legacy(CoDelQueueSender<RT, T>),
+    LaneDelayControl(IsolateQueueSender<RT, T>),
+}
+
+impl<RT: Runtime, T> Clone for SchedulerQueueSender<RT, T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Legacy(sender) => Self::Legacy(sender.clone()),
+            Self::LaneDelayControl(sender) => Self::LaneDelayControl(sender.clone()),
+        }
+    }
+}
+
+impl<RT: Runtime, T> SchedulerQueueSender<RT, T> {
+    fn try_send(&self, item: T, lane: IsolateQueueLane) -> Result<bool, IsolateQueueSendError> {
+        match self {
+            Self::Legacy(sender) => {
+                let result = if lane == IsolateQueueLane::Dependency {
+                    sender.try_send_with_reserved_capacity_detailed(item)
+                } else {
+                    sender.try_send_detailed(item).map(|()| false)
+                };
+                result.map_err(|error| match error {
+                    CoDelQueueSendError::Full => IsolateQueueSendError::QueueFull,
+                    CoDelQueueSendError::Closed => IsolateQueueSendError::SchedulerClosed,
+                })
+            },
+            Self::LaneDelayControl(sender) => sender.try_send(item, lane),
+        }
+    }
+}
+
+pub(crate) enum SchedulerQueueReceiver<RT: Runtime, T> {
+    Legacy(CoDelQueueReceiver<RT, T>),
+    LaneDelayControl(IsolateQueueReceiver<RT, T>),
+}
+
+enum SchedulerQueueExpiredReceiver<RT: Runtime, T> {
+    Legacy(CoDelQueueExpiredReceiver<RT, T>),
+    LaneDelayControl(IsolateQueueExpiredReceiver<RT, T>),
+}
+
+impl<RT: Runtime, T> SchedulerQueueReceiver<RT, T> {
+    async fn recv_next_selecting(
+        &mut self,
+        mut select: impl FnMut(&T) -> IsolateQueueEligibility,
+    ) -> Option<IsolateQueueOutput<T>> {
+        match self {
+            Self::Legacy(receiver) => receiver
+                .recv_next_selecting(|item| select(item).is_eligible().then_some(()))
+                .await
+                .map(|(item, expiration)| match expiration {
+                    Ok(permit_deadline) => IsolateQueueOutput {
+                        item,
+                        rejection: None,
+                        permit_deadline: Some(permit_deadline),
+                        dispatch_sojourn: None,
+                    },
+                    Err(_) => IsolateQueueOutput {
+                        item,
+                        rejection: Some(IsolateQueueRejection::HardExpired),
+                        permit_deadline: None,
+                        dispatch_sojourn: None,
+                    },
+                }),
+            Self::LaneDelayControl(receiver) => receiver.recv_next_selecting(select).await,
+        }
+    }
+
+    fn metrics_reporter(&self) -> Option<IsolateQueueMetricsReporter<RT, T>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::LaneDelayControl(receiver) => Some(receiver.metrics_reporter()),
+        }
+    }
+
+    fn expired_receiver(&self) -> SchedulerQueueExpiredReceiver<RT, T> {
+        match self {
+            Self::Legacy(receiver) => {
+                SchedulerQueueExpiredReceiver::Legacy(receiver.expired_receiver())
+            },
+            Self::LaneDelayControl(receiver) => {
+                SchedulerQueueExpiredReceiver::LaneDelayControl(receiver.expired_receiver())
+            },
+        }
+    }
+}
+
+impl<RT: Runtime, T> SchedulerQueueExpiredReceiver<RT, T> {
+    async fn recv_next_expired(
+        &mut self,
+        select: impl FnMut(&T) -> IsolateQueueEligibility,
+    ) -> Option<IsolateQueueOutput<T>> {
+        match self {
+            Self::Legacy(receiver) => receiver.next().await.map(|(item, _)| IsolateQueueOutput {
+                item,
+                rejection: Some(IsolateQueueRejection::HardExpired),
+                permit_deadline: None,
+                dispatch_sojourn: None,
+            }),
+            Self::LaneDelayControl(receiver) => receiver.recv_next_expired(select).await,
+        }
+    }
+}
+
+fn new_scheduler_queue<RT: Runtime, T>(
+    rt: RT,
+    pool_name: &'static str,
+    capacity: usize,
+    reserved_capacity: usize,
+    delay_control_config: Option<IsolateQueueConfig>,
+) -> (SchedulerQueueSender<RT, T>, SchedulerQueueReceiver<RT, T>) {
+    let total_capacity = capacity
+        .checked_add(reserved_capacity)
+        .expect("validated isolate queue capacity must not overflow");
+    metrics::log_isolate_queue_capacity(pool_name, "shared_base", capacity);
+    metrics::log_isolate_queue_capacity(pool_name, "total", total_capacity);
+    if let Some(config) = delay_control_config {
+        metrics::log_isolate_queue_capacity(
+            pool_name,
+            "control_plane_lane",
+            config.control_plane_capacity,
+        );
+        let (sender, receiver) =
+            new_isolate_queue(rt, pool_name, capacity, reserved_capacity, config);
+        (
+            SchedulerQueueSender::LaneDelayControl(sender),
+            SchedulerQueueReceiver::LaneDelayControl(receiver),
+        )
+    } else {
+        let (sender, receiver) =
+            new_codel_queue_async_with_reserved_capacity(rt, capacity, reserved_capacity);
+        metrics::log_isolate_queue_policy(pool_name, "legacy_codel");
+        metrics::log_isolate_queue_config(
+            pool_name,
+            "idle_expiration_millis",
+            *CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
+        );
+        metrics::log_isolate_queue_config(
+            pool_name,
+            "congested_expiration_millis",
+            *CODEL_QUEUE_CONGESTED_EXPIRATION_MILLIS,
+        );
+        (
+            SchedulerQueueSender::Legacy(sender),
+            SchedulerQueueReceiver::Legacy(receiver),
+        )
+    }
+}
+
+enum ExternalPermitWaitOutcome {
+    Acquired(ConcurrencyPermit),
+    CallerDropped,
+    DeadlineElapsed,
+}
+
+fn reject_queued_request<RT: Runtime>(
+    request: Request<RT>,
+    rejection: IsolateQueueRejection,
+    pool_name: &'static str,
+    control_plane_lane_enabled: bool,
+) {
+    let scheduling_properties = request.scheduling_properties(control_plane_lane_enabled);
+    match rejection {
+        IsolateQueueRejection::HardExpired => {
+            metrics::log_scheduler_request_expired(pool_name, scheduling_properties.as_label());
+        },
+        IsolateQueueRejection::DelayControlShed => {
+            metrics::log_scheduler_request_rejected(
+                pool_name,
+                scheduling_properties.as_label(),
+                "delay_control_shed",
+            );
+        },
+    }
+    request.expire(ExpiredInQueue);
+}
+
+async fn wait_for_external_permit<RT: Runtime>(
+    rt: &RT,
+    limiter: &ConcurrencyLimiter,
+    client_id: Arc<String>,
+    permit_deadline: tokio::time::Instant,
+    response_closed: impl std::future::Future<Output = ()>,
+) -> ExternalPermitWaitOutcome {
+    let permit = tokio::select! {
+        biased;
+        () = response_closed => return ExternalPermitWaitOutcome::CallerDropped,
+        () = rt.wait(
+            permit_deadline.saturating_duration_since(rt.monotonic_now()),
+        ) => return ExternalPermitWaitOutcome::DeadlineElapsed,
+        permit = limiter.acquire(
+            client_id,
+            // Initial external requests stay in the low-priority
+            // active-JavaScript tier.
+            false,
+        ) => permit,
+    };
+    // The timer precedes the permit so an ordinary readiness tie times out
+    // without registering capacity. Recheck absolute time after acquisition
+    // in case the clock advanced between branch polls or wake delivery lagged.
+    if rt.monotonic_now() >= permit_deadline {
+        ExternalPermitWaitOutcome::DeadlineElapsed
+    } else {
+        ExternalPermitWaitOutcome::Acquired(permit)
+    }
+}
+
+fn validate_control_plane_lane_config(
+    enabled: bool,
+    control_plane_capacity: usize,
+    control_plane_hard_max_age: Duration,
+    queue_capacity: usize,
+    ordinary_hard_max_age: Duration,
+    delay_control_enabled: bool,
+    analyze_concurrency: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        analyze_concurrency > 0,
+        "ANALYZE_CONCURRENCY must be greater than zero"
+    );
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        delay_control_enabled,
+        "ISOLATE_CONTROL_PLANE_LANE_ENABLED requires ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=true"
+    );
+    anyhow::ensure!(
+        control_plane_capacity >= analyze_concurrency,
+        "ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY must be at least ANALYZE_CONCURRENCY"
+    );
+    anyhow::ensure!(
+        control_plane_capacity <= queue_capacity,
+        "ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY must not exceed ISOLATE_QUEUE_SIZE"
+    );
+    anyhow::ensure!(
+        control_plane_hard_max_age > ordinary_hard_max_age,
+        "ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS must be greater than \
+         ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -249,6 +564,19 @@ struct ActiveRequestGuard {
     scheduling_properties: RequestSchedulingProperties,
 }
 
+fn per_client_worker_capacity(max_workers: usize, max_percent_per_client: usize) -> usize {
+    // Split the percentage calculation so a representable worker total cannot
+    // overflow before the result is clamped back to that same total.
+    let percentage_capacity = if max_percent_per_client >= 100 {
+        max_workers
+    } else {
+        let complete_hundreds = (max_workers / 100) * max_percent_per_client;
+        let remainder = (max_workers % 100) * max_percent_per_client;
+        complete_hundreds + remainder.div_ceil(100)
+    };
+    percentage_capacity.max(1).min(max_workers)
+}
+
 impl ActiveRequestGuard {
     fn new(
         active_workers: Arc<AtomicUsize>,
@@ -256,7 +584,11 @@ impl ActiveRequestGuard {
         scheduling_properties: RequestSchedulingProperties,
     ) -> Self {
         active_workers.fetch_add(1, Ordering::Relaxed);
-        metrics::log_scheduler_active_request_started(pool_name, scheduling_properties.as_label());
+        metrics::log_scheduler_active_request_started(
+            pool_name,
+            scheduling_properties.as_label(),
+            scheduling_properties.is_isolate_action,
+        );
         Self {
             active_workers,
             pool_name,
@@ -275,6 +607,7 @@ impl Drop for ActiveRequestGuard {
         metrics::log_scheduler_active_request_finished(
             self.pool_name,
             self.scheduling_properties.as_label(),
+            self.scheduling_properties.is_isolate_action,
         );
     }
 }
@@ -291,29 +624,49 @@ struct SchedulerStateSnapshot {
 
 impl SchedulerStateSnapshot {
     fn can_start_request(&self, properties: RequestSchedulingProperties, client_id: &str) -> bool {
+        self.request_eligibility(properties, client_id)
+            .is_eligible()
+    }
+
+    fn request_eligibility(
+        &self,
+        properties: RequestSchedulingProperties,
+        client_id: &str,
+    ) -> IsolateQueueEligibility {
         let client_active_counts = self
             .in_progress_counts_by_client
             .get(client_id)
             .copied()
             .unwrap_or_default();
-        if self.active_counts.total >= self.max_workers
-            || client_active_counts.total >= self.max_workers_per_client
-        {
-            return false;
+        IsolateQueueEligibility {
+            physical_total: self.active_counts.total >= self.max_workers,
+            shared_base: !properties.unblocks_ancestor
+                && self.active_counts.total >= self.base_worker_capacity,
+            per_client_total: client_active_counts.total >= self.max_workers_per_client,
+            per_client_base: !properties.unblocks_ancestor
+                && client_active_counts.total >= self.base_workers_per_client,
+            independent_action_cap: properties.is_isolate_action
+                && !properties.unblocks_ancestor
+                && self.active_counts.independent_actions >= self.max_independent_actions,
         }
-        if !properties.unblocks_ancestor
-            && (self.active_counts.total >= self.base_worker_capacity
-                || client_active_counts.total >= self.base_workers_per_client)
-        {
-            return false;
-        }
-        !properties.is_isolate_action
-            || properties.unblocks_ancestor
-            || self.active_counts.independent_actions < self.max_independent_actions
     }
 
     fn dependency_dispatch_uses_reserve(&self) -> bool {
         self.active_counts.total >= self.base_worker_capacity
+    }
+}
+
+fn worker_rejection_reason(
+    eligibility: IsolateQueueEligibility,
+) -> Option<RejectedBeforeExecutionReason> {
+    if eligibility.is_eligible() {
+        None
+    } else if eligibility.per_client_total || eligibility.per_client_base {
+        // Preserve the scheduler's historical per-client-first classification
+        // if both a client fence and a global fence became full concurrently.
+        Some(RejectedBeforeExecutionReason::PerClientWorkerOverloaded)
+    } else {
+        Some(RejectedBeforeExecutionReason::WorkerPoolOverloaded)
     }
 }
 
@@ -404,12 +757,17 @@ impl<RT: Runtime> Request<RT> {
         parent_trace: EncodedSpan,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> Self {
-        Self {
+        let request = Self {
             client_id,
             inner,
             parent_trace,
             scheduler_dependency,
-        }
+        };
+        assert!(
+            !request.inner.is_control_plane() || !request.scheduler_dependency.unblocks_ancestor(),
+            "control-plane isolate requests must not unblock an ancestor"
+        );
+        request
     }
 
     pub fn module(&self) -> Option<CanonicalizedComponentModulePath> {
@@ -431,7 +789,10 @@ impl<RT: Runtime> Request<RT> {
         })
     }
 
-    fn scheduling_properties(&self) -> RequestSchedulingProperties {
+    fn scheduling_properties(
+        &self,
+        control_plane_lane_enabled: bool,
+    ) -> RequestSchedulingProperties {
         let (can_block_on_descendant, is_isolate_action) = match &self.inner {
             RequestType::Udf { udf_callback, .. } => (udf_callback.is_some(), false),
             RequestType::Action { .. } | RequestType::HttpAction { .. } => (true, true),
@@ -451,6 +812,7 @@ impl<RT: Runtime> Request<RT> {
             unblocks_ancestor: self.scheduler_dependency.unblocks_ancestor(),
             can_block_on_descendant,
             is_isolate_action,
+            is_control_plane: control_plane_lane_enabled && self.inner.is_control_plane(),
         }
     }
 }
@@ -525,11 +887,29 @@ pub enum RequestType<RT: Runtime> {
         id: usize,
         can_block_on_descendant: bool,
         is_isolate_action: bool,
+        is_control_plane: bool,
         fail_worker: bool,
         started: mpsc::UnboundedSender<usize>,
         completion: oneshot::Receiver<()>,
         response: oneshot::Sender<anyhow::Result<()>>,
     },
+}
+
+impl<RT: Runtime> RequestType<RT> {
+    fn is_control_plane(&self) -> bool {
+        match self {
+            Self::Analyze { .. }
+            | Self::EvaluateSchema { .. }
+            | Self::EvaluateAuthConfig { .. }
+            | Self::EvaluateAppDefinitions { .. }
+            | Self::EvaluateComponentInitializer { .. } => true,
+            Self::Udf { .. } | Self::Action { .. } | Self::HttpAction { .. } => false,
+            #[cfg(test)]
+            Self::Test {
+                is_control_plane, ..
+            } => *is_control_plane,
+        }
+    }
 }
 
 #[allow(async_fn_in_trait)]
@@ -631,6 +1011,21 @@ impl<RT: Runtime> Request<RT> {
             RequestType::Test { response, .. } => response.is_closed(),
         }
     }
+
+    async fn response_closed(&mut self) {
+        match &mut self.inner {
+            RequestType::Udf { response, .. } => response.closed().await,
+            RequestType::Action { response, .. } => response.closed().await,
+            RequestType::HttpAction { response, .. } => response.closed().await,
+            RequestType::Analyze { response, .. } => response.closed().await,
+            RequestType::EvaluateSchema { response, .. } => response.closed().await,
+            RequestType::EvaluateAuthConfig { response, .. } => response.closed().await,
+            RequestType::EvaluateAppDefinitions { response, .. } => response.closed().await,
+            RequestType::EvaluateComponentInitializer { response, .. } => response.closed().await,
+            #[cfg(test)]
+            RequestType::Test { response, .. } => response.closed().await,
+        }
+    }
 }
 
 impl<RT: Runtime> Clone for IsolateClient<RT> {
@@ -644,6 +1039,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
             pool_name: self.pool_name,
             active_workers: self.active_workers.clone(),
             max_workers: self.max_workers,
+            control_plane_lane_enabled: self.control_plane_lane_enabled,
         }
     }
 }
@@ -725,13 +1121,14 @@ pub struct IsolateClient<RT: Runtime> {
     rt: RT,
     handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
     scheduler: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
-    sender: CoDelQueueSender<RT, Request<RT>>,
+    sender: SchedulerQueueSender<RT, Request<RT>>,
     internal_sender: mpsc::UnboundedSender<Request<RT>>,
     pool_name: &'static str,
     /// Shared with the scheduler. Tracks the total number of in-progress
     /// workers across all clients.
     active_workers: Arc<AtomicUsize>,
     max_workers: usize,
+    control_plane_lane_enabled: bool,
 }
 
 impl<RT: Runtime> IsolateClient<RT> {
@@ -753,6 +1150,12 @@ impl<RT: Runtime> IsolateClient<RT> {
             *ISOLATE_DEPENDENCY_WORKER_RESERVE < max_isolate_workers,
             "ISOLATE_DEPENDENCY_WORKER_RESERVE must be smaller than MAX_ISOLATE_WORKERS"
         );
+        anyhow::ensure!(
+            (*ISOLATE_QUEUE_SIZE)
+                .checked_add(*ISOLATE_DEPENDENCY_WORKER_RESERVE)
+                .is_some(),
+            "ISOLATE_QUEUE_SIZE plus ISOLATE_DEPENDENCY_WORKER_RESERVE must not overflow"
+        );
         let base_worker_capacity = max_isolate_workers - *ISOLATE_DEPENDENCY_WORKER_RESERVE;
         let max_independent_actions = if *MAX_ISOLATE_ACTION_WORKERS == 0 {
             base_worker_capacity
@@ -763,17 +1166,39 @@ impl<RT: Runtime> IsolateClient<RT> {
             max_independent_actions <= base_worker_capacity,
             "MAX_ISOLATE_ACTION_WORKERS must not exceed shared base isolate worker capacity"
         );
+        let queue_config = IsolateQueueConfig::new(
+            *ISOLATE_QUEUE_DELAY_TARGET_MILLIS,
+            *ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS,
+            *ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS,
+            *ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS,
+            *ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS,
+            *ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY,
+        )?;
+        let control_plane_lane_enabled = *ISOLATE_CONTROL_PLANE_LANE_ENABLED;
+        validate_control_plane_lane_config(
+            control_plane_lane_enabled,
+            *ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY,
+            *ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS,
+            *ISOLATE_QUEUE_SIZE,
+            *ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS,
+            *ISOLATE_QUEUE_DELAY_CONTROL_ENABLED,
+            *ANALYZE_CONCURRENCY,
+        )?;
+        let delay_control_config = (*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED).then_some(queue_config);
         let pool_name = isolate_worker.config().name;
         metrics::initialize_capacity_counters(pool_name);
+        metrics::log_control_plane_lane_enabled(pool_name, control_plane_lane_enabled);
 
         initialize_v8();
         // NB: We don't call V8::Dispose or V8::ShutdownPlatform since we just assume a
         // single V8 instance per process and don't need to clean up its
         // resources.
-        let (sender, receiver) = new_codel_queue_async_with_reserved_capacity::<_, Request<_>>(
+        let (sender, receiver) = new_scheduler_queue::<_, Request<_>>(
             rt.clone(),
+            pool_name,
             *ISOLATE_QUEUE_SIZE,
             *ISOLATE_DEPENDENCY_WORKER_RESERVE,
+            delay_control_config,
         );
         let (internal_sender, internal_receiver) = mpsc::unbounded_channel();
         let handles = Arc::new(Mutex::new(Vec::new()));
@@ -782,9 +1207,8 @@ impl<RT: Runtime> IsolateClient<RT> {
         let _active_workers = active_workers.clone();
         let rt_clone = rt.clone();
         let scheduler = rt.spawn("shared_isolate_scheduler", async move {
-            // The scheduler thread pops a worker from available_workers and
-            // pops a request from the CoDelQueueReceiver. Then it sends the request
-            // to the worker.
+            // The scheduler thread selects a queued request and an available
+            // worker, then sends the request to that worker.
             let scheduler = SharedIsolateScheduler::new(
                 rt_clone,
                 isolate_worker,
@@ -794,6 +1218,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                 handles_clone,
                 max_percent_per_client,
                 _active_workers,
+                control_plane_lane_enabled,
             );
             scheduler.run(receiver, internal_receiver).await
         });
@@ -806,6 +1231,7 @@ impl<RT: Runtime> IsolateClient<RT> {
             handles,
             active_workers,
             max_workers: max_isolate_workers,
+            control_plane_lane_enabled,
         })
     }
 
@@ -1283,30 +1709,27 @@ impl<RT: Runtime> IsolateClient<RT> {
     }
 
     fn send_request(&self, request: Request<RT>) -> anyhow::Result<()> {
-        let scheduling_properties = request.scheduling_properties();
-        let send_result = if scheduling_properties.unblocks_ancestor {
-            self.sender.try_send_with_reserved_capacity(request)
-        } else {
-            self.sender.try_send(request).map(|()| false)
-        };
-        let used_reserved_capacity = send_result.map_err(|_| {
-            if self.sender.is_closed() {
-                metrics::log_scheduler_request_rejected(
-                    self.pool_name,
-                    scheduling_properties.as_label(),
-                    "scheduler_closed",
-                );
-                return shutdown_error();
-            }
+        let scheduling_properties = request.scheduling_properties(self.control_plane_lane_enabled);
+        let send_result = self
+            .sender
+            .try_send(request, scheduling_properties.queue_lane());
+        let used_reserved_capacity = send_result.map_err(|error| {
             metrics::log_scheduler_request_rejected(
                 self.pool_name,
                 scheduling_properties.as_label(),
-                "queue_full",
+                error.as_label(),
             );
+            if error == IsolateQueueSendError::SchedulerClosed {
+                return shutdown_error();
+            }
             metrics::execute_full_error().into()
         })?;
         metrics::log_scheduler_request_enqueued(self.pool_name, scheduling_properties.as_label());
         if used_reserved_capacity {
+            assert!(
+                scheduling_properties.unblocks_ancestor,
+                "only dependency requests may enqueue in isolate queue reserve"
+            );
             metrics::log_scheduler_dependency_queue_reserve_enqueue(self.pool_name);
         }
         Ok(())
@@ -1346,7 +1769,7 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
             // whose caller retains an isolate worker.
             SchedulerDependencyClass::UnblocksAncestor,
         );
-        let scheduling_properties = request.scheduling_properties();
+        let scheduling_properties = request.scheduling_properties(self.control_plane_lane_enabled);
         self.internal_sender
             .send(request)
             .ok()
@@ -1416,6 +1839,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
     handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
     max_workers_per_client: usize,
     base_workers_per_client: usize,
+    control_plane_lane_enabled: bool,
 }
 
 pub struct IdleWorkerInfo {
@@ -1450,16 +1874,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
         handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
         max_percent_per_client: usize,
         active_workers: Arc<AtomicUsize>,
+        control_plane_lane_enabled: bool,
     ) -> Self {
         let dependency_reserve = max_workers - base_worker_capacity;
-        let max_workers_per_client = max_workers
-            .checked_mul(max_percent_per_client)
-            .expect("per-client isolate worker capacity overflow")
-            .div_ceil(100)
-            .max(1)
-            .min(max_workers);
-        // Preserve the percentage-derived per-client total and carve its
-        // dependency overflow from that finite total, as at the global gate.
+        let max_workers_per_client =
+            per_client_worker_capacity(max_workers, max_percent_per_client);
+        // Preserve the existing percentage-derived per-client total. Carve the
+        // dependency overflow out of that total just as the global policy carves
+        // R out of T, while retaining one shared base slot for small clients.
         let effective_dependency_reserve =
             dependency_reserve.min(max_workers_per_client.saturating_sub(1));
         let base_workers_per_client = max_workers_per_client - effective_dependency_reserve;
@@ -1478,6 +1900,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             handles,
             max_workers_per_client,
             base_workers_per_client,
+            control_plane_lane_enabled,
         }
     }
 
@@ -1534,10 +1957,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
         }
     }
 
-    pub async fn run(
+    pub(crate) async fn run(
         mut self,
-        mut receiver: CoDelQueueReceiver<RT, Request<RT>>,
-        internal_receiver: mpsc::UnboundedReceiver<Request<RT>>,
+        receiver: SchedulerQueueReceiver<RT, Request<RT>>,
+        mut internal_receiver: mpsc::UnboundedReceiver<Request<RT>>,
     ) {
         log_pool_max(self.worker.config().name, self.max_workers);
         metrics::log_scheduler_capacity(self.worker.config().name, "physical", self.max_workers);
@@ -1552,77 +1975,152 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             self.max_independent_actions,
         );
         let mut report_stats = self.rt.wait(*HEAP_WORKER_REPORT_INTERVAL_SECONDS);
-        let mut expired_receiver = receiver.expired_receiver();
+        let queue_metrics_reporter = receiver.metrics_reporter();
+        // Queue receipt is serialized through the active-permit wait below.
+        // Keep a non-consuming expiry companion live so other retained entries
+        // still honor their own absolute deadlines during that wait.
+        let mut external_expired_receiver = receiver.expired_receiver();
         let limiter = self.worker.config().limiter.clone();
-        let rt = self.rt.clone();
         let scheduler_state = Arc::new(Mutex::new(self.state_snapshot()));
+        let control_plane_lane_enabled = self.control_plane_lane_enabled;
         let selection_state = scheduler_state.clone();
         let pool_name = self.worker.config().name;
+        let external_rt = self.rt.clone();
         let external_limiter = limiter.clone();
-        let external_request_stream = stream::poll_fn(move |cx| {
-            let state = selection_state.lock();
-            receiver.poll_next_selecting_with_expiration(cx, &mut |request| {
-                state
-                    .can_start_request(request.scheduling_properties(), &request.client_id)
-                    .then_some(())
-            })
-        })
-        .filter_map(move |(request, expiration)| {
-            let limiter = external_limiter.clone();
-            let rt = rt.clone();
+        let external_request_stream = stream::unfold(receiver, move |mut receiver| {
+            let selection_state = selection_state.clone();
             async move {
-                match expiration {
-                    Ok(expiration) => {
-                        let permit = tokio::select! {
-                            biased;
-                            permit = limiter.acquire(
-                                request.client_id.clone().into(),
-                                // For newly executing functions, we acquire the
-                                // permit in "low priority" mode. This means
-                                // that we prioritize already-executing
-                                // functions over new ones and avoid piling more
-                                // work on if we're overloaded.
-                                false,
-                            ) => permit,
-                            () = rt.wait(
-                                expiration.saturating_duration_since(rt.monotonic_now()),
-                            ) => {
-                                request.reject(
-                                    RejectedBeforeExecutionReason::InitialPermitTimeout,
-                                );
-                                return None;
-                            }
-                        };
-                        Some((request, permit))
+                let output = receiver
+                    .recv_next_selecting(|request| {
+                        selection_state.lock().request_eligibility(
+                            request.scheduling_properties(control_plane_lane_enabled),
+                            &request.client_id,
+                        )
+                    })
+                    .await?;
+                Some((output, receiver))
+            }
+        })
+        .filter_map(move |output| {
+            let limiter = external_limiter.clone();
+            let rt = external_rt.clone();
+            async move {
+                let IsolateQueueOutput {
+                    item: mut request,
+                    rejection,
+                    permit_deadline,
+                    dispatch_sojourn,
+                } = output;
+                let scheduling_properties =
+                    request.scheduling_properties(control_plane_lane_enabled);
+                if let Some(rejection) = rejection {
+                    reject_queued_request(
+                        request,
+                        rejection,
+                        pool_name,
+                        control_plane_lane_enabled,
+                    );
+                    return None;
+                }
+                if request.is_response_closed() {
+                    log_scheduler_caller_dropped(pool_name, scheduling_properties);
+                    return None;
+                }
+                let permit_deadline = permit_deadline
+                    .expect("non-rejected external request must retain its queue deadline");
+                let client_id = Arc::new(request.client_id.clone());
+                let permit = match wait_for_external_permit(
+                    &rt,
+                    &limiter,
+                    client_id,
+                    permit_deadline,
+                    request.response_closed(),
+                )
+                .await
+                {
+                    ExternalPermitWaitOutcome::Acquired(permit) => permit,
+                    ExternalPermitWaitOutcome::CallerDropped => {
+                        log_scheduler_caller_dropped(pool_name, scheduling_properties);
+                        return None;
                     },
-                    Err(expired) => {
+                    ExternalPermitWaitOutcome::DeadlineElapsed => {
                         metrics::log_scheduler_request_expired(
                             pool_name,
-                            request.scheduling_properties().as_label(),
+                            scheduling_properties.as_label(),
                         );
-                        request.expire(expired);
-                        None
+                        request.reject(RejectedBeforeExecutionReason::InitialPermitTimeout);
+                        return None;
                     },
-                }
+                };
+                Some((request, permit, dispatch_sojourn))
             }
         });
-        let internal_request_stream =
-            UnboundedReceiverStream::new(internal_receiver).then(async |request| {
+        let internal_selection_state = scheduler_state.clone();
+        let mut pending_internal: VecDeque<Request<RT>> = VecDeque::new();
+        let internal_request_stream = stream::poll_fn(move |cx| {
+            loop {
+                // Internal admission is intentionally unbounded, but one client at
+                // its per-client total must not hide an eligible callback for
+                // another client. Discard abandoned callbacks and otherwise keep
+                // FIFO order among requests eligible in the current snapshot.
+                pending_internal.retain(|request| !request.is_response_closed());
+                let selected = {
+                    let state = internal_selection_state.lock();
+                    pending_internal.iter().position(|request| {
+                        state.can_start_request(
+                            request.scheduling_properties(control_plane_lane_enabled),
+                            &request.client_id,
+                        )
+                    })
+                };
+                if let Some(index) = selected {
+                    return Poll::Ready(Some(
+                        pending_internal
+                            .remove(index)
+                            .expect("selected internal request must still be buffered"),
+                    ));
+                }
+                match internal_receiver.poll_recv(cx) {
+                    Poll::Ready(Some(request)) => pending_internal.push_back(request),
+                    Poll::Ready(None) if pending_internal.is_empty() => {
+                        return Poll::Ready(None);
+                    },
+                    Poll::Ready(None) => return Poll::Pending,
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        })
+        .filter_map(move |mut request| {
+            let limiter = limiter.clone();
+            async move {
                 // Internal requests (for nested UDFs) get priority because they
-                // block workers.
-                let permit = limiter
-                    .acquire(request.client_id.clone().into(), true)
-                    .await;
-                (request, permit)
-            });
+                // block workers. Upstream gives this permit wait no queue
+                // deadline because the nested UDF cannot be retried safely.
+                let client_id = request.client_id.clone();
+                let permit = tokio::select! {
+                    biased;
+                    () = request.response_closed() => return None,
+                    permit = limiter.acquire(client_id.into(), true) => permit,
+                };
+                Some((request, permit, None))
+            }
+        });
         let mut next_request_stream = pin!(stream::select_with_strategy(
             internal_request_stream,
             external_request_stream,
             |&mut ()| PollNext::Left
         ));
+        let expiration_selection_state = scheduler_state.clone();
+        let mut external_expiration_receiver_open = true;
+        let mut report_queue_metrics = if queue_metrics_reporter.is_some() {
+            Either::Left(self.rt.wait(ISOLATE_QUEUE_METRICS_LOG_FREQUENCY))
+        } else {
+            // Do not even construct the periodic runtime timer on the legacy
+            // path; the opt-in policy must not add default scheduler wakeups.
+            Either::Right(future::pending())
+        };
         loop {
             *scheduler_state.lock() = self.state_snapshot();
-            let all_workers_busy = self.in_progress_counts.total >= self.max_workers;
             tokio::select! {
                 biased;
                 completed_worker = self.in_progress_workers.next(),
@@ -1636,26 +2134,32 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                         return;
                     };
                     self.handle_completed_worker(completed_worker, info);
-                }
-                request = expired_receiver.next() => {
-                    let Some((request, expired)) = request else {
-                        break;
+                },
+                _ = &mut report_queue_metrics, if queue_metrics_reporter.is_some() => {
+                    queue_metrics_reporter
+                        .as_ref()
+                        .expect("lane queue metrics reporter must exist when enabled")
+                        .report();
+                    report_queue_metrics =
+                        Either::Left(self.rt.wait(ISOLATE_QUEUE_METRICS_LOG_FREQUENCY));
+                },
+                request = next_request_stream.next() => {
+                    let Some((request, permit, dispatch_sojourn)) = request else {
+                        tracing::warn!(
+                            "Request sender went away; {} scheduler shutting down",
+                            self.worker.config().name,
+                        );
+                        return;
                     };
-                    metrics::log_scheduler_request_expired(
-                        self.worker.config().name,
-                        request.scheduling_properties().as_label(),
-                    );
-                    request.expire(expired);
-                }
-                request = next_request_stream.next(),
-                if !all_workers_busy => {
-                    let Some((request, permit)) = request else {
-                        break;
-                    };
+                    let scheduling_properties =
+                        request.scheduling_properties(self.control_plane_lane_enabled);
                     if request.is_response_closed() {
+                        log_scheduler_caller_dropped(
+                            self.worker.config().name,
+                            scheduling_properties,
+                        );
                         continue;
                     }
-                    let scheduling_properties = request.scheduling_properties();
                     let dispatch_state = self.state_snapshot();
                     let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
                         && dispatch_state.dependency_dispatch_uses_reserve();
@@ -1700,6 +2204,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                         );
                         return;
                     }
+                    if let Some((lane, sojourn)) = dispatch_sojourn {
+                        metrics::log_isolate_queue_sojourn(
+                            self.worker.config().name,
+                            lane.as_label(),
+                            sojourn,
+                        );
+                    }
                     // Record scheduler-owned state only after the worker
                     // accepted the request. The worker message owns externally
                     // visible active accounting and clears it on every drop path.
@@ -1727,6 +2238,37 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                         );
                     }
                 },
+                // Preserve the established internal-ingress priority instead
+                // of draining a bounded batch of expired external entries
+                // ahead of a ready nested callback. The consuming external
+                // receiver itself still checks hard expiry before selection.
+                expired = external_expired_receiver.recv_next_expired(|request| {
+                    expiration_selection_state.lock().request_eligibility(
+                        request.scheduling_properties(control_plane_lane_enabled),
+                        &request.client_id,
+                    )
+                }), if external_expiration_receiver_open => {
+                    match expired {
+                        Some(IsolateQueueOutput {
+                            item: request,
+                            rejection: Some(rejection @ IsolateQueueRejection::HardExpired),
+                            permit_deadline: None,
+                            dispatch_sojourn: None,
+                        }) => reject_queued_request(
+                            request,
+                            rejection,
+                            self.worker.config().name,
+                            self.control_plane_lane_enabled,
+                        ),
+                        Some(_) => unreachable!(
+                            "isolate expiry companion returned a non-expiration output"
+                        ),
+                        // A selected request may still be waiting for its permit
+                        // after the queue itself closes, so companion closure is
+                        // not a scheduler-shutdown signal.
+                        None => external_expiration_receiver_open = false,
+                    }
+                },
                 _ = &mut report_stats => {
                     let heap_stats = self.aggregate_heap_stats();
                     log_aggregated_heap_stats(&heap_stats);
@@ -1734,10 +2276,6 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                 },
             }
         }
-        tracing::warn!(
-            "Request sender went away; {} scheduler shutting down",
-            self.worker.config().name
-        );
     }
 
     /// Find a worker for the given `client_id`.`
@@ -1753,12 +2291,16 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
         state: &SchedulerStateSnapshot,
     ) -> Result<usize, RejectedBeforeExecutionReason> {
         let client_id = request.client_id.as_str();
-        if !state.can_start_request(request.scheduling_properties(), client_id) {
+        let eligibility = state.request_eligibility(
+            request.scheduling_properties(self.control_plane_lane_enabled),
+            client_id,
+        );
+        if let Some(reason) = worker_rejection_reason(eligibility) {
             tracing::warn!(
                 "Selected request no longer satisfies {} scheduler capacity constraints",
                 self.worker.config().name,
             );
-            return Err(RejectedBeforeExecutionReason::PerClientWorkerOverloaded);
+            return Err(reason);
         }
         // Try to find an existing worker for this client.
         if let Some((client_id, mut workers)) = self.available_workers.remove_entry(client_id) {
@@ -2043,7 +2585,10 @@ pub fn should_recreate_isolate<RT: Runtime>(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{
+            BTreeMap,
+            HashMap,
+        },
         future::Future,
         pin::Pin,
         sync::{
@@ -2061,10 +2606,9 @@ mod tests {
 
     use ::metrics::IntoLabel as _;
     use common::{
-        codel_queue::{
-            new_codel_queue_async_with_reserved_capacity,
-            CoDelQueueReceiver,
-            CoDelQueueSender,
+        components::{
+            ComponentDefinitionPath,
+            ComponentName,
         },
         fastrace_helpers::EncodedSpan,
         knobs::CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
@@ -2073,20 +2617,35 @@ mod tests {
             shutdown_and_join,
             Runtime,
             SpawnHandle,
+            UnixTimestamp,
         },
-        types::SchedulerDependencyClass,
+        types::{
+            ModuleEnvironment,
+            SchedulerDependencyClass,
+        },
     };
     use errors::ErrorMetadataAnyhowExt as _;
     use futures::future::FusedFuture;
     use parking_lot::Mutex;
     use runtime::prod::ProdRuntime;
+    use semver::Version;
+    use sync_types::{
+        CanonicalizedModulePath,
+        ModulePath,
+    };
     use tokio::sync::{
         mpsc,
         oneshot,
     };
 
     use super::{
+        new_scheduler_queue,
+        per_client_worker_capacity,
+        validate_control_plane_lane_config,
+        wait_for_external_permit,
+        worker_rejection_reason,
         ActiveRequestCounts,
+        ExternalPermitWaitOutcome,
         IdleWorkerInfo,
         IsolateConfig,
         IsolateWorker,
@@ -2095,6 +2654,8 @@ mod tests {
         Request,
         RequestSchedulingProperties,
         RequestType,
+        SchedulerQueueReceiver,
+        SchedulerQueueSender,
         SchedulerStateSnapshot,
         SharedIsolateHeapStats,
         SharedIsolateScheduler,
@@ -2102,6 +2663,12 @@ mod tests {
     use crate::{
         context_cache::ContextCache,
         isolate::Isolate,
+        isolate_queue::{
+            IsolateQueueConfig,
+            IsolateQueueEligibility,
+            IsolateQueueLane,
+        },
+        metrics::RejectedBeforeExecutionReason,
         ConcurrencyLimiter,
         ConcurrencyPermit,
     };
@@ -2195,6 +2762,7 @@ mod tests {
                         id,
                         can_block_on_descendant: _,
                         is_isolate_action: _,
+                        is_control_plane: _,
                         fail_worker,
                         started,
                         completion,
@@ -2246,6 +2814,7 @@ mod tests {
         DependencyHolder,
         Independent,
         Action,
+        ControlPlane,
         WorkerFailure,
     }
 
@@ -2285,6 +2854,7 @@ mod tests {
                 .expect("expired request response dropped")
                 .expect_err("expired scheduler request unexpectedly succeeded");
             assert!(error.is_rejected_before_execution());
+            assert_eq!(error.short_msg(), "ExpiredInQueue");
         }
     }
 
@@ -2302,6 +2872,7 @@ mod tests {
                 TestRequestKind::DependencyHolder | TestRequestKind::Action
             ),
             is_isolate_action: matches!(kind, TestRequestKind::Action),
+            is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
             fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
             started,
             completion: completion_receiver,
@@ -2318,6 +2889,7 @@ mod tests {
             },
             TestRequestKind::Independent
             | TestRequestKind::Action
+            | TestRequestKind::ControlPlane
             | TestRequestKind::WorkerFailure => {
                 Request::new("deployment".to_string(), inner, EncodedSpan::empty())
             },
@@ -2329,20 +2901,86 @@ mod tests {
         }
     }
 
+    fn control_plane_request_types() -> Vec<RequestType<SchedulerTestRuntime>> {
+        let udf_config = model::udf_config::types::UdfConfig {
+            server_version: Version::new(1, 0, 0),
+            import_phase_rng_seed: [0; 32],
+            import_phase_unix_timestamp: UnixTimestamp::from_nanos(0),
+        };
+        let module_config = model::config::types::ModuleConfig {
+            path: "test.js".parse::<ModulePath>().unwrap(),
+            source: model::modules::module_versions::ModuleSource::new(""),
+            source_map: None,
+            environment: ModuleEnvironment::Isolate,
+        };
+        let module_path = "test.js".parse::<CanonicalizedModulePath>().unwrap();
+
+        let (analyze_response, analyze_receiver) = oneshot::channel();
+        drop(analyze_receiver);
+        let (schema_response, schema_receiver) = oneshot::channel();
+        drop(schema_receiver);
+        let (auth_response, auth_receiver) = oneshot::channel();
+        drop(auth_receiver);
+        let (app_definitions_response, app_definitions_receiver) = oneshot::channel();
+        drop(app_definitions_receiver);
+        let (component_initializer_response, component_initializer_receiver) = oneshot::channel();
+        drop(component_initializer_receiver);
+
+        vec![
+            RequestType::Analyze {
+                udf_config,
+                modules: Arc::new(BTreeMap::new()),
+                to_analyze: module_path,
+                environment_variables: BTreeMap::new(),
+                response: analyze_response,
+            },
+            RequestType::EvaluateSchema {
+                schema_bundle: model::modules::module_versions::ModuleSource::new(""),
+                source_map: None,
+                rng_seed: [0; 32],
+                unix_timestamp: UnixTimestamp::from_nanos(0),
+                response: schema_response,
+            },
+            RequestType::EvaluateAuthConfig {
+                auth_config_bundle: model::modules::module_versions::ModuleSource::new(""),
+                source_map: None,
+                environment_variables: BTreeMap::new(),
+                response: auth_response,
+            },
+            RequestType::EvaluateAppDefinitions {
+                app_definition: module_config.clone(),
+                component_definitions: BTreeMap::new(),
+                dependency_graph: Default::default(),
+                user_environment_variables: BTreeMap::new(),
+                system_env_vars: BTreeMap::new(),
+                response: app_definitions_response,
+            },
+            RequestType::EvaluateComponentInitializer {
+                evaluated_definitions: BTreeMap::new(),
+                path: ComponentDefinitionPath::root(),
+                definition: module_config,
+                args: BTreeMap::new(),
+                name: ComponentName::min(),
+                response: component_initializer_response,
+            },
+        ]
+    }
+
     struct SchedulerHarness {
-        sender: CoDelQueueSender<SchedulerTestRuntime, Request<SchedulerTestRuntime>>,
+        sender: SchedulerQueueSender<SchedulerTestRuntime, Request<SchedulerTestRuntime>>,
         started_sender: mpsc::UnboundedSender<usize>,
         started: mpsc::UnboundedReceiver<usize>,
         pending_scheduler: Option<(
             SchedulerTestRuntime,
             SharedIsolateScheduler<SchedulerTestRuntime, TestIsolateWorker>,
-            CoDelQueueReceiver<SchedulerTestRuntime, Request<SchedulerTestRuntime>>,
+            SchedulerQueueReceiver<SchedulerTestRuntime, Request<SchedulerTestRuntime>>,
             mpsc::UnboundedReceiver<Request<SchedulerTestRuntime>>,
         )>,
         internal_sender: mpsc::UnboundedSender<Request<SchedulerTestRuntime>>,
         scheduler: Option<Box<dyn SpawnHandle>>,
         worker_handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
         active_workers: Arc<AtomicUsize>,
+        control_plane_lane_enabled: bool,
     }
 
     impl SchedulerHarness {
@@ -2354,10 +2992,64 @@ mod tests {
             max_percent_per_client: usize,
             queue_capacity: usize,
         ) -> Self {
-            let (sender, receiver) = new_codel_queue_async_with_reserved_capacity::<_, Request<_>>(
+            Self::new_with_policy(
+                rt,
+                max_workers,
+                base_worker_capacity,
+                max_independent_actions,
+                max_percent_per_client,
+                queue_capacity,
+                None,
+                false,
+            )
+        }
+
+        fn new_control_plane(
+            rt: SchedulerTestRuntime,
+            max_workers: usize,
+            base_worker_capacity: usize,
+            max_independent_actions: usize,
+            max_percent_per_client: usize,
+            queue_capacity: usize,
+        ) -> Self {
+            let queue_config = IsolateQueueConfig::new(
+                Duration::from_millis(10),
+                Duration::from_millis(100),
+                Duration::from_millis(20),
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                queue_capacity,
+            )
+            .unwrap();
+            Self::new_with_policy(
+                rt,
+                max_workers,
+                base_worker_capacity,
+                max_independent_actions,
+                max_percent_per_client,
+                queue_capacity,
+                Some(queue_config),
+                true,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn new_with_policy(
+            rt: SchedulerTestRuntime,
+            max_workers: usize,
+            base_worker_capacity: usize,
+            max_independent_actions: usize,
+            max_percent_per_client: usize,
+            queue_capacity: usize,
+            queue_config: Option<IsolateQueueConfig>,
+            control_plane_lane_enabled: bool,
+        ) -> Self {
+            let (sender, receiver) = new_scheduler_queue::<_, Request<_>>(
                 rt.clone(),
+                "scheduler_test",
                 queue_capacity,
                 max_workers - base_worker_capacity,
+                queue_config,
             );
             let (started_sender, started) = mpsc::unbounded_channel();
             let (internal_sender, internal_receiver) = mpsc::unbounded_channel();
@@ -2375,6 +3067,7 @@ mod tests {
                 worker_handles.clone(),
                 max_percent_per_client,
                 active_workers.clone(),
+                control_plane_lane_enabled,
             );
             Self {
                 sender,
@@ -2385,6 +3078,7 @@ mod tests {
                 scheduler: None,
                 worker_handles,
                 active_workers,
+                control_plane_lane_enabled,
             }
         }
 
@@ -2397,13 +3091,29 @@ mod tests {
                 Some(rt.spawn("scheduler_test", scheduler.run(receiver, internal_receiver)));
         }
 
+        fn set_concurrency_limiter(&mut self, limiter: ConcurrencyLimiter) {
+            self.pending_scheduler
+                .as_mut()
+                .expect("test scheduler already started")
+                .1
+                .worker
+                .config
+                .limiter = limiter;
+        }
+
         fn enqueue(&self, request: Request<SchedulerTestRuntime>) {
-            if request.scheduling_properties().unblocks_ancestor {
-                self.sender
-                    .try_send_with_reserved_capacity(request)
-                    .expect("test queue including dependency reserve is full");
-            } else {
-                self.sender.try_send(request).expect("test queue is full");
+            let properties = request.scheduling_properties(self.control_plane_lane_enabled);
+            self.sender
+                .try_send(request, properties.queue_lane())
+                .expect("test queue including dependency reserve is full");
+        }
+
+        fn lane_queue_len(&self) -> usize {
+            match &self.sender {
+                SchedulerQueueSender::LaneDelayControl(sender) => sender.len(),
+                SchedulerQueueSender::Legacy(_) => {
+                    panic!("lane queue depth requested for legacy scheduler")
+                },
             }
         }
 
@@ -2412,11 +3122,20 @@ mod tests {
         }
 
         fn enqueue_internal_test(&self, id: usize) -> InFlightTestRequest {
+            self.enqueue_internal_test_for_client(id, "deployment")
+        }
+
+        fn enqueue_internal_test_for_client(
+            &self,
+            id: usize,
+            client_id: &str,
+        ) -> InFlightTestRequest {
             let PendingTestRequest {
-                request,
+                mut request,
                 completion,
                 response,
             } = test_request(id, TestRequestKind::Dependency, self.started_sender.clone());
+            request.client_id = client_id.to_string();
             self.internal_sender
                 .send(request)
                 .expect("test internal scheduler queue is closed");
@@ -2462,6 +3181,7 @@ mod tests {
                 scheduler,
                 worker_handles,
                 active_workers: _,
+                control_plane_lane_enabled: _,
             } = self;
             assert!(
                 pending_scheduler.is_none(),
@@ -2496,6 +3216,7 @@ mod tests {
             unblocks_ancestor,
             can_block_on_descendant,
             is_isolate_action,
+            is_control_plane: false,
         }
     }
 
@@ -2532,6 +3253,168 @@ mod tests {
     }
 
     #[test]
+    fn exact_backend_control_plane_variants_use_the_lane_only_when_enabled() {
+        let requests = control_plane_request_types();
+        assert_eq!(requests.len(), 5);
+        for inner in requests {
+            assert!(inner.is_control_plane());
+            let request = Request::new("deployment".to_string(), inner, EncodedSpan::empty());
+            assert!(request.is_response_closed());
+            let enabled = request.scheduling_properties(true);
+            assert_eq!(enabled.queue_lane(), IsolateQueueLane::ControlPlane);
+            assert_eq!(enabled.as_label(), "control_plane");
+            assert!(!enabled.can_block_on_descendant);
+            assert!(!enabled.is_isolate_action);
+
+            let disabled = request.scheduling_properties(false);
+            assert_eq!(disabled.queue_lane(), IsolateQueueLane::Ordinary);
+            assert_eq!(disabled.as_label(), "independent");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "control-plane isolate requests must not unblock an ancestor")]
+    fn control_plane_request_rejects_dependency_ancestry() {
+        let inner = control_plane_request_types()
+            .pop()
+            .expect("control-plane request fixture must not be empty");
+        let _ = Request::new_with_scheduler_dependency(
+            "deployment".to_string(),
+            inner,
+            EncodedSpan::empty(),
+            SchedulerDependencyClass::UnblocksAncestor,
+        );
+    }
+
+    #[test]
+    fn enabled_control_plane_configuration_requires_lane_policy_and_bounded_values() {
+        let valid = || {
+            validate_control_plane_lane_config(
+                true,
+                16,
+                Duration::from_secs(30),
+                2000,
+                Duration::from_secs(5),
+                true,
+                4,
+            )
+        };
+        assert!(valid().is_ok());
+        assert!(validate_control_plane_lane_config(
+            false,
+            1,
+            Duration::from_millis(1),
+            1,
+            Duration::from_secs(5),
+            false,
+            4,
+        )
+        .is_ok());
+        assert!(validate_control_plane_lane_config(
+            false,
+            1,
+            Duration::from_millis(1),
+            1,
+            Duration::from_secs(5),
+            false,
+            0,
+        )
+        .is_err());
+        assert!(validate_control_plane_lane_config(
+            true,
+            16,
+            Duration::from_secs(30),
+            2000,
+            Duration::from_secs(5),
+            false,
+            4,
+        )
+        .is_err());
+        assert!(validate_control_plane_lane_config(
+            true,
+            3,
+            Duration::from_secs(30),
+            2000,
+            Duration::from_secs(5),
+            true,
+            4,
+        )
+        .is_err());
+        assert!(validate_control_plane_lane_config(
+            true,
+            2001,
+            Duration::from_secs(30),
+            2000,
+            Duration::from_secs(5),
+            true,
+            4,
+        )
+        .is_err());
+        assert!(validate_control_plane_lane_config(
+            true,
+            16,
+            Duration::from_secs(5),
+            2000,
+            Duration::from_secs(5),
+            true,
+            4,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn external_permit_notification_at_deadline_is_rejected() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        rt.clone()
+            .block_on("external_permit_deadline_tie_test", async move {
+                let clock = SchedulerTestRuntime::new(rt);
+                let limiter = ConcurrencyLimiter::new(1);
+                let held = limiter.acquire(Arc::new("active".to_owned()), false).await;
+                let deadline = clock.monotonic_now() + Duration::from_secs(60);
+                let mut wait = Box::pin(wait_for_external_permit(
+                    &clock,
+                    &limiter,
+                    Arc::new("waiting".to_owned()),
+                    deadline,
+                    futures::future::pending(),
+                ));
+                assert!(futures::poll!(wait.as_mut()).is_pending());
+
+                clock.advance(Duration::from_secs(60));
+                drop(held);
+                assert!(matches!(
+                    futures::poll!(wait.as_mut()),
+                    std::task::Poll::Ready(ExternalPermitWaitOutcome::DeadlineElapsed)
+                ));
+                assert_eq!(limiter.active_permits(), 0);
+            });
+    }
+
+    #[test]
+    fn control_plane_uses_shared_base_and_not_action_or_dependency_reserve() {
+        let active = ActiveRequestCounts {
+            total: 5,
+            independent_actions: 3,
+        };
+        let state = snapshot(active, active);
+        let control_plane = RequestSchedulingProperties {
+            unblocks_ancestor: false,
+            can_block_on_descendant: false,
+            is_isolate_action: false,
+            is_control_plane: true,
+        };
+        assert_eq!(control_plane.queue_lane(), IsolateQueueLane::ControlPlane);
+        assert!(!state.can_start_request(control_plane, "deployment"));
+        assert!(state.can_start_request(properties(true, false, false), "deployment"));
+
+        let mut counts = ActiveRequestCounts::default();
+        counts.increment(control_plane);
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.independent_actions, 0);
+    }
+
+    #[test]
     fn total_base_occupancy_preserves_dependency_overflow() {
         // Four dependencies and one root occupy all five shared base slots.
         let active = ActiveRequestCounts {
@@ -2565,6 +3448,38 @@ mod tests {
         let state = snapshot(active, active);
         assert!(!state.can_start_request(properties(false, false, false), "deployment"));
         assert!(!state.can_start_request(properties(true, false, false), "deployment"));
+    }
+
+    #[test]
+    fn stale_worker_recheck_distinguishes_global_and_per_client_overload() {
+        assert!(matches!(
+            worker_rejection_reason(IsolateQueueEligibility {
+                physical_total: true,
+                ..Default::default()
+            }),
+            Some(RejectedBeforeExecutionReason::WorkerPoolOverloaded)
+        ));
+        assert!(matches!(
+            worker_rejection_reason(IsolateQueueEligibility {
+                physical_total: true,
+                per_client_total: true,
+                ..Default::default()
+            }),
+            Some(RejectedBeforeExecutionReason::PerClientWorkerOverloaded)
+        ));
+    }
+
+    #[test]
+    fn per_client_capacity_handles_large_worker_totals_without_overflow() {
+        assert_eq!(
+            per_client_worker_capacity(usize::MAX, 50),
+            usize::MAX.div_ceil(2)
+        );
+        assert_eq!(per_client_worker_capacity(usize::MAX, 100), usize::MAX);
+        assert_eq!(
+            per_client_worker_capacity(usize::MAX, usize::MAX),
+            usize::MAX
+        );
     }
 
     #[test]
@@ -2715,6 +3630,200 @@ mod tests {
     }
 
     #[test]
+    fn internal_callbacks_skip_canceled_and_per_client_ineligible_entries() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("scheduler_internal_eligibility_test", async move {
+            // T=4 and 50% give each client a total of two and a shared base
+            // of one. Client A starts at its total while one physical reserve
+            // slot remains usable by a Client B descendant.
+            let mut harness = SchedulerHarness::new(scheduler_rt, 4, 3, 3, 50, 64);
+            let client_a_root =
+                harness.enqueue_test_for_client(1, TestRequestKind::Independent, "deployment_a");
+            let client_a_dependency =
+                harness.enqueue_test_for_client(2, TestRequestKind::Dependency, "deployment_a");
+            let client_b_root =
+                harness.enqueue_test_for_client(3, TestRequestKind::Independent, "deployment_b");
+            harness.start();
+
+            let mut initially_started = [
+                harness.next_started().await,
+                harness.next_started().await,
+                harness.next_started().await,
+            ];
+            initially_started.sort_unstable();
+            assert_eq!(initially_started, [1, 2, 3]);
+
+            let InFlightTestRequest {
+                completion: canceled_completion,
+                response: canceled_response,
+            } = harness.enqueue_internal_test_for_client(4, "deployment_a");
+            drop(canceled_response);
+            let client_a_waiting = harness.enqueue_internal_test_for_client(5, "deployment_a");
+            let client_b_dependency = harness.enqueue_internal_test_for_client(6, "deployment_b");
+
+            // Canceled work is removed, and the live but per-client-ineligible
+            // A request cannot hide B's eligible callback behind it.
+            assert_eq!(harness.next_started().await, 6);
+            assert!(
+                canceled_completion.send(()).is_err(),
+                "canceled internal callback unexpectedly reached a worker"
+            );
+
+            client_a_dependency.complete().await;
+            assert_eq!(harness.next_started().await, 5);
+
+            client_a_waiting.complete().await;
+            client_b_dependency.complete().await;
+            client_a_root.complete().await;
+            client_b_root.complete().await;
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn canceled_internal_permit_wait_does_not_retain_the_request_or_permit() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("scheduler_internal_permit_cancellation_test", async move {
+            let limiter = ConcurrencyLimiter::new(1);
+            let mut harness = SchedulerHarness::new(scheduler_rt, 2, 1, 1, 100, 64);
+            harness.set_concurrency_limiter(limiter.clone());
+            let parent = harness.enqueue_test(1, TestRequestKind::Action);
+            harness.start();
+            assert_eq!(harness.next_started().await, 1);
+
+            let InFlightTestRequest {
+                mut completion,
+                response,
+            } = harness.enqueue_internal_test(2);
+            drop(response);
+            tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, completion.closed())
+                .await
+                .expect("canceled internal request remained in its permit wait");
+
+            let next = harness.enqueue_internal_test(3);
+            parent.complete().await;
+            assert_eq!(harness.next_started().await, 3);
+            next.complete().await;
+            harness.shutdown().await;
+            assert_eq!(limiter.active_permits(), 0);
+        });
+    }
+
+    #[test]
+    fn canceled_external_permit_wait_does_not_retain_the_request_or_permit() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("scheduler_external_permit_cancellation_test", async move {
+            let limiter = ConcurrencyLimiter::new(1);
+            let mut harness = SchedulerHarness::new(scheduler_rt, 2, 2, 2, 100, 64);
+            harness.set_concurrency_limiter(limiter.clone());
+            let active = harness.enqueue_test(1, TestRequestKind::Independent);
+            harness.start();
+            assert_eq!(harness.next_started().await, 1);
+
+            let InFlightTestRequest {
+                mut completion,
+                response,
+            } = harness.enqueue_test(2, TestRequestKind::Independent);
+            drop(response);
+            tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, completion.closed())
+                .await
+                .expect("canceled external request remained in its permit wait");
+
+            let next = harness.enqueue_test(3, TestRequestKind::Independent);
+            active.complete().await;
+            assert_eq!(harness.next_started().await, 3);
+            next.complete().await;
+            harness.shutdown().await;
+            assert_eq!(limiter.active_permits(), 0);
+        });
+    }
+
+    #[test]
+    fn queued_dependency_expires_while_selected_control_plane_waits_for_permit() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        let clock = scheduler_rt.clone();
+        rt.block_on(
+            "scheduler_queued_expiry_during_permit_wait_test",
+            async move {
+                let limiter = ConcurrencyLimiter::new(1);
+                let queue_config = IsolateQueueConfig::new(
+                    Duration::from_millis(1),
+                    Duration::from_millis(10),
+                    Duration::from_millis(2),
+                    Duration::from_millis(50),
+                    Duration::from_secs(2),
+                    64,
+                )
+                .unwrap();
+                // T=2 with a 50% per-client limit lets client B's control-plane
+                // request leave the queue while client A's dependency remains
+                // ineligible behind A's active request.
+                let mut harness = SchedulerHarness::new_with_policy(
+                    scheduler_rt,
+                    2,
+                    2,
+                    2,
+                    50,
+                    64,
+                    Some(queue_config),
+                    true,
+                );
+                harness.set_concurrency_limiter(limiter.clone());
+                let active_workers = harness.active_workers.clone();
+                let active = harness.enqueue_test_for_client(
+                    1,
+                    TestRequestKind::Independent,
+                    "deployment_a",
+                );
+                harness.start();
+                assert_eq!(harness.next_started().await, 1);
+
+                let dependency =
+                    harness.enqueue_test_for_client(2, TestRequestKind::Dependency, "deployment_a");
+                let InFlightTestRequest {
+                    completion: mut control_plane_completion,
+                    response: control_plane_response,
+                } = harness.enqueue_test_for_client(
+                    3,
+                    TestRequestKind::ControlPlane,
+                    "deployment_b",
+                );
+                tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, async {
+                    while harness.lane_queue_len() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("control-plane request never entered its active-permit wait");
+
+                clock.advance(Duration::from_millis(51));
+                tokio::time::timeout(Duration::from_secs(1), dependency.expect_expired())
+                    .await
+                    .expect(
+                        "dependency outlived its deadline behind another request's permit wait",
+                    );
+
+                drop(control_plane_response);
+                tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, control_plane_completion.closed())
+                    .await
+                    .expect("canceled control-plane request remained in its permit wait");
+                active.complete().await;
+                harness.shutdown().await;
+                assert_eq!(limiter.active_permits(), 0);
+                assert_eq!(active_workers.load(Ordering::Relaxed), 0);
+            },
+        );
+    }
+
+    #[test]
     fn per_client_overflow_stays_within_percentage_derived_total() {
         let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
         let rt = ProdRuntime::new(&tokio);
@@ -2828,6 +3937,61 @@ mod tests {
             harness.shutdown().await;
 
             assert_eq!(active_workers.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn canceled_control_plane_request_is_discarded_before_worker_assignment() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("scheduler_control_plane_cancellation_test", async move {
+            let mut harness = SchedulerHarness::new_control_plane(scheduler_rt, 1, 1, 1, 100, 64);
+            let active_workers = harness.active_workers.clone();
+            let active = harness.enqueue_test(1, TestRequestKind::Independent);
+            harness.start();
+            assert_eq!(harness.next_started().await, 1);
+
+            let InFlightTestRequest {
+                completion: canceled_completion,
+                response: canceled_response,
+            } = harness.enqueue_test(2, TestRequestKind::ControlPlane);
+            drop(canceled_response);
+            let follow_up = harness.enqueue_test(3, TestRequestKind::Independent);
+
+            active.complete().await;
+            assert_eq!(harness.next_started().await, 3);
+            follow_up.complete().await;
+            drop(canceled_completion);
+            harness.shutdown().await;
+
+            assert_eq!(active_workers.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn control_plane_waits_in_shared_base_while_dependency_uses_reserves() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("scheduler_control_plane_reserve_test", async move {
+            // One request occupies the only shared-base worker. The older
+            // control-plane request also fills the shared queue entry, so only
+            // the newer dependency may use both overflow capacities.
+            let mut harness = SchedulerHarness::new_control_plane(scheduler_rt, 2, 1, 1, 100, 1);
+            let base = harness.enqueue_test(1, TestRequestKind::Independent);
+            harness.start();
+            assert_eq!(harness.next_started().await, 1);
+
+            let control_plane = harness.enqueue_test(2, TestRequestKind::ControlPlane);
+            let dependency = harness.enqueue_test(3, TestRequestKind::Dependency);
+            assert_eq!(harness.next_started().await, 3);
+
+            dependency.complete().await;
+            base.complete().await;
+            assert_eq!(harness.next_started().await, 2);
+            control_plane.complete().await;
+            harness.shutdown().await;
         });
     }
 
