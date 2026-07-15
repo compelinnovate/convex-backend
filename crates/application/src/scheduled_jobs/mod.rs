@@ -122,6 +122,32 @@ use crate::{
     function_log::FunctionExecutionLog,
 };
 
+const SCHEDULED_JOB_STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+fn should_log_scheduled_job_stats(
+    last_ready_time: Option<SystemTime>,
+    next_ready_time: Option<SystemTime>,
+    now: SystemTime,
+    last_stats_log: SystemTime,
+) -> bool {
+    let ready_time_changed = match (last_ready_time, next_ready_time) {
+        (None, None) => false,
+        (Some(previous), Some(next)) => {
+            let abs_diff = previous
+                .duration_since(next)
+                .unwrap_or_else(|e| e.duration());
+            abs_diff >= SCHEDULED_JOB_STATS_LOG_INTERVAL
+        },
+        // Always log if transitioning between Some and None.
+        _ => true,
+    };
+    let overdue_heartbeat = next_ready_time.is_some_and(|t| t <= now)
+        && now
+            .duration_since(last_stats_log)
+            .is_ok_and(|d| d >= SCHEDULED_JOB_STATS_LOG_INTERVAL);
+    ready_time_changed || overdue_heartbeat
+}
+
 mod metrics;
 
 pub(crate) const SCHEDULED_JOB_EXECUTED: &str = "scheduled_job_executed";
@@ -176,8 +202,6 @@ pub struct ScheduledJobExecutor<RT: Runtime> {
     context: ScheduledJobContext<RT>,
     deployment_name: String,
     running_job_ids: HashSet<ResolvedDocumentId>,
-    /// Some if there's at least one pending job. May be in the past!
-    next_job_ready_time: Option<Timestamp>,
     job_finished_tx: mpsc::Sender<ResolvedDocumentId>,
     job_finished_rx: mpsc::Receiver<ResolvedDocumentId>,
     execution_parallelism: usize,
@@ -240,7 +264,6 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
             },
             deployment_name,
             running_job_ids: HashSet::new(),
-            next_job_ready_time: None,
             job_finished_tx,
             job_finished_rx,
             execution_parallelism,
@@ -291,44 +314,39 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
         let backend_state = BackendStateModel::new(&mut tx).get_backend_state().await?;
         let is_backend_stopped = backend_state.is_stopped();
 
-        self.next_job_ready_time = if is_backend_stopped {
+        let next_job_ready_time = if is_backend_stopped {
             // If the backend is stopped we shouldn't poll. Our subscription will notify us
             // when the backend is started again.
             None
-        } else if self.running_job_ids.len() == self.execution_parallelism {
-            // A scheduled job may have been added, but we can't do anything because we're
-            // still running jobs at our concurrency limit.
-            self.next_job_ready_time
         } else {
-            // Great! we have enough remaining concurrency and our backend is running, start
-            // new job(s) if we can and update our next ready time.
+            // Query even at the executor concurrency limit. The query will not dispatch
+            // another job, but it must refresh the queue head after
+            // cancellation or replacement so the dashboard does not extrapolate
+            // a stale ready time. After initializing one head per namespace, a
+            // full executor advances past at most its bounded running-ID set.
             let root = get_sampled_span(
                 &self.deployment_name,
                 "scheduler/query_and_start_jobs",
                 &mut self.context.rt.rng(),
             );
             self.query_and_start_jobs(&mut tx).in_span(root).await?
-        };
+        }
+        .map(SystemTime::from);
 
         let now = self.context.rt.system_time();
-        let next_job_ready_time = self.next_job_ready_time.map(SystemTime::from);
         metrics::log_running_jobs(self.running_job_ids.len());
-
-        // Only log stats if:
-        // - next_job_ready_time differs by >=30 seconds from the last logged value; or
-        // - we're lagging and >=30 seconds have elapsed
-        let should_log = match (self.last_logged_ready_time, next_job_ready_time) {
-            (None, None) => false,
-            (Some(t1), Some(t2)) => {
-                let abs_diff = t1.duration_since(t2).unwrap_or_else(|e| e.duration());
-                abs_diff >= Duration::from_secs(30)
-            },
-            // always log if transitioning between Some and None
-            _ => true,
-        } || (next_job_ready_time.is_some_and(|t| t <= now)
-            && now
-                .duration_since(self.last_stats_log)
-                .is_ok_and(|d| d >= Duration::from_secs(30)));
+        // The app-metrics endpoint extrapolates from the latest observed ready time.
+        // Keep this cheap in-memory state current independently of rate-limited
+        // structured logs.
+        self.context
+            .function_log
+            .record_scheduled_job_lag(next_job_ready_time, now);
+        let should_log = should_log_scheduled_job_stats(
+            self.last_logged_ready_time,
+            next_job_ready_time,
+            now,
+            self.last_stats_log,
+        );
         if should_log {
             self.log_scheduled_job_stats(next_job_ready_time, now);
             self.last_logged_ready_time = next_job_ready_time;
@@ -419,6 +437,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
         tx: &mut Transaction<RT>,
     ) -> anyhow::Result<Option<Timestamp>> {
         let now = self.context.rt.generate_timestamp()?;
+        let scan_started = self.context.rt.monotonic_now();
         let mut job_stream = self.context.stream_jobs_to_run(tx);
         while let Some((job_id, job)) = job_stream.try_next().await? {
             self.context
@@ -439,6 +458,19 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
             if next_ts > now || self.running_job_ids.len() == self.execution_parallelism {
                 return Ok(Some(next_ts));
             }
+
+            // Anchor lag to the wall-clock due-time decision, then advance it with
+            // monotonic elapsed time. A wall-clock step during the scan must not erase
+            // or inflate lag that the scheduler already observed.
+            let admission_lag = (now - next_ts)
+                .checked_add(
+                    self.context
+                        .rt
+                        .monotonic_now()
+                        .saturating_duration_since(scan_started),
+                )
+                .context("Scheduled job admission lag overflow")?;
+            metrics::log_scheduled_job_admission_lag(admission_lag);
 
             let context = self.context.clone();
             let tx = self.job_finished_tx.clone();
@@ -1260,5 +1292,51 @@ impl<RT: Runtime> ScheduledJobGarbageCollector<RT> {
         }
         backoff.reset();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::UNIX_EPOCH;
+
+    use super::*;
+
+    #[test]
+    fn scheduled_job_stats_keep_sub_interval_catch_up_coalesced() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        assert!(!should_log_scheduled_job_stats(
+            Some(now - Duration::from_secs(1)),
+            Some(now + Duration::from_secs(1)),
+            now,
+            now - Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn scheduled_job_stats_keep_sub_interval_future_changes_coalesced() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        assert!(!should_log_scheduled_job_stats(
+            Some(now + Duration::from_secs(10)),
+            Some(now + Duration::from_secs(20)),
+            now,
+            now - Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn scheduled_job_stats_keep_existing_interval_triggers() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        assert!(should_log_scheduled_job_stats(
+            Some(now + Duration::from_secs(10)),
+            Some(now + Duration::from_secs(40)),
+            now,
+            now - Duration::from_secs(1),
+        ));
+        assert!(should_log_scheduled_job_stats(
+            Some(now - Duration::from_secs(1)),
+            Some(now - Duration::from_secs(1)),
+            now,
+            now - SCHEDULED_JOB_STATS_LOG_INTERVAL,
+        ));
     }
 }

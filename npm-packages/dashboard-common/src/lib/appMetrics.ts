@@ -116,18 +116,41 @@ export class PermissionDeniedError extends Error {
   }
 }
 
+export const SCHEDULER_LAG_WARNING_SECONDS = 20;
+export const SCHEDULER_LAG_CRITICAL_SECONDS = 300;
+export const SCHEDULER_LAG_BUCKET_MILLIS = 15_000;
+const SCHEDULER_LAG_WINDOW_MILLIS = 60 * 60 * 1000;
+
+export function formatSchedulerLag(seconds: number) {
+  if (seconds < 1) {
+    return `${Math.round(seconds * 1000)} ms`;
+  }
+  if (seconds < 60) {
+    return `${Math.round(seconds)} s`;
+  }
+  return `${Number((seconds / 60).toFixed(seconds < 600 ? 1 : 0))} min`;
+}
+
 export function useSchedulerLag() {
   const url = "/api/app_metrics/scheduled_job_lag";
   const isDisconnected = useDeploymentIsDisconnected();
   const deploymentUrl = useDeploymentUrl();
   const authHeader = useDeploymentAuthHeader();
   const fetcher = async () => {
-    const start = new Date(Date.now() - 60 * 60 * 1000); // 1 hour ago
-    const end = new Date();
+    const currentBucketStartMillis =
+      Math.floor(Date.now() / SCHEDULER_LAG_BUCKET_MILLIS) *
+      SCHEDULER_LAG_BUCKET_MILLIS;
+    // MetricsWindow returns bucket starts and excludes `end`. Include the current
+    // bucket start instead of making the summary one full bucket older.
+    const endMillis = currentBucketStartMillis + SCHEDULER_LAG_BUCKET_MILLIS;
+    const end = new Date(endMillis);
+    const start = new Date(endMillis - SCHEDULER_LAG_WINDOW_MILLIS);
     const windowArgs = {
       start: serializeDate(start),
       end: serializeDate(end),
-      num_buckets: 60,
+      // Scheduler lag is operationally meaningful below one minute. Keep enough resolution to
+      // distinguish a short admission delay from a sustained scheduled-function backlog.
+      num_buckets: SCHEDULER_LAG_WINDOW_MILLIS / SCHEDULER_LAG_BUCKET_MILLIS,
     };
     const window = JSON.stringify(windowArgs);
     const params = { window };
@@ -140,23 +163,18 @@ export function useSchedulerLag() {
   };
 
   const { data: d } = useSWR(isDisconnected ? null : url, fetcher, {
-    refreshInterval: 60 * 1000,
+    refreshInterval: SCHEDULER_LAG_BUCKET_MILLIS,
   });
   if (!d) {
     return undefined;
   }
   const buckets = responseToTimeseries(d as TimeseriesResponse);
-  const data = buckets.map((value) =>
-    value.metric
-      ? {
-          time: format(value.time, "h:mm a"),
-          lag: Math.round(value.metric / 60),
-        }
-      : {
-          time: format(value.time, "h:mm a"),
-          lag: 0,
-        },
-  );
+  const data = buckets.map((value) => ({
+    time: format(value.time, "h:mm:ss a"),
+    // A recorded empty queue is returned as zero. Keep a genuinely missing
+    // backend sample as a gap instead of presenting unknown state as healthy.
+    lag: value.metric === null ? null : Math.max(value.metric, 0),
+  }));
   return {
     data,
     xAxisKey: "time",
@@ -194,7 +212,11 @@ export function useTopKFunctionMetrics(
   k: number = 3,
   numBuckets: number = 60,
 ) {
-  const url = `/api/app_metrics/${kind === "cacheHitPercentage" ? "cache_hit_percentage_top_k" : "failure_percentage_top_k"}`;
+  const url = `/api/app_metrics/${
+    kind === "cacheHitPercentage"
+      ? "cache_hit_percentage_top_k"
+      : "failure_percentage_top_k"
+  }`;
   const cacheKey = `${useTopKCacheKey(kind)}?k=${k}&numBuckets=${numBuckets}`;
   const isDisconnected = useDeploymentIsDisconnected();
   const deploymentUrl = useDeploymentUrl();
@@ -252,10 +274,10 @@ export function useTopKFunctionMetrics(
         typeof metric === "number"
           ? metric
           : hadDataAt > -1
-            ? kind === "cacheHitPercentage"
-              ? 100
-              : 0
-            : null;
+          ? kind === "cacheHitPercentage"
+            ? 100
+            : 0
+          : null;
     }
     data.push(dataPoint);
   }
@@ -522,7 +544,9 @@ export function useSubscriptionInvalidationsTopK(
   const isDisconnected = useDeploymentIsDisconnected();
   const deploymentUrl = useDeploymentUrl();
   const authHeader = useDeploymentAuthHeader();
-  const cacheKey = `${deploymentUrl}${url}?k=${k}${opts ? `&path=${opts.udfIdentifier}` : ""}`;
+  const cacheKey = `${deploymentUrl}${url}?k=${k}${
+    opts ? `&path=${opts.udfIdentifier}` : ""
+  }`;
 
   const fetcher = async () => {
     const start = new Date(Date.now() - 60 * 60 * 1000);

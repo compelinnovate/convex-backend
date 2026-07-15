@@ -179,8 +179,11 @@ initializes its gauge to zero, and cancellation or exit resets it to zero so app
 cannot leave stale process occupancy. A completion for an unowned job, or duplicate IDs in one
 ordinary batch, fails the executor iteration after applying valid completions and publishing the
 resulting occupancy instead of silently accepting the broken ownership transition. The gauges
-complement the existing execution-lag histograms and the legacy sampled ordinary-occupancy
-histogram without adding function, module, or job identifiers.
+complement the sampled ready-queue lag histograms, the direct ordinary scheduled-job admission-lag
+histogram, and the legacy sampled ordinary-occupancy histogram without adding function, module, or
+job identifiers. Both executors refresh the first non-running queue entry while their execution
+slots are full, so cancellation or replacement cannot leave an obsolete ready time in those
+sampled histograms until another job finishes.
 
 ## Metrics
 
@@ -202,8 +205,10 @@ Use these bounded metric families together:
   dependency cache leaders;
 - `scheduled_job_execution_parallelism_info` for the resolved per-executor scheduled-job limit;
 - `scheduled_job_num_running_info` and `cron_job_num_running_info` for source current occupancy;
-- `scheduled_job_execution_lag_seconds` and `cron_job_execution_lag_seconds` for start lag in each
-  executor.
+- `scheduled_job_execution_lag_seconds` and `cron_job_execution_lag_seconds` for sampled
+  ready-queue lag in each executor;
+- `scheduled_job_admission_lag_seconds` for direct target-time-to-admission lag on each ordinary
+  scheduled-job admission attempt.
 
 Dependency enqueue without dispatch indicates a downstream capacity or scheduling problem.
 Dependency expiry or rejection is the liveness failure signal. Reserve use without failures is

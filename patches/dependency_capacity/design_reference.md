@@ -615,11 +615,18 @@ each start, each cron completion notification, and each drained ordinary-
 completion batch. Duplicate or unowned completion notifications fail before a
 false occupancy is accepted; valid completions in the same batch are applied
 and the resulting occupancy is published before the error propagates. External
-scrapes can still miss states shorter than the scrape interval. Compare the gauges with
-`scheduled_job_execution_lag_seconds` and `cron_job_execution_lag_seconds`
-respectively. The legacy `scheduled_job_num_running_total` histogram is
-event-sampled and should not be interpreted as a time-weighted occupancy
-distribution.
+scrapes can still miss states shorter than the scrape interval. Compare the
+gauges with `scheduled_job_execution_lag_seconds` and
+`cron_job_execution_lag_seconds` respectively. Those histograms sample
+ready-queue state and are not direct start measurements.
+`scheduled_job_admission_lag_seconds` directly records
+target-time-to-admission lag for each ordinary scheduled-job admission attempt;
+registered cron jobs do not currently have the matching direct admission
+metric. The legacy `scheduled_job_num_running_total` histogram is event-sampled
+and should not be interpreted as a time-weighted occupancy distribution.
+Both executors refresh the first non-running queue entry while their execution
+slots are full, so cancellation or replacement cannot leave an obsolete ready
+time in either sampled lag histogram until another job finishes.
 
 Use `isolate_scheduler_dependency_reserve_dispatch_total{pool_name}` as direct
 evidence that an ancestor-unblocking request was dispatched while pre-dispatch

@@ -81,8 +81,8 @@ export const SchedulerStatus: Story = {
     chartData: {
       ...chartData,
       data: points.map((row) => ({
-        time: row.time,
-        scheduler: Math.round((row.queryA / 10) * 10),
+        time: row.time.replace(" PM", ":00 PM"),
+        scheduler: Math.round(row.queryA),
       })),
       lineKeys: [
         { key: "scheduler", name: "scheduler", color: "var(--chart-line-1)" },

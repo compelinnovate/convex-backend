@@ -31,12 +31,12 @@ const mockConnectedDeployment = {
 const healthyLag: ChartData = {
   xAxisKey: "time",
   data: [
-    { time: "12:00 PM", lag: 0 },
-    { time: "12:10 PM", lag: 0 },
-    { time: "12:20 PM", lag: 0 },
-    { time: "12:30 PM", lag: 0 },
-    { time: "12:40 PM", lag: 0 },
-    { time: "12:50 PM", lag: 0 },
+    { time: "12:00:00 PM", lag: 0 },
+    { time: "12:10:00 PM", lag: 0 },
+    { time: "12:20:00 PM", lag: 0 },
+    { time: "12:30:00 PM", lag: 0 },
+    { time: "12:40:00 PM", lag: 0 },
+    { time: "12:50:00 PM", lag: 0 },
   ],
   lineKeys: [{ key: "lag", name: "Lag", color: "var(--chart-line-1)" }],
 };

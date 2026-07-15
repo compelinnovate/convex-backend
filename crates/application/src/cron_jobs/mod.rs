@@ -111,8 +111,6 @@ const CRON_LOG_MAX_LOG_LINE_LENGTH: usize = 1000;
 pub struct CronJobExecutor<RT: Runtime> {
     context: CronJobContext<RT>,
     running_job_ids: HashSet<ResolvedDocumentId>,
-    /// Some if there's at least one pending job. May be in the past!
-    next_job_ready_time: Option<Timestamp>,
     job_finished_tx: mpsc::Sender<ResolvedDocumentId>,
     job_finished_rx: mpsc::Receiver<ResolvedDocumentId>,
     execution_parallelism: usize,
@@ -168,7 +166,6 @@ impl<RT: Runtime> CronJobExecutor<RT> {
                 function_log,
             },
             running_job_ids: HashSet::new(),
-            next_job_ready_time: None,
             job_finished_tx,
             job_finished_rx,
             execution_parallelism,
@@ -199,17 +196,20 @@ impl<RT: Runtime> CronJobExecutor<RT> {
         let backend_state = BackendStateModel::new(&mut tx).get_backend_state().await?;
         let is_backend_stopped = backend_state.is_stopped();
 
-        self.next_job_ready_time = if is_backend_stopped {
+        let next_job_ready_time = if is_backend_stopped {
             None
-        } else if self.running_job_ids.len() == self.execution_parallelism {
-            self.next_job_ready_time
         } else {
+            // Refresh the first non-running queue entry even at the executor
+            // limit. Cancellation or replacement must not leave a stale ready
+            // time in the sampled lag histogram until another cron finishes.
+            // After initializing one head per namespace, a full executor
+            // advances past at most its bounded running-ID set.
             self.query_and_start_jobs(&mut tx).await?
         };
 
         metrics::log_running_jobs(self.running_job_ids.len());
 
-        let next_job_future = if let Some(next_job_ts) = self.next_job_ready_time {
+        let next_job_future = if let Some(next_job_ts) = next_job_ready_time {
             let now = self.context.rt.generate_timestamp()?;
             Either::Left(if next_job_ts < now {
                 metrics::log_cron_job_execution_lag(now - next_job_ts);

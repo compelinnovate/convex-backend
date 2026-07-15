@@ -2,22 +2,24 @@
 //! storing many sparse metrics with a low retention time (default: 1 hour) and
 //! relatively coarse aggregation buckets (default: 1 minute).
 //!
-//! We support two types of metrics:
+//! We support three types of metrics:
 //!
 //! - Counter: A simple counter that records some summable quantity associated
 //!   with an event.
+//! - Gauge: A value that is overwritten or maximized within an aggregation
+//!   bucket.
 //! - Histogram: A histogram that records the distribution of a duration between
 //!   1ms and 15m at millisecond resolution.
 //!
 //! # Implementation notes
 //! The data structure keeps a `base_ts` for its creation time and partitions
-//! time into one minute "buckets" of the form
-//! `[base_ts + i * 1m, base_ts + (i + 1) * 1m)`. For memory efficiency, buckets
-//! only store their index, not the full timestamp.
+//! time into configured-width buckets of the form
+//! `[base_ts + i * width, base_ts + (i + 1) * width)`. For memory efficiency,
+//! buckets only store their index, not the full timestamp.
 //!
-//! Non empty buckets are stored in two slabs: one for counters and one for
-//! histograms. Metrics must be strictly either counters or histograms, and it's
-//! an error to log a histogram sample to a counter bucket.
+//! Non-empty buckets are stored in separate counter, gauge, and histogram
+//! slabs. Each metric has exactly one type, and logging a sample of another
+//! type is an error.
 //!
 //! We maintain two indexes on the bucket slabs for efficient querying: one on
 //! `(bucket_index, metric_key)` for efficiently finding buckets ordered by
@@ -156,9 +158,7 @@ pub struct MetricStore {
     histogram_buckets: Slab<HistogramBucket>,
     gauge_buckets: Slab<GaugeBucket>,
 
-    // NB: Both of these indexes have bucket keys that point either to `counter_buckets`
-    // or `histogram_buckets`: Since a single metric has to either be a counter or a
-    // histogram, we can look at `metrics` to know which bucket slab to look at.
+    // Bucket keys in both indexes point into the slab selected by the metric's type.
     bucket_by_start: OrdMap<(BucketIndex, MetricKey), BucketKey>,
     bucket_by_metric: OrdMap<(MetricKey, BucketIndex), BucketKey>,
 }
@@ -561,8 +561,14 @@ impl MetricStore {
         (since_base.as_nanos() / self.config.bucket_width.as_nanos()) as u32
     }
 
-    fn bucket_start(&self, index: BucketIndex) -> SystemTime {
+    /// Return the start timestamp for a storage bucket index.
+    pub fn bucket_start(&self, index: BucketIndex) -> SystemTime {
         self.base_ts + (index * self.config.bucket_width)
+    }
+
+    /// Return the start of the storage bucket containing `ts`.
+    pub fn bucket_start_containing(&self, ts: SystemTime) -> SystemTime {
+        self.bucket_start(self.saturating_bucket_index(ts))
     }
 
     fn prune_buckets(&mut self) -> anyhow::Result<()> {
@@ -614,6 +620,11 @@ impl MetricStore {
 
     pub fn base_ts(&self) -> SystemTime {
         self.base_ts
+    }
+
+    /// Discard all samples and begin a new timestamp-ordered timeline.
+    pub fn reset_timeline(&mut self, base_ts: SystemTime) {
+        *self = Self::new(base_ts, self.config);
     }
 }
 
