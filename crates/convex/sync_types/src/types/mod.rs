@@ -5,6 +5,7 @@ use std::{
         Hash,
         Hasher,
     },
+    num::NonZeroU32,
     ops::Deref,
 };
 
@@ -123,9 +124,7 @@ pub enum QuerySetModification {
 }
 
 #[derive(Clone, Debug)]
-pub struct SerializedArgs(
-    Box<RawValue>,
-);
+pub struct SerializedArgs(Box<RawValue>);
 
 impl PartialEq for SerializedArgs {
     fn eq(&self, other: &Self) -> bool {
@@ -176,6 +175,8 @@ pub enum ClientMessage {
         last_close_reason: String,
         max_observed_timestamp: Option<Timestamp>,
         client_ts: Option<u64>,
+        query_workload_class: Option<QueryWorkloadClass>,
+        degradable_query_pressure_version: Option<DegradableQueryPressureProtocolVersion>,
     },
     ModifyQuerySet {
         base_version: QuerySetVersion,
@@ -202,7 +203,46 @@ pub enum ClientMessage {
         base_version: IdentityVersion,
         token: AuthenticationToken,
     },
+    RetryDegradableQueries {
+        epoch: DegradableQueryPressureEpoch,
+    },
     Event(ClientEvent),
+}
+
+/// A client declaration that opts its root reactive queries down from normal
+/// workload handling.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryWorkloadClass {
+    Degradable,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DegradableQueryPressureProtocolVersion {
+    V1,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DegradableQueryPressureEpoch(NonZeroU32);
+
+impl DegradableQueryPressureEpoch {
+    pub fn first() -> Self {
+        Self(NonZeroU32::MIN)
+    }
+
+    pub fn next(self) -> Self {
+        let next = self
+            .0
+            .get()
+            .checked_add(1)
+            .expect("degradable query pressure epoch exhausted");
+        Self(NonZeroU32::new(next).expect("incremented pressure epoch must remain positive"))
+    }
+
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,6 +379,23 @@ impl StateVersion {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ServerPressure {
+    LegacyDegradableQueryCapacity {
+        /// The JSON protocol accepts values in `1..=u32::MAX` milliseconds.
+        retry_after_ms: NonZeroU32,
+    },
+    DegradableQueryCapacityActive {
+        epoch: DegradableQueryPressureEpoch,
+        /// The JSON protocol accepts values in `1..=u32::MAX` milliseconds.
+        retry_after_ms: NonZeroU32,
+        pending_query_count: NonZeroU32,
+    },
+    DegradableQueryCapacityCleared {
+        epoch: DegradableQueryPressureEpoch,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServerMessage<V: 'static> {
     Transition {
@@ -351,6 +408,7 @@ pub enum ServerMessage<V: 'static> {
         /// The timestamp right before this message was sent back to the
         /// client.
         server_ts: Option<Timestamp>,
+        server_pressure: Option<ServerPressure>,
     },
     TransitionChunk {
         /// The chunk of the serialized Transition message.
@@ -442,3 +500,14 @@ impl From<SessionId> for Uuid {
 // The seq number of a request with a session. Uniquely identifies a
 // modification request within a session.
 pub type SessionRequestSeqNumber = u32;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "degradable query pressure epoch exhausted")]
+    fn degradable_query_pressure_epoch_exhaustion_fails_fast() {
+        DegradableQueryPressureEpoch(NonZeroU32::MAX).next();
+    }
+}

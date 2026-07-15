@@ -50,6 +50,7 @@ use model::{
 use sync_types::{
     types::SerializedArgs,
     AuthenticationToken,
+    QueryWorkloadClass,
     SerializedQueryJournal,
     Timestamp,
 };
@@ -104,6 +105,7 @@ pub trait ApplicationApi: Send + Sync {
         path: ExportPath,
         args: SerializedArgs,
         caller: FunctionCaller,
+        query_workload_class: Option<QueryWorkloadClass>,
         ts: ExecuteQueryTimestamp,
         journal: Option<SerializedQueryJournal>,
         invocation: Option<QueryInvocation>,
@@ -120,6 +122,7 @@ pub trait ApplicationApi: Send + Sync {
         path: CanonicalizedComponentFunctionPath,
         args: SerializedArgs,
         caller: FunctionCaller,
+        query_workload_class: Option<QueryWorkloadClass>,
         ts: ExecuteQueryTimestamp,
         journal: Option<SerializedQueryJournal>,
         invocation: Option<QueryInvocation>,
@@ -282,6 +285,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
         path: ExportPath,
         args: SerializedArgs,
         caller: FunctionCaller,
+        query_workload_class: Option<QueryWorkloadClass>,
         ts: ExecuteQueryTimestamp,
         journal: Option<SerializedQueryJournal>,
         invocation: Option<QueryInvocation>,
@@ -294,7 +298,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
             ExecuteQueryTimestamp::Latest => *self.now_ts_for_reads(),
             ExecuteQueryTimestamp::At(ts) => ts,
         };
-        self.read_only_udf_at_ts(
+        self.read_only_udf_at_ts_with_workload_class(
             request_context,
             PublicFunctionPath::RootExport(path),
             args,
@@ -303,6 +307,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
             journal,
             caller,
             invocation.unwrap_or(QueryInvocation::Fresh),
+            query_workload_class,
         )
         .await
     }
@@ -315,6 +320,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
         path: CanonicalizedComponentFunctionPath,
         args: SerializedArgs,
         caller: FunctionCaller,
+        query_workload_class: Option<QueryWorkloadClass>,
         ts: ExecuteQueryTimestamp,
         journal: Option<SerializedQueryJournal>,
         invocation: Option<QueryInvocation>,
@@ -327,7 +333,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
             ExecuteQueryTimestamp::Latest => *self.now_ts_for_reads(),
             ExecuteQueryTimestamp::At(ts) => ts,
         };
-        self.read_only_udf_at_ts(
+        self.read_only_udf_at_ts_with_workload_class(
             request_context,
             PublicFunctionPath::Component(path),
             args,
@@ -336,6 +342,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
             journal,
             caller,
             invocation.unwrap_or(QueryInvocation::Fresh),
+            query_workload_class,
         )
         .await
     }

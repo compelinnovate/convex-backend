@@ -1,12 +1,18 @@
 use std::{
     borrow::Cow,
-    sync::Arc,
+    sync::{
+        Arc,
+        Once,
+    },
     time::Duration,
 };
 
 use common::{
     components::ResolvedComponentFunctionPath,
-    types::UdfType,
+    types::{
+        ActiveJavascriptClass,
+        UdfType,
+    },
 };
 use deno_core::v8;
 use errors::ErrorMetadata;
@@ -1167,10 +1173,134 @@ register_convex_histogram!(
     CONCURRENCY_PERMIT_ACQUIRE_SECONDS,
     "Time to acquire a concurrency permit. High latency indicate that isolate threads are \
      oversubscribed and spend time waiting for CPU instead of waiting on async work",
-    &STATUS_LABEL
+    &[STATUS_LABEL[0], "active_javascript_class", "phase"]
 );
-pub fn concurrency_permit_acquire_timer() -> CancelableTimer {
-    CancelableTimer::new(&CONCURRENCY_PERMIT_ACQUIRE_SECONDS)
+
+fn active_javascript_class_label(class: ActiveJavascriptClass) -> StaticMetricLabel {
+    StaticMetricLabel::new(
+        "active_javascript_class",
+        match class {
+            ActiveJavascriptClass::Dependency => "dependency",
+            ActiveJavascriptClass::Protected => "protected",
+            ActiveJavascriptClass::Degradable => "degradable",
+        },
+    )
+}
+
+fn active_javascript_phase_label(phase: &'static str) -> StaticMetricLabel {
+    StaticMetricLabel::new("phase", phase)
+}
+
+pub(crate) fn concurrency_permit_acquire_timer(
+    class: ActiveJavascriptClass,
+    phase: &'static str,
+) -> CancelableTimer {
+    let mut timer = CancelableTimer::new(&CONCURRENCY_PERMIT_ACQUIRE_SECONDS);
+    timer.add_label(active_javascript_class_label(class));
+    timer.add_label(active_javascript_phase_label(phase));
+    timer
+}
+
+register_convex_gauge!(
+    ACTIVE_JAVASCRIPT_CAPACITY_INFO,
+    "Configured active-JavaScript admission capacity by kind",
+    &["capacity_kind"]
+);
+register_convex_gauge!(
+    ACTIVE_JAVASCRIPT_OCCUPANCY_INFO,
+    "Active-JavaScript permits held or granted by service class",
+    &["active_javascript_class"]
+);
+register_convex_gauge!(
+    ACTIVE_JAVASCRIPT_WAITERS_INFO,
+    "Active-JavaScript permit waiters by service class and phase",
+    &["active_javascript_class", "phase"]
+);
+
+pub(crate) fn initialize_active_javascript_metrics(
+    total: usize,
+    protected_minimum: usize,
+    degradable_minimum: usize,
+) {
+    for (capacity_kind, capacity) in [
+        ("total", total),
+        ("protected_minimum", protected_minimum),
+        ("degradable_minimum", degradable_minimum),
+    ] {
+        log_gauge_with_labels(
+            &ACTIVE_JAVASCRIPT_CAPACITY_INFO,
+            capacity as f64,
+            vec![StaticMetricLabel::new("capacity_kind", capacity_kind)],
+        );
+    }
+    static INITIALIZE_OCCUPANCY: Once = Once::new();
+    INITIALIZE_OCCUPANCY.call_once(|| {
+        for class in [
+            ActiveJavascriptClass::Dependency,
+            ActiveJavascriptClass::Protected,
+            ActiveJavascriptClass::Degradable,
+        ] {
+            log_gauge_with_labels(
+                &ACTIVE_JAVASCRIPT_OCCUPANCY_INFO,
+                0.0,
+                vec![active_javascript_class_label(class)],
+            );
+            for phase in ["initial", "resume"] {
+                log_gauge_with_labels(
+                    &ACTIVE_JAVASCRIPT_WAITERS_INFO,
+                    0.0,
+                    vec![
+                        active_javascript_class_label(class),
+                        active_javascript_phase_label(phase),
+                    ],
+                );
+            }
+        }
+    });
+}
+
+pub(crate) fn increment_active_javascript_occupancy(class: ActiveJavascriptClass) {
+    add_to_gauge_with_labels(
+        &ACTIVE_JAVASCRIPT_OCCUPANCY_INFO,
+        1.0,
+        vec![active_javascript_class_label(class)],
+    );
+}
+
+pub(crate) fn decrement_active_javascript_occupancy(class: ActiveJavascriptClass) {
+    subtract_from_gauge_with_labels(
+        &ACTIVE_JAVASCRIPT_OCCUPANCY_INFO,
+        1.0,
+        vec![active_javascript_class_label(class)],
+    );
+}
+
+pub(crate) fn increment_active_javascript_waiters(
+    class: ActiveJavascriptClass,
+    phase: &'static str,
+) {
+    add_to_gauge_with_labels(
+        &ACTIVE_JAVASCRIPT_WAITERS_INFO,
+        1.0,
+        vec![
+            active_javascript_class_label(class),
+            active_javascript_phase_label(phase),
+        ],
+    );
+}
+
+pub(crate) fn decrement_active_javascript_waiters(
+    class: ActiveJavascriptClass,
+    phase: &'static str,
+) {
+    subtract_from_gauge_with_labels(
+        &ACTIVE_JAVASCRIPT_WAITERS_INFO,
+        1.0,
+        vec![
+            active_javascript_class_label(class),
+            active_javascript_phase_label(phase),
+        ],
+    );
 }
 
 register_convex_counter!(

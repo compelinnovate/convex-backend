@@ -1,10 +1,15 @@
-use std::time::Duration;
+use std::{
+    num::NonZeroU32,
+    time::Duration,
+};
 
 use metrics::{
+    log_counter,
     log_counter_with_labels,
     log_distribution,
     log_distribution_with_labels,
     register_convex_counter,
+    register_convex_gauge,
     register_convex_histogram,
     StaticMetricLabel,
     StatusTimer,
@@ -18,8 +23,262 @@ use serde_json::Value as JsonValue;
 use sync_types::{
     types::ClientEvent,
     ClientMessage,
+    QueryWorkloadClass,
     Timestamp,
 };
+
+register_convex_gauge!(
+    SYNC_QUERY_WORKLOAD_CONNECTIONS_INFO,
+    "Current sync connections by declared query workload class",
+    &["query_workload_class"]
+);
+register_convex_counter!(
+    SYNC_DEGRADABLE_QUERY_WORKLOAD_DECISIONS_TOTAL,
+    "Decisions for sync connections declaring degradable query workload",
+    &["decision"],
+    Duration::MAX
+);
+
+macro_rules! metric_label_enum {
+    (
+        $visibility:vis enum $name:ident {
+            $($variant:ident => $label:literal),+ $(,)?
+        }
+    ) => {
+        #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+        $visibility enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label),+
+                }
+            }
+        }
+    };
+}
+
+metric_label_enum! {
+    pub enum DegradableQueryWorkloadDecision {
+        Effective => "effective",
+        SuppressedDisabled => "suppressed_disabled",
+    }
+}
+
+metric_label_enum! {
+    pub enum DegradableQueryPressureLifecycleState {
+        Active => "active",
+        Cleared => "cleared",
+    }
+}
+
+metric_label_enum! {
+    pub enum DegradableQueryRetryTrigger {
+        Timer => "timer",
+        Client => "client",
+    }
+}
+
+metric_label_enum! {
+    pub enum DegradableQueryClientRetryOutcome {
+        Scheduled => "scheduled",
+        Duplicate => "duplicate",
+        Stale => "stale",
+        Inactive => "inactive",
+        Unsupported => "unsupported",
+    }
+}
+register_convex_counter!(
+    SYNC_DEGRADABLE_QUERY_PRESSURE_LIFECYCLE_TOTAL,
+    "Degradable query pressure lifecycle transitions",
+    &["state"],
+    Duration::MAX
+);
+register_convex_histogram!(
+    SYNC_DEGRADABLE_QUERY_PRESSURE_PENDING_QUERIES,
+    "Deferred query count reported by active pressure transitions"
+);
+register_convex_counter!(
+    SYNC_DEGRADABLE_QUERY_RETRY_ATTEMPTS_TOTAL,
+    "Deferred-only degradable query retry attempts",
+    &["trigger"],
+    Duration::MAX
+);
+register_convex_histogram!(
+    SYNC_DEGRADABLE_QUERY_RETRY_QUERIES,
+    "Queries selected by a deferred-only degradable query retry",
+    &["trigger"]
+);
+register_convex_counter!(
+    SYNC_DEGRADABLE_QUERY_CLIENT_RETRY_TOTAL,
+    "Decisions for client-requested degradable query retries",
+    &["outcome"],
+    Duration::MAX
+);
+register_convex_counter!(
+    SYNC_DEGRADABLE_QUERY_DEFERRALS_TOTAL,
+    "Typed degradable query capacity deferrals returned to sync workers"
+);
+register_convex_counter!(
+    SYNC_SERVER_PRESSURE_TRANSITIONS_TOTAL,
+    "Sync transitions carrying server pressure",
+    &["kind"],
+    Duration::MAX
+);
+
+pub struct QueryWorkloadConnectionMetrics {
+    query_workload_class: &'static str,
+}
+
+impl QueryWorkloadConnectionMetrics {
+    pub fn new(
+        query_workload_class: Option<QueryWorkloadClass>,
+        degradable_admission_enabled: bool,
+    ) -> Self {
+        // Initialize both closed label values together so an unused class is
+        // reported as zero rather than looking like an unavailable metric.
+        let normal_connections =
+            SYNC_QUERY_WORKLOAD_CONNECTIONS_INFO.with_label_values(&["normal"]);
+        let degradable_connections =
+            SYNC_QUERY_WORKLOAD_CONNECTIONS_INFO.with_label_values(&["degradable"]);
+        for decision in DegradableQueryWorkloadDecision::ALL {
+            log_counter_with_labels(
+                &SYNC_DEGRADABLE_QUERY_WORKLOAD_DECISIONS_TOTAL,
+                0,
+                vec![StaticMetricLabel::new("decision", decision.label())],
+            );
+        }
+        for state in DegradableQueryPressureLifecycleState::ALL {
+            log_counter_with_labels(
+                &SYNC_DEGRADABLE_QUERY_PRESSURE_LIFECYCLE_TOTAL,
+                0,
+                vec![StaticMetricLabel::new("state", state.label())],
+            );
+        }
+        for trigger in DegradableQueryRetryTrigger::ALL {
+            log_counter_with_labels(
+                &SYNC_DEGRADABLE_QUERY_RETRY_ATTEMPTS_TOTAL,
+                0,
+                vec![StaticMetricLabel::new("trigger", trigger.label())],
+            );
+        }
+        for outcome in DegradableQueryClientRetryOutcome::ALL {
+            log_counter_with_labels(
+                &SYNC_DEGRADABLE_QUERY_CLIENT_RETRY_TOTAL,
+                0,
+                vec![StaticMetricLabel::new("outcome", outcome.label())],
+            );
+        }
+        if degradable_admission_enabled {
+            log_counter(&SYNC_DEGRADABLE_QUERY_DEFERRALS_TOTAL, 0);
+            log_counter_with_labels(
+                &SYNC_SERVER_PRESSURE_TRANSITIONS_TOTAL,
+                0,
+                vec![StaticMetricLabel::new("kind", "degradable_query_capacity")],
+            );
+        }
+        let (query_workload_class, current_connections) = match query_workload_class {
+            Some(QueryWorkloadClass::Degradable) => {
+                log_counter_with_labels(
+                    &SYNC_DEGRADABLE_QUERY_WORKLOAD_DECISIONS_TOTAL,
+                    1,
+                    vec![StaticMetricLabel::new(
+                        "decision",
+                        if degradable_admission_enabled {
+                            DegradableQueryWorkloadDecision::Effective.label()
+                        } else {
+                            DegradableQueryWorkloadDecision::SuppressedDisabled.label()
+                        },
+                    )],
+                );
+                ("degradable", degradable_connections)
+            },
+            None => ("normal", normal_connections),
+        };
+        current_connections.add(1.0);
+        Self {
+            query_workload_class,
+        }
+    }
+}
+
+pub fn log_degradable_query_deferral() {
+    log_counter(&SYNC_DEGRADABLE_QUERY_DEFERRALS_TOTAL, 1);
+}
+
+pub fn log_degradable_query_capacity_pressure_transition() {
+    log_counter_with_labels(
+        &SYNC_SERVER_PRESSURE_TRANSITIONS_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("kind", "degradable_query_capacity")],
+    );
+}
+
+pub fn log_degradable_query_pressure_lifecycle(
+    state: DegradableQueryPressureLifecycleState,
+    pending_query_count: Option<NonZeroU32>,
+) {
+    let pending_query_count = match state {
+        DegradableQueryPressureLifecycleState::Active => Some(
+            pending_query_count.expect("active pressure metric requires a pending query count"),
+        ),
+        DegradableQueryPressureLifecycleState::Cleared => {
+            assert!(
+                pending_query_count.is_none(),
+                "cleared pressure metric must not contain a pending query count"
+            );
+            None
+        },
+    };
+    log_counter_with_labels(
+        &SYNC_DEGRADABLE_QUERY_PRESSURE_LIFECYCLE_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("state", state.label())],
+    );
+    if let Some(pending_query_count) = pending_query_count {
+        log_distribution(
+            &SYNC_DEGRADABLE_QUERY_PRESSURE_PENDING_QUERIES,
+            f64::from(pending_query_count.get()),
+        );
+    }
+}
+
+pub fn log_degradable_query_retry_attempt(
+    trigger: DegradableQueryRetryTrigger,
+    query_count: NonZeroU32,
+) {
+    log_counter_with_labels(
+        &SYNC_DEGRADABLE_QUERY_RETRY_ATTEMPTS_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("trigger", trigger.label())],
+    );
+    log_distribution_with_labels(
+        &SYNC_DEGRADABLE_QUERY_RETRY_QUERIES,
+        f64::from(query_count.get()),
+        vec![StaticMetricLabel::new("trigger", trigger.label())],
+    );
+}
+
+pub fn log_degradable_query_client_retry(outcome: DegradableQueryClientRetryOutcome) {
+    log_counter_with_labels(
+        &SYNC_DEGRADABLE_QUERY_CLIENT_RETRY_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("outcome", outcome.label())],
+    );
+}
+
+impl Drop for QueryWorkloadConnectionMetrics {
+    fn drop(&mut self) {
+        SYNC_QUERY_WORKLOAD_CONNECTIONS_INFO
+            .with_label_values(&[self.query_workload_class])
+            .add(-1.0);
+    }
+}
+
 register_convex_histogram!(
     SYNC_CONNECT_SECONDS,
     "Time between SyncWorker creation and receiving Connect message",
@@ -48,6 +307,7 @@ pub fn handle_message_timer(partition_id: u64, message: &ClientMessage) -> Statu
         ClientMessage::Action { .. } => "Action",
         ClientMessage::ModifyQuerySet { .. } => "ModifyQuerySet",
         ClientMessage::Mutation { .. } => "Mutation",
+        ClientMessage::RetryDegradableQueries { .. } => "RetryDegradableQueries",
         ClientMessage::Event { .. } => "Event",
     };
     timer.add_label(StaticMetricLabel::new("endpoint", request_name.to_owned()));
@@ -675,4 +935,66 @@ pub fn log_network_recovery_reconnect(partition_id: u64, time_saved_ms: f64) {
             partition_id.to_string(),
         )],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query_workload_connections(query_workload_class: &str) -> Option<f64> {
+        SYNC_QUERY_WORKLOAD_CONNECTIONS_INFO
+            .get_metric_with_label_values(&[query_workload_class])
+            .ok()
+            .map(|gauge| gauge.get())
+    }
+
+    #[test]
+    fn query_workload_connection_metrics_initialize_and_balance_closed_labels() {
+        let normal_before = query_workload_connections("normal").unwrap_or(0.0);
+        let degradable_before = query_workload_connections("degradable").unwrap_or(0.0);
+        let suppressed = SYNC_DEGRADABLE_QUERY_WORKLOAD_DECISIONS_TOTAL
+            .with_label_values(&["suppressed_disabled"]);
+        let suppressed_before = suppressed.get();
+        let effective =
+            SYNC_DEGRADABLE_QUERY_WORKLOAD_DECISIONS_TOTAL.with_label_values(&["effective"]);
+        let effective_before = effective.get();
+
+        let mut connection = Some(QueryWorkloadConnectionMetrics::new(None, false));
+        assert_eq!(
+            query_workload_connections("normal"),
+            Some(normal_before + 1.0)
+        );
+        assert_eq!(
+            query_workload_connections("degradable"),
+            Some(degradable_before)
+        );
+
+        drop(connection.take());
+        connection = Some(QueryWorkloadConnectionMetrics::new(
+            Some(QueryWorkloadClass::Degradable),
+            false,
+        ));
+        assert_eq!(query_workload_connections("normal"), Some(normal_before));
+        assert_eq!(
+            query_workload_connections("degradable"),
+            Some(degradable_before + 1.0)
+        );
+        assert_eq!(suppressed.get(), suppressed_before + 1);
+
+        drop(connection.take());
+        connection = Some(QueryWorkloadConnectionMetrics::new(
+            Some(QueryWorkloadClass::Degradable),
+            true,
+        ));
+        assert_eq!(effective.get(), effective_before + 1);
+
+        drop(connection);
+        assert_eq!(query_workload_connections("normal"), Some(normal_before));
+        assert_eq!(
+            query_workload_connections("degradable"),
+            Some(degradable_before)
+        );
+        assert_eq!(suppressed.get(), suppressed_before + 1);
+        assert_eq!(effective.get(), effective_before + 1);
+    }
 }

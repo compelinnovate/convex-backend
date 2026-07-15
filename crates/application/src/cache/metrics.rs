@@ -13,6 +13,7 @@ use metrics::{
     StatusTimer,
     STATUS_LABEL,
 };
+use strum::VariantArray;
 register_convex_histogram!(
     CACHE_GET_SECONDS,
     "Time taken for a UDF cache read",
@@ -82,24 +83,186 @@ register_convex_counter!(
 pub fn log_plan_wait() {
     log_counter(&CACHE_PLAN_WAIT_TOTAL, 1);
 }
+
+register_convex_counter!(
+    DEGRADABLE_QUERY_LEADER_ADMISSION_TOTAL,
+    "Immediate degradable query cache-miss leader admission decisions",
+    &["outcome"],
+    Duration::MAX
+);
+register_convex_gauge!(
+    DEGRADABLE_QUERY_LEADER_PERMITS_IN_USE_INFO,
+    "Degradable query cache-miss leader permits currently in use"
+);
+register_convex_gauge!(
+    DEGRADABLE_QUERY_LEADER_CAPACITY_INFO,
+    "Configured degradable query cache-miss leader capacity"
+);
+register_convex_counter!(
+    DEGRADABLE_QUERY_CACHE_RECHECK_TOTAL,
+    "Cache outcomes after acquiring a degradable query leader permit",
+    &["outcome"],
+    Duration::MAX
+);
+register_convex_counter!(
+    DEGRADABLE_QUERY_CACHE_WAIT_TOTAL,
+    "Degradable query cache waits by leader execution class",
+    &["leader_class"],
+    Duration::MAX
+);
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, strum::VariantArray)]
+pub enum DegradableLeaderAdmissionOutcome {
+    Admitted,
+    Deferred,
+}
+
+impl DegradableLeaderAdmissionOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, strum::VariantArray)]
+pub enum DegradableCacheRecheckOutcome {
+    Published,
+    Ready,
+    Wait,
+    DirectExecution,
+    Retry,
+}
+
+impl DegradableCacheRecheckOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Ready => "ready",
+            Self::Wait => "wait",
+            Self::DirectExecution => "direct_execution",
+            Self::Retry => "retry",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, strum::VariantArray)]
+pub enum DegradableCacheLeaderClass {
+    Dependency,
+    Normal,
+    Degradable,
+}
+
+impl DegradableCacheLeaderClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dependency => "dependency",
+            Self::Normal => "normal",
+            Self::Degradable => "degradable",
+        }
+    }
+}
+
+pub fn initialize_degradable_leader_metrics(capacity: usize) {
+    for outcome in DegradableLeaderAdmissionOutcome::VARIANTS {
+        log_counter_with_labels(
+            &DEGRADABLE_QUERY_LEADER_ADMISSION_TOTAL,
+            0,
+            vec![StaticMetricLabel::new("outcome", outcome.label())],
+        );
+    }
+    for outcome in DegradableCacheRecheckOutcome::VARIANTS {
+        log_counter_with_labels(
+            &DEGRADABLE_QUERY_CACHE_RECHECK_TOTAL,
+            0,
+            vec![StaticMetricLabel::new("outcome", outcome.label())],
+        );
+    }
+    for leader_class in DegradableCacheLeaderClass::VARIANTS {
+        log_counter_with_labels(
+            &DEGRADABLE_QUERY_CACHE_WAIT_TOTAL,
+            0,
+            vec![StaticMetricLabel::new("leader_class", leader_class.label())],
+        );
+    }
+    for reason in GoReason::VARIANTS {
+        log_counter_with_labels(
+            &CACHE_PLAN_GO_TOTAL,
+            0,
+            vec![StaticMetricLabel::new("reason", reason.label())],
+        );
+    }
+    // Register the process-wide occupancy gauge without resetting permits held
+    // by another live cache manager or a concurrent test instance.
+    let _ = DEGRADABLE_QUERY_LEADER_PERMITS_IN_USE_INFO.get();
+    log_gauge(&DEGRADABLE_QUERY_LEADER_CAPACITY_INFO, capacity as f64);
+}
+
+pub fn log_degradable_leader_admission(outcome: DegradableLeaderAdmissionOutcome) {
+    log_counter_with_labels(
+        &DEGRADABLE_QUERY_LEADER_ADMISSION_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("outcome", outcome.label())],
+    );
+}
+
+pub fn increment_degradable_leader_permits_in_use() {
+    DEGRADABLE_QUERY_LEADER_PERMITS_IN_USE_INFO.inc();
+}
+
+pub fn decrement_degradable_leader_permits_in_use() {
+    DEGRADABLE_QUERY_LEADER_PERMITS_IN_USE_INFO.dec();
+}
+
+pub fn log_degradable_cache_recheck(outcome: DegradableCacheRecheckOutcome) {
+    log_counter_with_labels(
+        &DEGRADABLE_QUERY_CACHE_RECHECK_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("outcome", outcome.label())],
+    );
+}
+
+pub fn log_degradable_cache_wait(leader_class: DegradableCacheLeaderClass) {
+    log_counter_with_labels(
+        &DEGRADABLE_QUERY_CACHE_WAIT_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("leader_class", leader_class.label())],
+    );
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, strum::VariantArray)]
 pub enum GoReason {
     NoCacheResult,
     PeerTimestampTooNew,
     DependencyCannotWaitForIndependentPeer,
+    DependencyCannotWaitForDegradablePeer,
+    NormalCannotWaitForDegradablePeer,
 }
+
+impl GoReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoCacheResult => "no_cache_result",
+            Self::PeerTimestampTooNew => "peer_timestamp_too_new",
+            Self::DependencyCannotWaitForIndependentPeer => {
+                "dependency_cannot_wait_for_independent_peer"
+            },
+            Self::DependencyCannotWaitForDegradablePeer => {
+                "dependency_cannot_wait_for_degradable_peer"
+            },
+            Self::NormalCannotWaitForDegradablePeer => "normal_cannot_wait_for_degradable_peer",
+        }
+    }
+}
+
 register_convex_counter!(
     CACHE_PLAN_GO_TOTAL,
     "Number of times an execution plans to compute the cache result",
     &["reason"]
 );
 pub fn log_plan_go(reason: GoReason) {
-    let label = match reason {
-        GoReason::NoCacheResult => StaticMetricLabel::new("reason", "no_cache_result"),
-        GoReason::PeerTimestampTooNew => StaticMetricLabel::new("reason", "peer_timestamp_too_new"),
-        GoReason::DependencyCannotWaitForIndependentPeer => {
-            StaticMetricLabel::new("reason", "dependency_cannot_wait_for_independent_peer")
-        },
-    };
+    let label = StaticMetricLabel::new("reason", reason.label());
     log_counter_with_labels(&CACHE_PLAN_GO_TOTAL, 1, vec![label]);
 }
 

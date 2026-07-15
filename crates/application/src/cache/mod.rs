@@ -6,6 +6,7 @@ use std::{
     sync::{
         atomic::{
             AtomicU32,
+            AtomicUsize,
             Ordering,
         },
         Arc,
@@ -38,6 +39,7 @@ use common::{
     query_journal::QueryJournal,
     runtime::Runtime,
     types::{
+        ActiveJavascriptClass,
         AllowedVisibility,
         FunctionCaller,
         QueryInvocation,
@@ -52,7 +54,10 @@ use database::{
     Database,
     Token,
 };
-use errors::ErrorMetadataAnyhowExt;
+use errors::{
+    ErrorMetadata,
+    ErrorMetadataAnyhowExt,
+};
 use futures::{
     select_biased,
     FutureExt,
@@ -60,9 +65,15 @@ use futures::{
 use keybroker::Identity;
 use lru::LruCache;
 use metrics::{
+    decrement_degradable_leader_permits_in_use,
     get_timer,
+    increment_degradable_leader_permits_in_use,
+    initialize_degradable_leader_metrics,
     log_cache_hit_visibility_rejected,
     log_cache_size,
+    log_degradable_cache_recheck,
+    log_degradable_cache_wait,
+    log_degradable_leader_admission,
     log_drop_cache_result_too_old,
     log_perform_go,
     log_perform_wait_peer_timeout,
@@ -79,6 +90,9 @@ use metrics::{
     log_validate_ts_too_old,
     query_cache_log_eviction,
     succeed_get_timer,
+    DegradableCacheLeaderClass,
+    DegradableCacheRecheckOutcome,
+    DegradableLeaderAdmissionOutcome,
     GoReason,
 };
 use parking_lot::Mutex;
@@ -86,7 +100,15 @@ use smallvec::{
     smallvec,
     SmallVec,
 };
-use sync_types::types::SerializedArgs;
+use sync_types::{
+    types::SerializedArgs,
+    QueryWorkloadClass,
+};
+use tokio::sync::{
+    OwnedSemaphorePermit,
+    Semaphore,
+    TryAcquireError,
+};
 use udf::{
     validation::{
         PendingArgsPolicy,
@@ -122,6 +144,123 @@ static TOTAL_QUERY_TIMEOUT: LazyLock<Duration> =
 static MAX_CACHE_AGE: LazyLock<Duration> =
     LazyLock::new(|| *TOTAL_QUERY_TIMEOUT + Duration::from_secs(1));
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum QueryExecutionClass {
+    Dependency,
+    Normal,
+    Degradable,
+}
+
+impl QueryExecutionClass {
+    fn new(
+        scheduler_dependency: SchedulerDependencyClass,
+        query_workload_class: Option<QueryWorkloadClass>,
+        degradable_admission_enabled: bool,
+    ) -> Self {
+        if scheduler_dependency.unblocks_ancestor() {
+            Self::Dependency
+        } else if degradable_admission_enabled
+            && query_workload_class == Some(QueryWorkloadClass::Degradable)
+        {
+            Self::Degradable
+        } else {
+            Self::Normal
+        }
+    }
+
+    fn wait_decision(self, leader: Self) -> CacheWaitDecision {
+        match (self, leader) {
+            (Self::Dependency, Self::Dependency)
+            | (Self::Normal, Self::Dependency | Self::Normal)
+            | (Self::Degradable, _) => CacheWaitDecision::Wait,
+            (Self::Dependency, Self::Normal) => {
+                CacheWaitDecision::Bypass(GoReason::DependencyCannotWaitForIndependentPeer)
+            },
+            (Self::Dependency, Self::Degradable) => {
+                CacheWaitDecision::Bypass(GoReason::DependencyCannotWaitForDegradablePeer)
+            },
+            (Self::Normal, Self::Degradable) => {
+                CacheWaitDecision::Bypass(GoReason::NormalCannotWaitForDegradablePeer)
+            },
+        }
+    }
+
+    fn metric_leader_class(self) -> DegradableCacheLeaderClass {
+        match self {
+            Self::Dependency => DegradableCacheLeaderClass::Dependency,
+            Self::Normal => DegradableCacheLeaderClass::Normal,
+            Self::Degradable => DegradableCacheLeaderClass::Degradable,
+        }
+    }
+}
+
+enum CacheWaitDecision {
+    Wait,
+    Bypass(GoReason),
+}
+
+#[derive(Clone)]
+struct DegradableQueryLeaderAdmission {
+    inner: Arc<DegradableQueryLeaderAdmissionInner>,
+}
+
+struct DegradableQueryLeaderAdmissionInner {
+    semaphore: Arc<Semaphore>,
+    permits_in_use: AtomicUsize,
+}
+
+struct DegradableQueryLeaderPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    admission: Arc<DegradableQueryLeaderAdmissionInner>,
+}
+
+impl DegradableQueryLeaderAdmission {
+    fn new(capacity: usize) -> Self {
+        initialize_degradable_leader_metrics(capacity);
+        Self {
+            inner: Arc::new(DegradableQueryLeaderAdmissionInner {
+                semaphore: Arc::new(Semaphore::new(capacity)),
+                permits_in_use: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    fn try_acquire(&self) -> anyhow::Result<DegradableQueryLeaderPermit> {
+        let permit = match self.inner.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                log_degradable_leader_admission(DegradableLeaderAdmissionOutcome::Deferred);
+                return Err(ErrorMetadata::degradable_query_capacity().into());
+            },
+            Err(TryAcquireError::Closed) => {
+                panic!("degradable query leader admission semaphore unexpectedly closed")
+            },
+        };
+        self.inner.permits_in_use.fetch_add(1, Ordering::SeqCst);
+        increment_degradable_leader_permits_in_use();
+        Ok(DegradableQueryLeaderPermit {
+            permit: Some(permit),
+            admission: self.inner.clone(),
+        })
+    }
+}
+
+impl Drop for DegradableQueryLeaderPermit {
+    fn drop(&mut self) {
+        let permit = self
+            .permit
+            .take()
+            .expect("degradable query leader permit released twice");
+        // Account for this leader while the semaphore still excludes its
+        // replacement, so concurrent acquisition cannot make occupancy exceed
+        // the configured capacity.
+        let previous = self.admission.permits_in_use.fetch_sub(1, Ordering::SeqCst);
+        assert!(previous > 0, "degradable query leader permit underflow");
+        decrement_degradable_leader_permits_in_use();
+        drop(permit);
+    }
+}
+
 #[derive(Clone)]
 pub struct CacheManager<RT: Runtime> {
     rt: RT,
@@ -132,6 +271,7 @@ pub struct CacheManager<RT: Runtime> {
 
     tenant_id: QueryCacheTenantId,
     cache: QueryCache,
+    degradable_query_leader_admission: Option<DegradableQueryLeaderAdmission>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -279,7 +419,7 @@ enum CacheEntry {
         receiver: Receiver<CacheResult>,
         // The UDF is being executed at this timestamp.
         ts: Timestamp,
-        scheduler_dependency: SchedulerDependencyClass,
+        execution_class: QueryExecutionClass,
     },
 }
 
@@ -320,6 +460,7 @@ impl<RT: Runtime> CacheManager<RT> {
         udf_execution: FunctionExecutionLog<RT>,
         audit_log_client: AuditLogClient,
         cache: QueryCache,
+        degradable_query_leader_capacity: Option<usize>,
     ) -> Self {
         // each `CacheManager` (for a different deployment) gets its own tenant
         // ID within `Cache`, which has a _global_ size-limit
@@ -332,6 +473,8 @@ impl<RT: Runtime> CacheManager<RT> {
             audit_log_client,
             tenant_id,
             cache,
+            degradable_query_leader_admission: degradable_query_leader_capacity
+                .map(DegradableQueryLeaderAdmission::new),
         }
     }
 
@@ -352,6 +495,7 @@ impl<RT: Runtime> CacheManager<RT> {
         usage_tracker: FunctionUsageTracker,
         query_invocation: QueryInvocation,
         scheduler_dependency: SchedulerDependencyClass,
+        query_workload_class: Option<QueryWorkloadClass>,
     ) -> anyhow::Result<QueryReturn> {
         let timer = get_timer();
         let result = self
@@ -366,6 +510,7 @@ impl<RT: Runtime> CacheManager<RT> {
                 usage_tracker,
                 query_invocation,
                 scheduler_dependency,
+                query_workload_class,
             )
             .await;
         match &result {
@@ -395,6 +540,7 @@ impl<RT: Runtime> CacheManager<RT> {
         usage_tracker: FunctionUsageTracker,
         query_invocation: QueryInvocation,
         scheduler_dependency: SchedulerDependencyClass,
+        query_workload_class: Option<QueryWorkloadClass>,
     ) -> anyhow::Result<(QueryReturn, bool)> {
         let start = self.rt.monotonic_now();
         let identity_cache_key = identity.cache_key();
@@ -407,6 +553,11 @@ impl<RT: Runtime> CacheManager<RT> {
             allowed_visibility: caller.allowed_visibility(),
         };
         let context = ExecutionContext::new(request_context, &caller);
+        let execution_class = QueryExecutionClass::new(
+            scheduler_dependency,
+            query_workload_class,
+            self.degradable_query_leader_admission.is_some(),
+        );
         // If the query exists at some cache key, but the cached entry is invalid,
         // create a Waiting entry at that key, even if it's not the most precise for the
         // request. e.g. if the query was cached with identity:None, create a
@@ -434,7 +585,12 @@ impl<RT: Runtime> CacheManager<RT> {
 
             // Step 1: Decide what we're going to do this iteration: use a cached value,
             // wait on someone else to run a UDF, or run the UDF ourselves.
-            let maybe_op = self.cache.plan_cache_op(
+            let miss_behavior = if execution_class == QueryExecutionClass::Degradable {
+                CacheMissBehavior::InspectDegradable
+            } else {
+                CacheMissBehavior::Publish
+            };
+            let maybe_plan = self.cache.plan_cache_op(
                 &requested_key,
                 stored_key_hint.as_ref(),
                 start,
@@ -442,10 +598,44 @@ impl<RT: Runtime> CacheManager<RT> {
                 &identity,
                 ts,
                 context.clone(),
-                scheduler_dependency,
+                execution_class,
+                miss_behavior,
             );
-            let (op, stored_key) = match maybe_op {
-                Some(op_key) => op_key,
+            let (op, stored_key) = match maybe_plan {
+                Some(CachePlan::Operation(op, stored_key)) => (op, stored_key),
+                Some(CachePlan::NeedsDegradableAdmission(stored_key)) => {
+                    let admission = self
+                        .degradable_query_leader_admission
+                        .as_ref()
+                        .expect("degradable cache miss planned while admission is disabled");
+                    let permit = admission.try_acquire()?;
+                    let recheck = self.cache.plan_cache_op(
+                        &requested_key,
+                        Some(&stored_key),
+                        start,
+                        now,
+                        &identity,
+                        ts,
+                        context.clone(),
+                        execution_class,
+                        CacheMissBehavior::PublishDegradable(permit),
+                    );
+                    match recheck {
+                        Some(CachePlan::Operation(op, stored_key)) => {
+                            log_degradable_cache_recheck(op.degradable_recheck_outcome());
+                            (op, stored_key)
+                        },
+                        Some(CachePlan::NeedsDegradableAdmission(_)) => {
+                            panic!("degradable cache recheck requested admission twice")
+                        },
+                        None => {
+                            log_degradable_cache_recheck(DegradableCacheRecheckOutcome::Retry);
+                            retry_description
+                                .push(format!("plan_cache_recheck_failed ({elapsed:?})"));
+                            continue 'top;
+                        },
+                    }
+                },
                 None => {
                     retry_description.push(format!("plan_cache_op_failed ({elapsed:?})"));
                     continue 'top;
@@ -664,6 +854,7 @@ impl<RT: Runtime> CacheManager<RT> {
             },
             CacheOp::Go {
                 waiting_entry_id: _,
+                degradable_leader_permit,
                 sender,
                 path,
                 args,
@@ -673,6 +864,15 @@ impl<RT: Runtime> CacheManager<RT> {
                 allowed_visibility,
                 context,
             } => {
+                // Only a cache operation that still owns the admitted leader
+                // permit receives degradable active-JavaScript service. A
+                // cache hit, follower, normal bypass, or dependency must not
+                // inherit a client declaration by accident.
+                let active_javascript_class = if degradable_leader_permit.is_some() {
+                    ActiveJavascriptClass::Degradable
+                } else {
+                    ActiveJavascriptClass::Protected
+                };
                 let mut tx = self
                     .database
                     .begin_with_ts(identity.clone(), ts, usage_tracker)
@@ -714,6 +914,7 @@ impl<RT: Runtime> CacheManager<RT> {
                                 journal.clone(),
                                 context,
                                 scheduler_dependency,
+                                active_javascript_class,
                             )
                             .await?;
                         let FunctionOutcome::Query(mut query_outcome) = outcome else {
@@ -902,9 +1103,10 @@ impl QueryCache {
         identity: &'a Identity,
         ts: Timestamp,
         context: ExecutionContext,
-        scheduler_dependency: SchedulerDependencyClass,
-    ) -> Option<(CacheOp<'a>, StoredCacheKey)> {
-        let go = |sender: Option<(Sender<_>, u64)>| {
+        execution_class: QueryExecutionClass,
+        miss_behavior: CacheMissBehavior,
+    ) -> Option<CachePlan<'a>> {
+        let go = |sender: Option<(Sender<_>, u64)>, degradable_leader_permit| {
             let (sender, waiting_entry_id) = match sender {
                 Some((sender, waiting_entry_id)) => (sender, Some(waiting_entry_id)),
                 None => {
@@ -916,6 +1118,7 @@ impl QueryCache {
             };
             CacheOp::Go {
                 waiting_entry_id,
+                degradable_leader_permit,
                 sender,
                 path: &key.path,
                 args: &key.args,
@@ -934,9 +1137,19 @@ impl QueryCache {
                     // If another request has already executed this UDF at a
                     // newer timestamp, we can't use the cache. Re-execute
                     // in this case.
+                    let degradable_leader_permit = match miss_behavior {
+                        CacheMissBehavior::Publish => None,
+                        CacheMissBehavior::InspectDegradable => {
+                            return Some(CachePlan::NeedsDegradableAdmission(stored_key));
+                        },
+                        CacheMissBehavior::PublishDegradable(permit) => Some(permit),
+                    };
                     tracing::debug!("Cache value too new for {:?}", stored_key);
+                    if degradable_leader_permit.is_some() {
+                        log_degradable_leader_admission(DegradableLeaderAdmissionOutcome::Admitted);
+                    }
                     log_plan_go(GoReason::PeerTimestampTooNew);
-                    go(None)
+                    go(None, degradable_leader_permit)
                 } else {
                     tracing::debug!("Cache value ready for {:?}", stored_key);
                     log_plan_ready();
@@ -948,21 +1161,35 @@ impl QueryCache {
                 started: peer_started,
                 receiver,
                 ts: peer_ts,
-                scheduler_dependency: peer_scheduler_dependency,
+                execution_class: peer_execution_class,
             }) => {
                 let entry_id = *id;
                 if *peer_ts > ts {
+                    let degradable_leader_permit = match miss_behavior {
+                        CacheMissBehavior::Publish => None,
+                        CacheMissBehavior::InspectDegradable => {
+                            return Some(CachePlan::NeedsDegradableAdmission(stored_key));
+                        },
+                        CacheMissBehavior::PublishDegradable(permit) => Some(permit),
+                    };
+                    if degradable_leader_permit.is_some() {
+                        log_degradable_leader_admission(DegradableLeaderAdmissionOutcome::Admitted);
+                    }
                     log_plan_go(GoReason::PeerTimestampTooNew);
-                    return Some((go(None), stored_key));
+                    return Some(CachePlan::Operation(
+                        go(None, degradable_leader_permit),
+                        stored_key,
+                    ));
                 }
-                if scheduler_dependency.unblocks_ancestor()
-                    && !peer_scheduler_dependency.unblocks_ancestor()
+                if let CacheWaitDecision::Bypass(reason) =
+                    execution_class.wait_decision(*peer_execution_class)
                 {
-                    // The independent peer may be queued outside the worker
-                    // reserve. A side-effect-free duplicate keeps this action
-                    // callback attached to the dependency lane.
-                    log_plan_go(GoReason::DependencyCannotWaitForIndependentPeer);
-                    return Some((go(None), stored_key));
+                    // The higher-class caller must retain its existing
+                    // application and dependency scheduling contract. Queries
+                    // are side-effect-free, so this duplicate does not replace
+                    // or cancel the waiting leader.
+                    log_plan_go(reason);
+                    return Some(CachePlan::Operation(go(None, None), stored_key));
                 }
                 // We don't serialize sampling `now` under the cache lock, and since it can
                 // occur on different threads, we're not guaranteed that
@@ -983,6 +1210,9 @@ impl QueryCache {
                 let remaining = *TOTAL_QUERY_TIMEOUT - cmp::max(peer_elapsed, get_elapsed);
                 tracing::debug!("Waiting for peer to compute {:?}", stored_key);
                 log_plan_wait();
+                if execution_class == QueryExecutionClass::Degradable {
+                    log_degradable_cache_wait(peer_execution_class.metric_leader_class());
+                }
                 CacheOp::Wait {
                     waiting_entry_id: *id,
                     receiver: receiver.clone(),
@@ -990,14 +1220,24 @@ impl QueryCache {
                 }
             },
             None => {
+                let degradable_leader_permit = match miss_behavior {
+                    CacheMissBehavior::Publish => None,
+                    CacheMissBehavior::InspectDegradable => {
+                        return Some(CachePlan::NeedsDegradableAdmission(stored_key));
+                    },
+                    CacheMissBehavior::PublishDegradable(permit) => Some(permit),
+                };
                 tracing::debug!("No cache value for {:?}, executing UDF...", stored_key);
                 let (sender, executor_id) =
-                    inner.put_waiting(stored_key.clone(), now, ts, scheduler_dependency);
+                    inner.put_waiting(stored_key.clone(), now, ts, execution_class);
+                if degradable_leader_permit.is_some() {
+                    log_degradable_leader_admission(DegradableLeaderAdmissionOutcome::Admitted);
+                }
                 log_plan_go(GoReason::NoCacheResult);
-                go(Some((sender, executor_id)))
+                go(Some((sender, executor_id)), degradable_leader_permit)
             },
         };
-        Some((op, stored_key))
+        Some(CachePlan::Operation(op, stored_key))
     }
 
     fn remove_waiting(&self, key: &StoredCacheKey, entry_id: u64) {
@@ -1048,7 +1288,7 @@ impl Inner {
         key: StoredCacheKey,
         now: tokio::time::Instant,
         ts: Timestamp,
-        scheduler_dependency: SchedulerDependencyClass,
+        execution_class: QueryExecutionClass,
     ) -> (Sender<CacheResult>, u64) {
         let id = self.next_waiting_id;
         self.next_waiting_id += 1;
@@ -1060,7 +1300,7 @@ impl Inner {
             receiver,
             started: now,
             ts,
-            scheduler_dependency,
+            execution_class,
         };
         let new_size = key.size() + new_entry.size();
         let old_size = self
@@ -1133,6 +1373,17 @@ impl Inner {
     }
 }
 
+enum CacheMissBehavior {
+    Publish,
+    InspectDegradable,
+    PublishDegradable(DegradableQueryLeaderPermit),
+}
+
+enum CachePlan<'a> {
+    Operation(CacheOp<'a>, StoredCacheKey),
+    NeedsDegradableAdmission(StoredCacheKey),
+}
+
 #[derive(strum::Display)]
 enum CacheOp<'a> {
     Ready {
@@ -1145,6 +1396,7 @@ enum CacheOp<'a> {
     },
     Go {
         waiting_entry_id: Option<u64>,
+        degradable_leader_permit: Option<DegradableQueryLeaderPermit>,
         sender: Sender<CacheResult>,
         path: &'a PublicFunctionPath,
         args: &'a SerializedArgs,
@@ -1154,4 +1406,521 @@ enum CacheOp<'a> {
         allowed_visibility: AllowedVisibility,
         context: ExecutionContext,
     },
+}
+
+impl CacheOp<'_> {
+    fn degradable_recheck_outcome(&self) -> DegradableCacheRecheckOutcome {
+        match self {
+            Self::Ready { .. } => DegradableCacheRecheckOutcome::Ready,
+            Self::Wait { .. } => DegradableCacheRecheckOutcome::Wait,
+            Self::Go {
+                waiting_entry_id: Some(_),
+                ..
+            } => DegradableCacheRecheckOutcome::Published,
+            Self::Go {
+                waiting_entry_id: None,
+                ..
+            } => DegradableCacheRecheckOutcome::DirectExecution,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::{
+        components::ExportPath,
+        identity::InertIdentity,
+        runtime::UnixTimestamp,
+        types::FunctionCaller,
+        RequestId,
+    };
+    use value::{
+        JsonPackedValue,
+        PendingValue,
+    };
+
+    use super::*;
+
+    fn requested_key() -> RequestedCacheKey {
+        RequestedCacheKey {
+            tenant_id: QueryCacheTenantId::allocate(),
+            path: PublicFunctionPath::RootExport("test:default".parse::<ExportPath>().unwrap()),
+            args: SerializedArgs::from_args(vec![]).unwrap(),
+            identity: IdentityCacheKey::Unknown(None),
+            journal: QueryJournal::new(),
+            allowed_visibility: AllowedVisibility::PublicOnly,
+        }
+    }
+
+    fn context() -> ExecutionContext {
+        ExecutionContext::new(
+            RequestContext::new_for_system_request(RequestId::new()),
+            &FunctionCaller::Cron,
+        )
+    }
+
+    fn plan<'a>(
+        cache: &QueryCache,
+        key: &'a RequestedCacheKey,
+        stored_key_hint: Option<&StoredCacheKey>,
+        identity: &'a Identity,
+        execution_class: QueryExecutionClass,
+        miss_behavior: CacheMissBehavior,
+    ) -> Option<CachePlan<'a>> {
+        plan_at_ts(
+            cache,
+            key,
+            stored_key_hint,
+            identity,
+            Timestamp::MIN,
+            execution_class,
+            miss_behavior,
+        )
+    }
+
+    fn plan_at_ts<'a>(
+        cache: &QueryCache,
+        key: &'a RequestedCacheKey,
+        stored_key_hint: Option<&StoredCacheKey>,
+        identity: &'a Identity,
+        ts: Timestamp,
+        execution_class: QueryExecutionClass,
+        miss_behavior: CacheMissBehavior,
+    ) -> Option<CachePlan<'a>> {
+        let now = tokio::time::Instant::now();
+        cache.plan_cache_op(
+            key,
+            stored_key_hint,
+            now,
+            now,
+            identity,
+            ts,
+            context(),
+            execution_class,
+            miss_behavior,
+        )
+    }
+
+    fn cache_result(key: &RequestedCacheKey) -> CacheResult {
+        cache_result_at(key, Timestamp::MIN)
+    }
+
+    fn cache_result_at(key: &RequestedCacheKey, original_ts: Timestamp) -> CacheResult {
+        let outcome = UdfOutcome {
+            path: key.path.clone().debug_into_component_path(),
+            arguments: key.args.clone(),
+            identity: InertIdentity::Unknown,
+            observed_identity: false,
+            rng_seed: [0; 32],
+            observed_rng: false,
+            unix_timestamp: UnixTimestamp::from_nanos(0),
+            observed_time: false,
+            log_lines: vec![].into(),
+            journal: QueryJournal::new(),
+            audit_log_lines: vec![].into(),
+            result: Ok(JsonPackedValue::pack(PendingValue::Concrete(
+                ConvexValue::Null,
+            ))),
+            syscall_trace: udf::SyscallTrace::new(),
+            udf_server_version: None,
+            memory_in_mb: 0,
+            user_execution_time: Some(Duration::ZERO),
+        };
+        CacheResult {
+            outcome: Arc::new(outcome),
+            original_ts,
+            token: Token::empty(original_ts),
+            visibility_info: None,
+        }
+    }
+
+    fn put_ready(cache: &QueryCache, key: &RequestedCacheKey) {
+        put_ready_at(cache, key, Timestamp::MIN)
+    }
+
+    fn put_ready_at(cache: &QueryCache, key: &RequestedCacheKey, original_ts: Timestamp) {
+        cache
+            .inner
+            .lock()
+            .put_ready(key.precise_cache_key(), cache_result_at(key, original_ts));
+    }
+
+    #[test]
+    fn disabled_classification_and_wait_bypass_matrix_are_closed() {
+        assert_eq!(
+            QueryExecutionClass::new(
+                SchedulerDependencyClass::Independent,
+                Some(QueryWorkloadClass::Degradable),
+                false,
+            ),
+            QueryExecutionClass::Normal
+        );
+        assert_eq!(
+            QueryExecutionClass::new(
+                SchedulerDependencyClass::Independent,
+                Some(QueryWorkloadClass::Degradable),
+                true,
+            ),
+            QueryExecutionClass::Degradable
+        );
+        assert_eq!(
+            QueryExecutionClass::new(
+                SchedulerDependencyClass::UnblocksAncestor,
+                Some(QueryWorkloadClass::Degradable),
+                true,
+            ),
+            QueryExecutionClass::Dependency
+        );
+
+        use CacheWaitDecision::{
+            Bypass,
+            Wait,
+        };
+        use QueryExecutionClass::{
+            Degradable,
+            Dependency,
+            Normal,
+        };
+        assert!(matches!(Dependency.wait_decision(Dependency), Wait));
+        assert!(matches!(
+            Dependency.wait_decision(Normal),
+            Bypass(GoReason::DependencyCannotWaitForIndependentPeer)
+        ));
+        assert!(matches!(
+            Dependency.wait_decision(Degradable),
+            Bypass(GoReason::DependencyCannotWaitForDegradablePeer)
+        ));
+        assert!(matches!(Normal.wait_decision(Dependency), Wait));
+        assert!(matches!(Normal.wait_decision(Normal), Wait));
+        assert!(matches!(
+            Normal.wait_decision(Degradable),
+            Bypass(GoReason::NormalCannotWaitForDegradablePeer)
+        ));
+        assert!(matches!(Degradable.wait_decision(Dependency), Wait));
+        assert!(matches!(Degradable.wait_decision(Normal), Wait));
+        assert!(matches!(Degradable.wait_decision(Degradable), Wait));
+    }
+
+    #[test]
+    fn ready_and_wait_plans_do_not_acquire_degradable_capacity() {
+        let key = requested_key();
+        let identity = Identity::Unknown(None);
+        let admission = DegradableQueryLeaderAdmission::new(1);
+
+        let ready_cache = QueryCache::new(usize::MAX);
+        put_ready(&ready_cache, &key);
+        assert!(matches!(
+            plan(
+                &ready_cache,
+                &key,
+                None,
+                &identity,
+                QueryExecutionClass::Degradable,
+                CacheMissBehavior::InspectDegradable,
+            ),
+            Some(CachePlan::Operation(CacheOp::Ready { .. }, _))
+        ));
+        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+
+        let waiting_cache = QueryCache::new(usize::MAX);
+        let normal_leader = plan(
+            &waiting_cache,
+            &key,
+            None,
+            &identity,
+            QueryExecutionClass::Normal,
+            CacheMissBehavior::Publish,
+        )
+        .unwrap();
+        assert!(matches!(
+            plan(
+                &waiting_cache,
+                &key,
+                None,
+                &identity,
+                QueryExecutionClass::Degradable,
+                CacheMissBehavior::InspectDegradable,
+            ),
+            Some(CachePlan::Operation(CacheOp::Wait { .. }, _))
+        ));
+        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+        let CachePlan::Operation(
+            CacheOp::Go {
+                waiting_entry_id: Some(waiting_entry_id),
+                ..
+            },
+            stored_key,
+        ) = normal_leader
+        else {
+            panic!("normal miss did not publish a leader")
+        };
+        waiting_cache.remove_waiting(&stored_key, waiting_entry_id);
+    }
+
+    #[test]
+    fn degradable_miss_admission_is_immediate_and_recheck_releases_unused_permit() {
+        let cache = QueryCache::new(usize::MAX);
+        let key = requested_key();
+        let identity = Identity::Unknown(None);
+        let admission = DegradableQueryLeaderAdmission::new(1);
+
+        let CachePlan::NeedsDegradableAdmission(stored_key) = plan(
+            &cache,
+            &key,
+            None,
+            &identity,
+            QueryExecutionClass::Degradable,
+            CacheMissBehavior::InspectDegradable,
+        )
+        .unwrap() else {
+            panic!("empty degradable cache did not request admission")
+        };
+        assert!(cache.inner.lock().cache.is_empty());
+
+        let held = admission.try_acquire().unwrap();
+        let Err(error) = admission.try_acquire() else {
+            panic!("saturated admission unexpectedly returned a permit")
+        };
+        assert!(error.is_degradable_query_capacity());
+        assert!(cache.inner.lock().cache.is_empty());
+        drop(held);
+
+        let permit = admission.try_acquire().unwrap();
+        let normal_leader = plan(
+            &cache,
+            &key,
+            Some(&stored_key),
+            &identity,
+            QueryExecutionClass::Normal,
+            CacheMissBehavior::Publish,
+        )
+        .unwrap();
+        assert!(matches!(
+            plan(
+                &cache,
+                &key,
+                Some(&stored_key),
+                &identity,
+                QueryExecutionClass::Degradable,
+                CacheMissBehavior::PublishDegradable(permit),
+            ),
+            Some(CachePlan::Operation(CacheOp::Wait { .. }, _))
+        ));
+        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+
+        let CachePlan::Operation(
+            CacheOp::Go {
+                waiting_entry_id: Some(waiting_entry_id),
+                ..
+            },
+            stored_key,
+        ) = normal_leader
+        else {
+            panic!("normal miss did not publish during recheck race")
+        };
+        cache.remove_waiting(&stored_key, waiting_entry_id);
+    }
+
+    #[test]
+    fn degradable_timestamp_duplicates_require_and_retain_admission() {
+        let key = requested_key();
+        let identity = Identity::Unknown(None);
+        let newer_ts = Timestamp::try_from(1_u64).unwrap();
+
+        let ready_cache = QueryCache::new(usize::MAX);
+        put_ready_at(&ready_cache, &key, newer_ts);
+        let Some(CachePlan::NeedsDegradableAdmission(ready_key)) = plan_at_ts(
+            &ready_cache,
+            &key,
+            None,
+            &identity,
+            Timestamp::MIN,
+            QueryExecutionClass::Degradable,
+            CacheMissBehavior::InspectDegradable,
+        ) else {
+            panic!("a too-new ready result bypassed degradable admission")
+        };
+        let ready_admission = DegradableQueryLeaderAdmission::new(1);
+        let ready_permit = ready_admission.try_acquire().unwrap();
+        let Some(CachePlan::Operation(ready_duplicate, _)) = plan_at_ts(
+            &ready_cache,
+            &key,
+            Some(&ready_key),
+            &identity,
+            Timestamp::MIN,
+            QueryExecutionClass::Degradable,
+            CacheMissBehavior::PublishDegradable(ready_permit),
+        ) else {
+            panic!("an admitted too-new ready result did not execute directly")
+        };
+        assert!(matches!(
+            &ready_duplicate,
+            CacheOp::Go {
+                waiting_entry_id: None,
+                degradable_leader_permit: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(ready_admission.inner.semaphore.available_permits(), 0);
+        drop(ready_duplicate);
+        assert_eq!(ready_admission.inner.semaphore.available_permits(), 1);
+
+        let waiting_cache = QueryCache::new(usize::MAX);
+        let normal_leader = plan_at_ts(
+            &waiting_cache,
+            &key,
+            None,
+            &identity,
+            newer_ts,
+            QueryExecutionClass::Normal,
+            CacheMissBehavior::Publish,
+        )
+        .unwrap();
+        let Some(CachePlan::NeedsDegradableAdmission(waiting_key)) = plan_at_ts(
+            &waiting_cache,
+            &key,
+            None,
+            &identity,
+            Timestamp::MIN,
+            QueryExecutionClass::Degradable,
+            CacheMissBehavior::InspectDegradable,
+        ) else {
+            panic!("a too-new waiting result bypassed degradable admission")
+        };
+        let waiting_admission = DegradableQueryLeaderAdmission::new(1);
+        let held = waiting_admission.try_acquire().unwrap();
+        let Err(error) = waiting_admission.try_acquire() else {
+            panic!("a timestamp duplicate ignored saturated admission")
+        };
+        assert!(error.is_degradable_query_capacity());
+        drop(held);
+
+        let waiting_permit = waiting_admission.try_acquire().unwrap();
+        let Some(CachePlan::Operation(waiting_duplicate, _)) = plan_at_ts(
+            &waiting_cache,
+            &key,
+            Some(&waiting_key),
+            &identity,
+            Timestamp::MIN,
+            QueryExecutionClass::Degradable,
+            CacheMissBehavior::PublishDegradable(waiting_permit),
+        ) else {
+            panic!("an admitted too-new waiting result did not execute directly")
+        };
+        assert!(matches!(
+            &waiting_duplicate,
+            CacheOp::Go {
+                waiting_entry_id: None,
+                degradable_leader_permit: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(waiting_admission.inner.semaphore.available_permits(), 0);
+        drop(waiting_duplicate);
+        assert_eq!(waiting_admission.inner.semaphore.available_permits(), 1);
+
+        let CachePlan::Operation(
+            CacheOp::Go {
+                waiting_entry_id: Some(waiting_entry_id),
+                ..
+            },
+            stored_key,
+        ) = normal_leader
+        else {
+            panic!("normal newer query did not publish a waiting leader")
+        };
+        waiting_cache.remove_waiting(&stored_key, waiting_entry_id);
+    }
+
+    #[test]
+    fn published_degradable_leader_owns_permit_until_operation_drop() {
+        let cache = QueryCache::new(usize::MAX);
+        let key = requested_key();
+        let identity = Identity::Unknown(None);
+        let admission = DegradableQueryLeaderAdmission::new(1);
+        let CachePlan::NeedsDegradableAdmission(stored_key) = plan(
+            &cache,
+            &key,
+            None,
+            &identity,
+            QueryExecutionClass::Degradable,
+            CacheMissBehavior::InspectDegradable,
+        )
+        .unwrap() else {
+            panic!("empty degradable cache did not request admission")
+        };
+        let permit = admission.try_acquire().unwrap();
+        let CachePlan::Operation(op, stored_key) = plan(
+            &cache,
+            &key,
+            Some(&stored_key),
+            &identity,
+            QueryExecutionClass::Degradable,
+            CacheMissBehavior::PublishDegradable(permit),
+        )
+        .unwrap() else {
+            panic!("admitted degradable miss did not publish")
+        };
+        let CacheOp::Go {
+            waiting_entry_id: Some(waiting_entry_id),
+            ..
+        } = &op
+        else {
+            panic!("admitted degradable miss was not a cache leader")
+        };
+        assert_eq!(admission.inner.semaphore.available_permits(), 0);
+
+        let guard = WaitingEntryGuard::new(Some(*waiting_entry_id), &stored_key, cache.clone());
+        drop(op);
+        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+        drop(guard);
+        assert!(cache.inner.lock().cache.is_empty());
+    }
+
+    #[test]
+    fn successful_degradable_leader_completion_replaces_waiting_entry() {
+        let cache = QueryCache::new(usize::MAX);
+        let key = requested_key();
+        let identity = Identity::Unknown(None);
+        let admission = DegradableQueryLeaderAdmission::new(1);
+        let CachePlan::NeedsDegradableAdmission(stored_key) = plan(
+            &cache,
+            &key,
+            None,
+            &identity,
+            QueryExecutionClass::Degradable,
+            CacheMissBehavior::InspectDegradable,
+        )
+        .unwrap() else {
+            panic!("empty degradable cache did not request admission")
+        };
+        let permit = admission.try_acquire().unwrap();
+        let CachePlan::Operation(op, stored_key) = plan(
+            &cache,
+            &key,
+            Some(&stored_key),
+            &identity,
+            QueryExecutionClass::Degradable,
+            CacheMissBehavior::PublishDegradable(permit),
+        )
+        .unwrap() else {
+            panic!("admitted degradable miss did not publish")
+        };
+        let CacheOp::Go {
+            waiting_entry_id: Some(waiting_entry_id),
+            ..
+        } = &op
+        else {
+            panic!("admitted degradable miss was not a cache leader")
+        };
+        let mut guard = WaitingEntryGuard::new(Some(*waiting_entry_id), &stored_key, cache.clone());
+
+        drop(op);
+        guard.complete(smallvec![stored_key.clone()], cache_result(&key));
+        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+        assert!(matches!(
+            cache.inner.lock().cache.get(&stored_key),
+            Some(CacheEntry::Ready(_))
+        ));
+    }
 }

@@ -473,3 +473,99 @@ pub async fn sync(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use sync_types::{
+        DegradableQueryPressureEpoch,
+        LogLinesMessage,
+        QueryId,
+        ServerPressure,
+        StateModification,
+        StateVersion,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TestValue(JsonValue);
+
+    impl From<TestValue> for JsonValue {
+        fn from(value: TestValue) -> Self {
+            value.0
+        }
+    }
+
+    impl TryFrom<JsonValue> for TestValue {
+        type Error = anyhow::Error;
+
+        fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
+            Ok(Self(value))
+        }
+    }
+
+    #[test]
+    fn transition_chunks_preserve_server_pressure() -> anyhow::Result<()> {
+        let pressure = ServerPressure::DegradableQueryCapacityActive {
+            epoch: DegradableQueryPressureEpoch::first(),
+            retry_after_ms: NonZeroU32::new(250).unwrap(),
+            pending_query_count: NonZeroU32::new(2).unwrap(),
+        };
+        let transition: ServerMessage = ServerMessage::Transition {
+            start_version: StateVersion::initial(),
+            end_version: StateVersion::initial(),
+            modifications: vec![StateModification::QueryFailed {
+                query_id: QueryId::new(1),
+                error_message: "x".repeat(MAX_MESSAGE_SIZE + 1),
+                log_lines: LogLinesMessage(vec![]),
+                journal: None,
+                error_data: None,
+            }],
+            client_clock_skew: None,
+            server_ts: None,
+            server_pressure: Some(pressure),
+        };
+        let expected_json = JsonValue::from(transition.clone());
+
+        let chunks = maybe_split_transition(transition, true)?;
+        assert!(chunks.len() > 1);
+        let total_parts = chunks.len() as u32;
+        let mut serialized_transition = String::new();
+        let mut expected_transition_id = None;
+        for (index, message) in chunks.into_iter().enumerate() {
+            let chunk_json = JsonValue::from(message.clone());
+            assert!(chunk_json.get("serverPressure").is_none());
+            let ServerMessage::TransitionChunk {
+                chunk,
+                part_number,
+                total_parts: message_total_parts,
+                transition_id,
+            } = message
+            else {
+                panic!("expected TransitionChunk");
+            };
+            assert_eq!(part_number, index as u32);
+            assert_eq!(message_total_parts, total_parts);
+            if let Some(expected_transition_id) = &expected_transition_id {
+                assert_eq!(&transition_id, expected_transition_id);
+            } else {
+                expected_transition_id = Some(transition_id);
+            }
+            serialized_transition.push_str(&chunk);
+        }
+
+        let reconstructed_json = serde_json::from_str::<JsonValue>(&serialized_transition)?;
+        assert_eq!(reconstructed_json, expected_json);
+        let reconstructed = sync_types::ServerMessage::<TestValue>::try_from(reconstructed_json)?;
+        let sync_types::ServerMessage::Transition {
+            server_pressure, ..
+        } = reconstructed
+        else {
+            panic!("expected Transition");
+        };
+        assert_eq!(server_pressure, Some(pressure));
+        Ok(())
+    }
+}

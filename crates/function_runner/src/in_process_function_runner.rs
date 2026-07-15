@@ -24,6 +24,8 @@ use common::{
     execution_context::ExecutionContext,
     http::fetch::FetchClient,
     knobs::{
+        validate_active_javascript_class_minimums,
+        APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS,
         FUNRUN_ISOLATE_ACTIVE_THREADS,
         FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN,
         FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN,
@@ -187,7 +189,11 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
             degradable_leader_capacity,
         )?;
         let concurrency_limiter = if *FUNRUN_ISOLATE_ACTIVE_THREADS > 0 {
-            ConcurrencyLimiter::new(*FUNRUN_ISOLATE_ACTIVE_THREADS)
+            ConcurrencyLimiter::new_with_class_minimums(
+                *FUNRUN_ISOLATE_ACTIVE_THREADS,
+                *FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN,
+                *FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN,
+            )
         } else {
             ConcurrencyLimiter::unlimited()
         };

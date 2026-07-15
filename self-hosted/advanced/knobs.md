@@ -364,10 +364,42 @@ for admission, memory pressure, metrics, rollout, and rollback behavior.
 
 This caps isolates actively executing JavaScript. `0` means unlimited. A
 request can release this permit while waiting for asynchronous work, so this is
-not the same as assigned isolate workers and does not provide dependency-only
-overflow. Initial external requests acquire a low-priority permit before worker
-assignment, bounded by their original queue deadline. Direct nested
-transactional callbacks and requests reacquiring a released permit use high
-priority. The tiers change handoff order but add no permits. Use the setting to
-control CPU oversubscription, and raise it only after checking backend CPU
-headroom and throttling.
+not the same as assigned isolate workers. Initial external requests remain
+bounded by their original queue deadline. A request that releases its permit
+for asynchronous work retains the resumption phase when it later reacquires
+the permit.
+
+Set `FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN` and
+`FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN` together to positive values to
+enable work-conserving service floors for protected and degradable JavaScript.
+With these floors enabled, dependency work receives the next available permit
+because completing it releases an isolate-holding ancestor. The service class
+follows an execution across every release and reacquisition.
+Only an admitted degradable root query cache-miss leader uses the degradable
+class. Cache hits, followers, ordinary roots, actions, deployment analysis, and
+other backend work use the protected class unless backend-derived ancestry
+classifies the request as a dependency.
+
+The floors apply when both protected and degradable work are runnable and no
+dependency grant is pending. They do not preempt JavaScript that is already
+active and do not keep permits idle. Either class borrows all capacity that the
+other class does not need. After both floors are met, elastic occupancy is
+balanced between the two classes; resumptions precede initial starts within a
+selected class.
+
+Both minimums are `0` by default, which preserves the ordinary two-phase
+admission behavior. Positive minimums require a finite
+`FUNRUN_ISOLATE_ACTIVE_THREADS`, require
+`APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`, and their sum cannot
+exceed the active-thread total. The degradable minimum cannot exceed the
+degradable leader cap. With these minimums enabled, the leader cap can exceed
+the active-thread total because the leader cap bounds admitted query-tree
+lifetime while the active gate bounds runnable JavaScript occupancy.
+
+For example, a total of `28`, protected minimum `4`, and degradable minimum
+`14` leaves ten elastic permits. Under sustained two-class contention the
+elastic permits are shared, producing approximately nine protected and
+nineteen degradable active executions after non-preemptive convergence. If
+either class is idle, the other can use all 28 permits. Use the total to
+control CPU oversubscription and select the minimums from measured progress,
+wait time, CPU headroom, and throttling.

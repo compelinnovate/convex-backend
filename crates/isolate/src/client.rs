@@ -6,6 +6,7 @@ use std::{
         VecDeque,
     },
     env,
+    mem,
     pin::pin,
     sync::{
         atomic::{
@@ -98,6 +99,7 @@ use common::{
     schemas::DatabaseSchema,
     static_span,
     types::{
+        ActiveJavascriptClass,
         DeploymentMetadata,
         ModuleEnvironment,
         SchedulerDependencyClass,
@@ -133,7 +135,6 @@ use futures::{
     stream::{
         self,
         FuturesUnordered,
-        PollNext,
         StreamExt,
     },
     task::AtomicWaker,
@@ -183,7 +184,11 @@ use udf::{
 use value::identifier::Identifier;
 
 use crate::{
-    concurrency_limiter::ConcurrencyLimiter,
+    concurrency_limiter::{
+        ConcurrencyLimiter,
+        ConcurrencyPermit,
+        ConcurrencyPermitPhase,
+    },
     context_cache::{
         context_cache_key,
         CachedContexts,
@@ -224,7 +229,6 @@ use crate::{
         ModuleCache,
         V8ModuleSource,
     },
-    ConcurrencyPermit,
 };
 
 const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
@@ -307,6 +311,7 @@ struct RequestSchedulingProperties {
     can_block_on_descendant: bool,
     is_isolate_action: bool,
     is_control_plane: bool,
+    active_javascript_class: ActiveJavascriptClass,
 }
 
 impl RequestSchedulingProperties {
@@ -521,6 +526,11 @@ enum ExternalPermitWaitOutcome {
     DeadlineElapsed,
 }
 
+enum InternalPermitWaitOutcome {
+    Acquired(ConcurrencyPermit),
+    CallerDropped,
+}
+
 fn reject_queued_request<RT: Runtime>(
     request: Request<RT>,
     rejection: IsolateQueueRejection,
@@ -544,32 +554,39 @@ fn reject_queued_request<RT: Runtime>(
 }
 
 async fn wait_for_external_permit<RT: Runtime>(
-    rt: &RT,
-    limiter: &ConcurrencyLimiter,
-    client_id: Arc<String>,
+    rt: RT,
+    limiter: ConcurrencyLimiter,
+    mut request: Request<RT>,
     permit_deadline: tokio::time::Instant,
-    response_closed: impl std::future::Future<Output = ()>,
-) -> ExternalPermitWaitOutcome {
-    let permit = tokio::select! {
+    dispatch_sojourn: Option<(IsolateQueueLane, Duration)>,
+) -> PendingExternalPermit<RT> {
+    let client_id = Arc::new(request.client_id.clone());
+    let active_javascript_class = request.active_javascript_class;
+    let outcome = tokio::select! {
         biased;
-        () = response_closed => return ExternalPermitWaitOutcome::CallerDropped,
+        () = request.response_closed() => ExternalPermitWaitOutcome::CallerDropped,
         () = rt.wait(
             permit_deadline.saturating_duration_since(rt.monotonic_now()),
-        ) => return ExternalPermitWaitOutcome::DeadlineElapsed,
-        permit = limiter.acquire(
+        ) => ExternalPermitWaitOutcome::DeadlineElapsed,
+        permit = limiter.acquire_with_class(
             client_id,
-            // Initial external requests stay in the low-priority
-            // active-JavaScript tier.
-            false,
-        ) => permit,
+            active_javascript_class,
+            ConcurrencyPermitPhase::Initial,
+        ) => {
+            // The timer precedes the permit so an ordinary readiness tie times
+            // out without registering capacity. Recheck absolute time after
+            // acquisition in case the clock advanced before wake delivery.
+            if rt.monotonic_now() >= permit_deadline {
+                ExternalPermitWaitOutcome::DeadlineElapsed
+            } else {
+                ExternalPermitWaitOutcome::Acquired(permit)
+            }
+        },
     };
-    // The timer precedes the permit so an ordinary readiness tie times out
-    // without registering capacity. Recheck absolute time after acquisition
-    // in case the clock advanced between branch polls or wake delivery lagged.
-    if rt.monotonic_now() >= permit_deadline {
-        ExternalPermitWaitOutcome::DeadlineElapsed
-    } else {
-        ExternalPermitWaitOutcome::Acquired(permit)
+    PendingExternalPermit {
+        request,
+        outcome,
+        dispatch_sojourn,
     }
 }
 
@@ -639,6 +656,70 @@ impl ActiveRequestCounts {
                 .expect("active independent action count underflow");
         }
     }
+
+    fn add_assign(&mut self, other: Self) {
+        self.total += other.total;
+        self.independent_actions += other.independent_actions;
+    }
+}
+
+fn active_javascript_class_index(class: ActiveJavascriptClass) -> usize {
+    match class {
+        ActiveJavascriptClass::Dependency => 0,
+        ActiveJavascriptClass::Protected => 1,
+        ActiveJavascriptClass::Degradable => 2,
+    }
+}
+
+fn pending_active_javascript_class_index(
+    class: ActiveJavascriptClass,
+    class_aware_admission_enabled: bool,
+) -> usize {
+    // The zero-minimum compatibility mode has one phase-only external wait,
+    // just as it did before service classes existed. Distinguish pending
+    // classes only when the active limiter will distinguish their grants.
+    let class = if class_aware_admission_enabled {
+        class
+    } else {
+        ActiveJavascriptClass::Protected
+    };
+    active_javascript_class_index(class)
+}
+
+struct PendingExternalPermit<RT: Runtime> {
+    request: Request<RT>,
+    outcome: ExternalPermitWaitOutcome,
+    dispatch_sojourn: Option<(IsolateQueueLane, Duration)>,
+}
+
+struct PendingInternalPermit<RT: Runtime> {
+    request: Request<RT>,
+    outcome: InternalPermitWaitOutcome,
+}
+
+async fn wait_for_internal_permit<RT: Runtime>(
+    limiter: ConcurrencyLimiter,
+    mut request: Request<RT>,
+) -> PendingInternalPermit<RT> {
+    let client_id = Arc::new(request.client_id.clone());
+    assert_eq!(
+        request.active_javascript_class,
+        ActiveJavascriptClass::Dependency,
+        "internal isolate callbacks must unblock an ancestor"
+    );
+    let outcome = tokio::select! {
+        biased;
+        () = request.response_closed() => InternalPermitWaitOutcome::CallerDropped,
+        permit = limiter.acquire_internal_dependency(client_id) => {
+            InternalPermitWaitOutcome::Acquired(permit)
+        },
+    };
+    PendingInternalPermit { request, outcome }
+}
+
+enum SchedulerDispatchOutcome {
+    Continue,
+    Shutdown,
 }
 
 struct ActiveRequestGuard {
@@ -755,6 +836,7 @@ impl SchedulerStateSnapshot {
             independent_action_cap: properties.is_isolate_action
                 && !properties.unblocks_ancestor
                 && self.active_counts.independent_actions >= self.max_independent_actions,
+            active_javascript_class_pending: false,
         }
     }
 
@@ -863,6 +945,7 @@ pub struct Request<RT: Runtime> {
     pub inner: RequestType<RT>,
     pub parent_trace: EncodedSpan,
     pub scheduler_dependency: SchedulerDependencyClass,
+    pub active_javascript_class: ActiveJavascriptClass,
 }
 
 impl<RT: Runtime> Request<RT> {
@@ -881,16 +964,49 @@ impl<RT: Runtime> Request<RT> {
         parent_trace: EncodedSpan,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> Self {
+        Self::new_with_active_javascript_class(
+            client_id,
+            inner,
+            parent_trace,
+            scheduler_dependency,
+            ActiveJavascriptClass::Protected,
+        )
+    }
+
+    pub fn new_with_active_javascript_class(
+        client_id: String,
+        inner: RequestType<RT>,
+        parent_trace: EncodedSpan,
+        scheduler_dependency: SchedulerDependencyClass,
+        active_javascript_class: ActiveJavascriptClass,
+    ) -> Self {
+        let active_javascript_class =
+            active_javascript_class.for_scheduler_dependency(scheduler_dependency);
         let request = Self {
             client_id,
             inner,
             parent_trace,
             scheduler_dependency,
+            active_javascript_class,
         };
         assert!(
             !request.inner.is_control_plane() || !request.scheduler_dependency.unblocks_ancestor(),
             "control-plane isolate requests must not unblock an ancestor"
         );
+        if request.active_javascript_class == ActiveJavascriptClass::Degradable {
+            let is_independent_root_query = matches!(
+                &request.inner,
+                RequestType::Udf { request, reactor_depth: 0, .. }
+                    if request.udf_type == UdfType::Query
+            ) && !request.scheduler_dependency.unblocks_ancestor();
+            #[cfg(test)]
+            let is_independent_root_query =
+                is_independent_root_query || matches!(&request.inner, RequestType::Test { .. });
+            assert!(
+                is_independent_root_query,
+                "only an independent admitted root query can use degradable active JavaScript"
+            );
+        }
         request
     }
 
@@ -967,6 +1083,7 @@ impl<RT: Runtime> Request<RT> {
             can_block_on_descendant,
             is_isolate_action,
             is_control_plane: control_plane_lane_enabled && self.inner.is_control_plane(),
+            active_javascript_class: self.active_javascript_class,
         }
     }
 }
@@ -1481,6 +1598,7 @@ impl<RT: Runtime> IsolateClient<RT> {
         function_started_sender: Option<oneshot::Sender<()>>,
         subfunctions_in_same_isolate: bool,
         scheduler_dependency: SchedulerDependencyClass,
+        active_javascript_class: ActiveJavascriptClass,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
         let (tx, rx) = oneshot::channel();
         let cancellation = CancellationSignal::new();
@@ -1507,11 +1625,12 @@ impl<RT: Runtime> IsolateClient<RT> {
                 Some(self.clone())
             },
         };
-        self.send_request(Request::new_with_scheduler_dependency(
+        self.send_request(Request::new_with_active_javascript_class(
             instance_name,
             request,
             EncodedSpan::from_parent(),
             scheduler_dependency,
+            active_javascript_class,
         ))?;
         let response = pin!(Self::receive_response(rx));
         // Declare this guard after the pinned response future so cancellation is
@@ -2065,6 +2184,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
     /// if at least one request is active for that client.
     in_progress_counts_by_client: HashMap<String, ActiveRequestCounts>,
     in_progress_counts: ActiveRequestCounts,
+    /// Worker-capacity reservations for external requests that left the queue
+    /// and are waiting for an initial active-JavaScript permit.
+    pending_permit_counts_by_client: HashMap<String, ActiveRequestCounts>,
+    pending_permit_counts: ActiveRequestCounts,
     /// Externally visible active-worker accounting. The worker request owns the
     /// corresponding guard so failure paths cannot leave this count stale.
     active_workers: Arc<AtomicUsize>,
@@ -2135,6 +2258,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             in_progress_workers: FuturesUnordered::new(),
             in_progress_counts_by_client: HashMap::new(),
             in_progress_counts: ActiveRequestCounts::default(),
+            pending_permit_counts_by_client: HashMap::new(),
+            pending_permit_counts: ActiveRequestCounts::default(),
             active_workers,
             available_workers: HashMap::new(),
             max_workers,
@@ -2189,14 +2314,46 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
     }
 
     fn state_snapshot(&self) -> SchedulerStateSnapshot {
+        let mut counts_by_client = self.in_progress_counts_by_client.clone();
+        for (client_id, pending) in &self.pending_permit_counts_by_client {
+            counts_by_client
+                .entry(client_id.clone())
+                .or_default()
+                .add_assign(*pending);
+        }
+        let mut active_counts = self.in_progress_counts;
+        active_counts.add_assign(self.pending_permit_counts);
         SchedulerStateSnapshot {
-            in_progress_counts_by_client: self.in_progress_counts_by_client.clone(),
-            active_counts: self.in_progress_counts,
+            in_progress_counts_by_client: counts_by_client,
+            active_counts,
             max_workers: self.max_workers,
             base_worker_capacity: self.base_worker_capacity,
             max_independent_actions: self.max_independent_actions,
             max_workers_per_client: self.max_workers_per_client,
             base_workers_per_client: self.base_workers_per_client,
+        }
+    }
+
+    fn reserve_pending_permit(&mut self, request: &Request<RT>) {
+        let properties = request.scheduling_properties(self.control_plane_lane_enabled);
+        self.pending_permit_counts.increment(properties);
+        self.pending_permit_counts_by_client
+            .entry(request.client_id.clone())
+            .or_default()
+            .increment(properties);
+    }
+
+    fn release_pending_permit(&mut self, request: &Request<RT>) {
+        let properties = request.scheduling_properties(self.control_plane_lane_enabled);
+        self.pending_permit_counts.decrement(properties);
+        let (client_id, mut counts) = self
+            .pending_permit_counts_by_client
+            .remove_entry(&request.client_id)
+            .expect("pending active-JavaScript request missing its client reservation");
+        counts.decrement(properties);
+        if !counts.is_empty() {
+            self.pending_permit_counts_by_client
+                .insert(client_id, counts);
         }
     }
 
@@ -2219,83 +2376,39 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
         );
         let mut report_stats = self.rt.wait(*HEAP_WORKER_REPORT_INTERVAL_SECONDS);
         let queue_metrics_reporter = receiver.metrics_reporter();
-        // Queue receipt is serialized through the active-permit wait below.
-        // Keep a non-consuming expiry companion live so other retained entries
-        // still honor their own absolute deadlines during that wait.
+        // Active-permit waits leave the queue, so the expiry companion continues
+        // to enforce deadlines for entries that remain queued.
         let mut external_expired_receiver = receiver.expired_receiver();
-        let limiter = self.worker.config().limiter.clone();
         let scheduler_state = Arc::new(Mutex::new(self.state_snapshot()));
         let control_plane_lane_enabled = self.control_plane_lane_enabled;
+        let class_aware_admission_enabled =
+            self.worker.config().limiter.class_aware_admission_enabled();
         let selection_state = scheduler_state.clone();
-        let pool_name = self.worker.config().name;
-        let external_rt = self.rt.clone();
-        let external_limiter = limiter.clone();
+        let pending_external_classes = Arc::new(Mutex::new([false; 3]));
+        let selection_pending_classes = pending_external_classes.clone();
         let external_request_stream = stream::unfold(receiver, move |mut receiver| {
             let selection_state = selection_state.clone();
+            let pending_classes = selection_pending_classes.clone();
             async move {
                 let output = receiver
                     .recv_next_selecting(|request| {
-                        selection_state.lock().request_eligibility(
-                            request.scheduling_properties(control_plane_lane_enabled),
-                            &request.client_id,
-                        )
+                        let properties = request.scheduling_properties(control_plane_lane_enabled);
+                        let mut eligibility = selection_state
+                            .lock()
+                            .request_eligibility(properties, &request.client_id);
+                        // Expose at most one initial waiter from each service
+                        // class to the active limiter. Without this fence, a
+                        // wave from one class can be removed from the queue and
+                        // hide demand from the other class behind permit waits.
+                        eligibility.active_javascript_class_pending = pending_classes.lock()
+                            [pending_active_javascript_class_index(
+                                properties.active_javascript_class,
+                                class_aware_admission_enabled,
+                            )];
+                        eligibility
                     })
                     .await?;
                 Some((output, receiver))
-            }
-        })
-        .filter_map(move |output| {
-            let limiter = external_limiter.clone();
-            let rt = external_rt.clone();
-            async move {
-                let IsolateQueueOutput {
-                    item: mut request,
-                    rejection,
-                    permit_deadline,
-                    dispatch_sojourn,
-                } = output;
-                let scheduling_properties =
-                    request.scheduling_properties(control_plane_lane_enabled);
-                if let Some(rejection) = rejection {
-                    reject_queued_request(
-                        request,
-                        rejection,
-                        pool_name,
-                        control_plane_lane_enabled,
-                    );
-                    return None;
-                }
-                if request.is_response_closed() {
-                    log_scheduler_caller_dropped(pool_name, scheduling_properties);
-                    return None;
-                }
-                let permit_deadline = permit_deadline
-                    .expect("non-rejected external request must retain its queue deadline");
-                let client_id = Arc::new(request.client_id.clone());
-                let permit = match wait_for_external_permit(
-                    &rt,
-                    &limiter,
-                    client_id,
-                    permit_deadline,
-                    request.response_closed(),
-                )
-                .await
-                {
-                    ExternalPermitWaitOutcome::Acquired(permit) => permit,
-                    ExternalPermitWaitOutcome::CallerDropped => {
-                        log_scheduler_caller_dropped(pool_name, scheduling_properties);
-                        return None;
-                    },
-                    ExternalPermitWaitOutcome::DeadlineElapsed => {
-                        metrics::log_scheduler_request_expired(
-                            pool_name,
-                            scheduling_properties.as_label(),
-                        );
-                        request.reject(RejectedBeforeExecutionReason::InitialPermitTimeout);
-                        return None;
-                    },
-                };
-                Some((request, permit, dispatch_sojourn))
             }
         });
         let internal_selection_state = scheduler_state.clone();
@@ -2332,28 +2445,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                     Poll::Pending => return Poll::Pending,
                 }
             }
-        })
-        .filter_map(move |mut request| {
-            let limiter = limiter.clone();
-            async move {
-                // Internal requests (for nested UDFs) get priority because they
-                // block workers. Upstream gives this permit wait no queue
-                // deadline because the nested UDF cannot be retried safely.
-                let client_id = request.client_id.clone();
-                let permit = tokio::select! {
-                    biased;
-                    () = request.response_closed() => return None,
-                    permit = limiter.acquire(client_id.into(), true) => permit,
-                };
-                Some((request, permit, None))
-            }
         });
-        let mut next_request_stream = pin!(stream::select_with_strategy(
-            internal_request_stream,
-            external_request_stream,
-            |&mut ()| PollNext::Left
-        ));
+        let mut internal_request_stream = pin!(internal_request_stream);
+        let mut external_request_stream = pin!(external_request_stream);
+        let mut pending_internal_permits = FuturesUnordered::new();
+        let mut pending_external_permits = FuturesUnordered::new();
         let expiration_selection_state = scheduler_state.clone();
+        let expiration_pending_classes = pending_external_classes.clone();
         let mut external_expiration_receiver_open = true;
         let mut report_queue_metrics = if queue_metrics_reporter.is_some() {
             Either::Left(self.rt.wait(ISOLATE_QUEUE_METRICS_LOG_FREQUENCY))
@@ -2362,8 +2460,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             // path; the opt-in policy must not add default scheduler wakeups.
             Either::Right(future::pending())
         };
+        let mut internal_request_stream_open = true;
+        let mut external_request_stream_open = true;
         loop {
             *scheduler_state.lock() = self.state_snapshot();
+            if !internal_request_stream_open
+                && !external_request_stream_open
+                && pending_internal_permits.is_empty()
+                && pending_external_permits.is_empty()
+                && self.in_progress_workers.is_empty()
+            {
+                return;
+            }
+            let has_pending_internal = !pending_internal_permits.is_empty();
+            let has_pending_external = !pending_external_permits.is_empty();
             tokio::select! {
                 biased;
                 completed_worker = self.in_progress_workers.next(),
@@ -2386,120 +2496,157 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                     report_queue_metrics =
                         Either::Left(self.rt.wait(ISOLATE_QUEUE_METRICS_LOG_FREQUENCY));
                 },
-                request = next_request_stream.next() => {
-                    let Some((request, permit, dispatch_sojourn)) = request else {
-                        tracing::warn!(
-                            "Request sender went away; {} scheduler shutting down",
-                            self.worker.config().name,
-                        );
-                        return;
+                pending = pending_internal_permits.next(), if has_pending_internal => {
+                    let Some(PendingInternalPermit { request, outcome }) = pending else {
+                        unreachable!("nonempty internal active-permit set ended")
                     };
-                    let scheduling_properties =
+                    self.release_pending_permit(&request);
+                    let properties =
                         request.scheduling_properties(self.control_plane_lane_enabled);
-                    if request.is_response_closed() {
-                        log_scheduler_caller_dropped(
+                    match outcome {
+                        InternalPermitWaitOutcome::Acquired(permit) => {
+                            if matches!(
+                                self.dispatch_request(request, permit, None),
+                                SchedulerDispatchOutcome::Shutdown
+                            ) {
+                                return;
+                            }
+                        },
+                        InternalPermitWaitOutcome::CallerDropped => {
+                            log_scheduler_caller_dropped(
+                                self.worker.config().name,
+                                properties,
+                            );
+                        },
+                    }
+                },
+                request = internal_request_stream.next(),
+                if internal_request_stream_open && !has_pending_internal => {
+                    let Some(request) = request else {
+                        internal_request_stream_open = false;
+                        continue;
+                    };
+                    // Keep one internal dependency visible to the active gate.
+                    // Its worker reservation prevents concurrent external
+                    // permit waits from consuming the slot needed to release
+                    // its isolate-holding ancestor.
+                    self.reserve_pending_permit(&request);
+                    pending_internal_permits.push(wait_for_internal_permit(
+                        self.worker.config().limiter.clone(),
+                        request,
+                    ));
+                },
+                pending = pending_external_permits.next(), if has_pending_external => {
+                    let Some(PendingExternalPermit {
+                        request,
+                        outcome,
+                        dispatch_sojourn,
+                    }) = pending else {
+                        unreachable!("nonempty external active-permit set ended")
+                    };
+                    self.release_pending_permit(&request);
+                    let properties =
+                        request.scheduling_properties(self.control_plane_lane_enabled);
+                    let class_index = pending_active_javascript_class_index(
+                        properties.active_javascript_class,
+                        class_aware_admission_enabled,
+                    );
+                    let was_pending = mem::replace(
+                        &mut pending_external_classes.lock()[class_index],
+                        false,
+                    );
+                    assert!(was_pending, "external active-JavaScript class was not pending");
+                    match outcome {
+                        ExternalPermitWaitOutcome::Acquired(permit) => {
+                            if matches!(
+                                self.dispatch_request(request, permit, dispatch_sojourn),
+                                SchedulerDispatchOutcome::Shutdown
+                            ) {
+                                return;
+                            }
+                        },
+                        ExternalPermitWaitOutcome::CallerDropped => {
+                            log_scheduler_caller_dropped(
+                                self.worker.config().name,
+                                properties,
+                            );
+                        },
+                        ExternalPermitWaitOutcome::DeadlineElapsed => {
+                            metrics::log_scheduler_request_expired(
+                                self.worker.config().name,
+                                properties.as_label(),
+                            );
+                            request.reject(RejectedBeforeExecutionReason::InitialPermitTimeout);
+                        },
+                    }
+                },
+                output = external_request_stream.next(), if external_request_stream_open => {
+                    let Some(IsolateQueueOutput {
+                        item: request,
+                        rejection,
+                        permit_deadline,
+                        dispatch_sojourn,
+                    }) = output else {
+                        external_request_stream_open = false;
+                        continue;
+                    };
+                    let properties =
+                        request.scheduling_properties(self.control_plane_lane_enabled);
+                    if let Some(rejection) = rejection {
+                        reject_queued_request(
+                            request,
+                            rejection,
                             self.worker.config().name,
-                            scheduling_properties,
+                            self.control_plane_lane_enabled,
                         );
                         continue;
                     }
-                    let dispatch_state = self.state_snapshot();
-                    let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
-                        && dispatch_state.dependency_dispatch_uses_reserve();
-                    let WorkerSelection {
-                        worker_id,
-                        context_affinity,
-                    } = match self.get_worker(&request, &dispatch_state) {
-                        Ok(selection) => selection,
-                        Err(reason) => {
-                            metrics::log_scheduler_request_rejected(
-                                self.worker.config().name,
-                                scheduling_properties.as_label(),
-                                "no_worker",
-                            );
-                            request.reject(reason);
-                            continue;
-                        },
-                    };
-                    let (done_sender, done_receiver) = oneshot::channel();
-                    let client_id = request.client_id.clone();
-                    let st = ActiveWorkerState {
-                        client_id: client_id.clone(),
-                        worker_id,
-                        scheduling_properties,
-                    };
-                    let active_request_guard = ActiveRequestGuard::new(
-                        self.active_workers.clone(),
-                        self.worker.config().name,
-                        scheduling_properties,
+                    if request.is_response_closed() {
+                        log_scheduler_caller_dropped(self.worker.config().name, properties);
+                        continue;
+                    }
+                    let permit_deadline = permit_deadline
+                        .expect("non-rejected external request must retain its queue deadline");
+                    let class_index = pending_active_javascript_class_index(
+                        properties.active_javascript_class,
+                        class_aware_admission_enabled,
                     );
-                    if self.worker_senders[worker_id]
-                        .try_send(IsolateWorkerRequest {
-                            request,
-                            permit,
-                            done: done_sender,
-                            active_request_guard,
-                        })
-                        .is_err()
-                    {
-                        // Available worker should have an empty channel, so if we fail
-                        // here it must be shut down. We should shut down too.
-                        tracing::warn!(
-                            "Worker died or dropped channel. Shutting down {} scheduler.",
-                            self.worker.config().name
-                        );
-                        return;
-                    }
-                    if let Some((context_kind, outcome)) = context_affinity {
-                        metrics::log_scheduler_context_affinity(
-                            self.worker.config().name,
-                            context_kind,
-                            outcome,
-                        );
-                    }
-                    if let Some((lane, sojourn)) = dispatch_sojourn {
-                        metrics::log_isolate_queue_sojourn(
-                            self.worker.config().name,
-                            lane.as_label(),
-                            sojourn,
-                        );
-                    }
-                    // Record scheduler-owned state only after the worker
-                    // accepted the request. The worker message owns externally
-                    // visible active accounting and clears it on every drop path.
-                    self.in_progress_workers
-                        .push(future::join(done_receiver, future::ready(st)));
-                    let entry = self
-                        .in_progress_counts_by_client
-                        .entry(client_id.clone())
-                        .or_default();
-                    entry.increment(scheduling_properties);
-                    let client_running_count = entry.total;
-                    self.in_progress_counts.increment(scheduling_properties);
-                    log_pool_running_count(
-                        self.worker.config().name,
-                        client_running_count,
-                        &client_id,
+                    let mut pending_classes = pending_external_classes.lock();
+                    assert!(
+                        !pending_classes[class_index],
+                        "selected a second external active-JavaScript waiter for one class"
                     );
-                    metrics::log_scheduler_request_dispatched(
-                        self.worker.config().name,
-                        scheduling_properties.as_label(),
-                    );
-                    if dependency_reserve_dispatch {
-                        metrics::log_scheduler_dependency_reserve_dispatch(
-                            self.worker.config().name,
-                        );
-                    }
+                    pending_classes[class_index] = true;
+                    drop(pending_classes);
+                    // Reserve worker eligibility while this request waits for
+                    // CPU admission. The reservation prevents another class's
+                    // concurrent permit wait from overcommitting the worker or
+                    // per-client limits before either request is dispatched.
+                    self.reserve_pending_permit(&request);
+                    pending_external_permits.push(wait_for_external_permit(
+                        self.rt.clone(),
+                        self.worker.config().limiter.clone(),
+                        request,
+                        permit_deadline,
+                        dispatch_sojourn,
+                    ));
                 },
                 // Preserve the established internal-ingress priority instead
                 // of draining a bounded batch of expired external entries
                 // ahead of a ready nested callback. The consuming external
                 // receiver itself still checks hard expiry before selection.
                 expired = external_expired_receiver.recv_next_expired(|request| {
-                    expiration_selection_state.lock().request_eligibility(
-                        request.scheduling_properties(control_plane_lane_enabled),
+                    let properties = request.scheduling_properties(control_plane_lane_enabled);
+                    let mut eligibility = expiration_selection_state.lock().request_eligibility(
+                        properties,
                         &request.client_id,
-                    )
+                    );
+                    eligibility.active_javascript_class_pending = expiration_pending_classes.lock()
+                        [pending_active_javascript_class_index(
+                            properties.active_javascript_class,
+                            class_aware_admission_enabled,
+                        )];
+                    eligibility
                 }), if external_expiration_receiver_open => {
                     match expired {
                         Some(IsolateQueueOutput {
@@ -2533,6 +2680,97 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                 },
             }
         }
+    }
+
+    fn dispatch_request(
+        &mut self,
+        request: Request<RT>,
+        permit: ConcurrencyPermit,
+        dispatch_sojourn: Option<(IsolateQueueLane, Duration)>,
+    ) -> SchedulerDispatchOutcome {
+        let scheduling_properties = request.scheduling_properties(self.control_plane_lane_enabled);
+        if request.is_response_closed() {
+            log_scheduler_caller_dropped(self.worker.config().name, scheduling_properties);
+            return SchedulerDispatchOutcome::Continue;
+        }
+        let dispatch_state = self.state_snapshot();
+        let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
+            && dispatch_state.dependency_dispatch_uses_reserve();
+        let WorkerSelection {
+            worker_id,
+            context_affinity,
+        } = match self.get_worker(&request, &dispatch_state) {
+            Ok(selection) => selection,
+            Err(reason) => {
+                metrics::log_scheduler_request_rejected(
+                    self.worker.config().name,
+                    scheduling_properties.as_label(),
+                    "no_worker",
+                );
+                request.reject(reason);
+                return SchedulerDispatchOutcome::Continue;
+            },
+        };
+        let (done_sender, done_receiver) = oneshot::channel();
+        let client_id = request.client_id.clone();
+        let st = ActiveWorkerState {
+            client_id: client_id.clone(),
+            worker_id,
+            scheduling_properties,
+        };
+        let active_request_guard = ActiveRequestGuard::new(
+            self.active_workers.clone(),
+            self.worker.config().name,
+            scheduling_properties,
+        );
+        if self.worker_senders[worker_id]
+            .try_send(IsolateWorkerRequest {
+                request,
+                permit,
+                done: done_sender,
+                active_request_guard,
+            })
+            .is_err()
+        {
+            // An available worker has an empty channel, so failure means that
+            // worker has shut down and the scheduler cannot continue safely.
+            tracing::warn!(
+                "Worker died or dropped channel. Shutting down {} scheduler.",
+                self.worker.config().name
+            );
+            return SchedulerDispatchOutcome::Shutdown;
+        }
+        if let Some((context_kind, outcome)) = context_affinity {
+            metrics::log_scheduler_context_affinity(
+                self.worker.config().name,
+                context_kind,
+                outcome,
+            );
+        }
+        if let Some((lane, sojourn)) = dispatch_sojourn {
+            metrics::log_isolate_queue_sojourn(self.worker.config().name, lane.as_label(), sojourn);
+        }
+        // Record scheduler-owned state only after the worker accepted the
+        // request. The worker message owns externally visible active accounting
+        // and clears the count on every drop path.
+        self.in_progress_workers
+            .push(future::join(done_receiver, future::ready(st)));
+        let entry = self
+            .in_progress_counts_by_client
+            .entry(client_id.clone())
+            .or_default();
+        entry.increment(scheduling_properties);
+        let client_running_count = entry.total;
+        self.in_progress_counts.increment(scheduling_properties);
+        log_pool_running_count(self.worker.config().name, client_running_count, &client_id);
+        metrics::log_scheduler_request_dispatched(
+            self.worker.config().name,
+            scheduling_properties.as_label(),
+        );
+        if dependency_reserve_dispatch {
+            metrics::log_scheduler_dependency_reserve_dispatch(self.worker.config().name);
+        }
+        SchedulerDispatchOutcome::Continue
     }
 
     /// Find a worker for the request's client.
@@ -2913,6 +3151,7 @@ mod tests {
             UnixTimestamp,
         },
         types::{
+            ActiveJavascriptClass,
             ModuleEnvironment,
             SchedulerDependencyClass,
         },
@@ -2941,6 +3180,7 @@ mod tests {
         ActiveRequestCounts,
 		CancelExecutionOnDrop,
         CancellationSignal,
+        ConcurrencyPermitPhase,
         ExternalPermitWaitOutcome,
         IdleWorkerInfo,
         IdleWorkerState,
@@ -2948,6 +3188,7 @@ mod tests {
         IsolateWorker,
         IsolateWorkerHandle,
         IsolateWorkerRequest,
+        PendingExternalPermit,
         Request,
         RequestSchedulingProperties,
         RequestType,
@@ -3117,6 +3358,7 @@ mod tests {
     enum TestRequestKind {
         Dependency,
         DependencyHolder,
+        Degradable,
         Independent,
         Action,
         ControlPlane,
@@ -3194,10 +3436,21 @@ mod tests {
                 )
             },
             TestRequestKind::Independent
+            | TestRequestKind::Degradable
             | TestRequestKind::Action
             | TestRequestKind::ControlPlane
             | TestRequestKind::WorkerFailure => {
-                Request::new("deployment".to_string(), inner, EncodedSpan::empty())
+                if matches!(kind, TestRequestKind::Degradable) {
+                    Request::new_with_active_javascript_class(
+                        "deployment".to_string(),
+                        inner,
+                        EncodedSpan::empty(),
+                        SchedulerDependencyClass::Independent,
+                        ActiveJavascriptClass::Degradable,
+                    )
+                } else {
+                    Request::new("deployment".to_string(), inner, EncodedSpan::empty())
+                }
             },
         };
         PendingTestRequest {
@@ -3527,6 +3780,11 @@ mod tests {
             can_block_on_descendant,
             is_isolate_action,
             is_control_plane: false,
+            active_javascript_class: if unblocks_ancestor {
+                ActiveJavascriptClass::Dependency
+            } else {
+                ActiveJavascriptClass::Protected
+            },
         }
     }
 
@@ -3696,12 +3954,18 @@ mod tests {
                 let limiter = ConcurrencyLimiter::new(1);
                 let held = limiter.acquire(Arc::new("active".to_owned()), false).await;
                 let deadline = clock.monotonic_now() + Duration::from_secs(60);
+                let (started, _started_receiver) = mpsc::unbounded_channel();
+                let PendingTestRequest {
+                    request,
+                    completion: _completion,
+                    response: _response,
+                } = test_request(1, TestRequestKind::Independent, started);
                 let mut wait = Box::pin(wait_for_external_permit(
-                    &clock,
-                    &limiter,
-                    Arc::new("waiting".to_owned()),
+                    clock.clone(),
+                    limiter.clone(),
+                    request,
                     deadline,
-                    futures::future::pending(),
+                    None,
                 ));
                 assert!(futures::poll!(wait.as_mut()).is_pending());
 
@@ -3709,7 +3973,10 @@ mod tests {
                 drop(held);
                 assert!(matches!(
                     futures::poll!(wait.as_mut()),
-                    std::task::Poll::Ready(ExternalPermitWaitOutcome::DeadlineElapsed)
+                    std::task::Poll::Ready(PendingExternalPermit {
+                        outcome: ExternalPermitWaitOutcome::DeadlineElapsed,
+                        ..
+                    })
                 ));
                 assert_eq!(limiter.active_permits(), 0);
             });
@@ -3727,6 +3994,7 @@ mod tests {
             can_block_on_descendant: false,
             is_isolate_action: false,
             is_control_plane: true,
+            active_javascript_class: ActiveJavascriptClass::Protected,
         };
         assert_eq!(control_plane.queue_lane(), IsolateQueueLane::ControlPlane);
         assert!(!state.can_start_request(control_plane, "deployment"));
@@ -4172,6 +4440,172 @@ mod tests {
             harness.shutdown().await;
             assert_eq!(limiter.active_permits(), 0);
         });
+    }
+
+    #[test]
+    fn scheduler_preserves_one_external_permit_wait_without_class_minimums() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("scheduler_phase_only_permit_wait_test", async move {
+            let limiter = ConcurrencyLimiter::new(1);
+            let held = limiter.acquire(Arc::new("held".to_owned()), false).await;
+            let mut harness = SchedulerHarness::new(scheduler_rt, 2, 2, 2, 100, 64);
+            harness.set_concurrency_limiter(limiter.clone());
+            let degradable = harness.enqueue_test(1, TestRequestKind::Degradable);
+            let protected = harness.enqueue_test(2, TestRequestKind::Independent);
+            harness.start();
+
+            tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, async {
+                while limiter.waiting_permits(
+                    ActiveJavascriptClass::Protected,
+                    ConcurrencyPermitPhase::Initial,
+                ) != 1
+                {
+                    tokio::task::yield_now().await;
+                }
+                // Let the scheduler poll the second request after establishing
+                // the first wait. Compatibility mode must leave it queued.
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("scheduler did not establish the phase-only permit wait");
+            assert_eq!(
+                limiter.waiting_permits(
+                    ActiveJavascriptClass::Protected,
+                    ConcurrencyPermitPhase::Initial,
+                ),
+                1
+            );
+            assert_eq!(
+                limiter.waiting_permits(
+                    ActiveJavascriptClass::Degradable,
+                    ConcurrencyPermitPhase::Initial,
+                ),
+                0
+            );
+
+            drop(held);
+            assert_eq!(harness.next_started().await, 1);
+            degradable.complete().await;
+            assert_eq!(harness.next_started().await, 2);
+            protected.complete().await;
+            harness.shutdown().await;
+            assert_eq!(limiter.active_permits(), 0);
+        });
+    }
+
+    #[test]
+    fn scheduler_exposes_initial_demand_from_both_active_classes() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("scheduler_active_class_demand_test", async move {
+            let limiter = ConcurrencyLimiter::new_with_class_minimums(2, 1, 1);
+            let protected_held = limiter
+                .acquire_with_class(
+                    Arc::new("protected-held".to_owned()),
+                    ActiveJavascriptClass::Protected,
+                    ConcurrencyPermitPhase::Initial,
+                )
+                .await;
+            let degradable_held = limiter
+                .acquire_with_class(
+                    Arc::new("degradable-held".to_owned()),
+                    ActiveJavascriptClass::Degradable,
+                    ConcurrencyPermitPhase::Initial,
+                )
+                .await;
+            let mut harness = SchedulerHarness::new(scheduler_rt, 2, 2, 2, 100, 64);
+            harness.set_concurrency_limiter(limiter.clone());
+            let degradable = harness.enqueue_test(1, TestRequestKind::Degradable);
+            let protected = harness.enqueue_test(2, TestRequestKind::Independent);
+            harness.start();
+
+            tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, async {
+                loop {
+                    if limiter.waiting_permits(
+                        ActiveJavascriptClass::Degradable,
+                        ConcurrencyPermitPhase::Initial,
+                    ) == 1
+                        && limiter.waiting_permits(
+                            ActiveJavascriptClass::Protected,
+                            ConcurrencyPermitPhase::Initial,
+                        ) == 1
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("scheduler hid one active class behind the other permit wait");
+
+            drop(protected_held);
+            drop(degradable_held);
+            let mut started = [harness.next_started().await, harness.next_started().await];
+            started.sort();
+            assert_eq!(started, [1, 2]);
+            degradable.complete().await;
+            protected.complete().await;
+            harness.shutdown().await;
+            assert_eq!(limiter.active_permits(), 0);
+        });
+    }
+
+    #[test]
+    fn pending_permit_reservations_apply_worker_and_client_limits() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt);
+
+        let mut global_harness = SchedulerHarness::new(scheduler_rt.clone(), 1, 1, 1, 100, 4);
+        let PendingTestRequest {
+            request: global_pending,
+            ..
+        } = test_request(
+            1,
+            TestRequestKind::Degradable,
+            global_harness.started_sender.clone(),
+        );
+        let global_scheduler = &mut global_harness
+            .pending_scheduler
+            .as_mut()
+            .expect("test scheduler must not be started")
+            .1;
+        global_scheduler.reserve_pending_permit(&global_pending);
+        let global_state = global_scheduler.state_snapshot();
+        let candidate = properties(false, false, false);
+        assert!(
+            global_state
+                .request_eligibility(candidate, "another_deployment")
+                .physical_total
+        );
+        global_scheduler.release_pending_permit(&global_pending);
+
+        let mut client_harness = SchedulerHarness::new(scheduler_rt, 2, 2, 2, 50, 4);
+        let PendingTestRequest {
+            request: client_pending,
+            ..
+        } = test_request(
+            2,
+            TestRequestKind::Degradable,
+            client_harness.started_sender.clone(),
+        );
+        let client_scheduler = &mut client_harness
+            .pending_scheduler
+            .as_mut()
+            .expect("test scheduler must not be started")
+            .1;
+        client_scheduler.reserve_pending_permit(&client_pending);
+        let client_state = client_scheduler.state_snapshot();
+        let client_eligibility =
+            client_state.request_eligibility(candidate, &client_pending.client_id);
+        assert!(!client_eligibility.physical_total);
+        assert!(client_eligibility.per_client_total);
+        client_scheduler.release_pending_permit(&client_pending);
     }
 
     #[test]

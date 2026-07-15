@@ -7,13 +7,17 @@ query, mutation, or child action it awaits cannot obtain one. It propagates ance
 ownership through the application, function-runner, V8, and Node boundaries and gives only that
 dependency work bounded overflow above shared application, queue, and worker capacity.
 
-The patch also adds a separate cap for independent V8 and HTTP action shells. It does not give
-dependencies unconditional priority while shared capacity is available, reserve CPU execution
-permits, or guarantee arbitrary recursive fan-out.
+The patch also adds a separate cap for independent V8 and HTTP action shells. At application,
+queue, and worker gates it does not give dependencies unconditional priority while shared capacity
+is available, reserve CPU execution permits, or guarantee arbitrary recursive fan-out. The
+degradable-query integration gives dependency work the next grant at the already-finite
+active-JavaScript gate when its service floors are enabled because that grant releases an
+isolate-holding ancestor.
 
 Upstream now has a distinct internal path for direct nested UDF callbacks. Those requests bypass
-CoDel, are selected before external queued requests, and acquire active-JavaScript permits at high
-priority. This patch keeps that upstream path intact. Its bounded `Q + R` CoDel admission remains
+CoDel and are selected before external queued requests. The active-JavaScript integration
+classifies them as dependencies. This patch keeps that upstream path intact. Its bounded `Q + R`
+CoDel admission remains
 necessary for dependencies that arrive through external boundaries, especially Node/action
 callback chains. Both paths dispatch into the same physical worker total and dependency reserve;
 neither path creates a second worker pool or extra active-JavaScript permits.
@@ -102,8 +106,8 @@ but it preserves the ancestor-release contract and is counted separately.
 The scheduler has two ingress paths with intentionally different waiting semantics:
 
 - Direct nested UDF callbacks use upstream's internal unbounded channel. The scheduler polls this
-  path before the external stream, it has no CoDel expiry, and it acquires the existing
-  active-JavaScript permit in upstream's high-priority mode before worker assignment. Its local
+  path before the external stream, it has no CoDel expiry, and it acquires a dependency-class
+  active-JavaScript permit before worker assignment. Its local
   buffer discards closed callers and selects the oldest request eligible in the current worker
   snapshot, so an older callback at one client's total cannot hide an eligible callback for
   another client.
@@ -120,20 +124,21 @@ per-client accounting before another dispatch decision. External dependencies do
 eligible external work below shared base capacity; they become the only externally eligible class
 when the shared base is full.
 
-`FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate active-JavaScript permit gate. Upstream now
-acquires that permit before worker assignment. Its two-tier limiter has one fixed permit total:
-direct internal nested transactional functions and all permit reacquisitions wait at high priority,
-while initial external root and action requests wait at low priority. The tiers change notification
-order but do not reserve or add active-JavaScript capacity. A dependency can be eligible for the
-worker reserve and still wait for an active permit or CPU. Initial external root and action permit
-waits remain bounded by the request's original queue deadline: the applicable CoDel expiration or
-lane hard deadline. Direct separately scheduled nested transactional functions do not use that
-external deadline because they cannot be retried safely. Both ingress paths cancel an outstanding
-permit acquisition when response-channel closure shows that the caller has disappeared; dropping
-that acquisition uses the limiter's cancellation-safe notification handoff and cannot leak a
-permit. While one selected external request waits for its permit, a non-consuming queue expiry
-companion continues enforcing every other retained entry's own deadline without another enqueue or
-worker completion.
+`FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate active-JavaScript permit gate with one fixed
+total. With the degradable-query patch applied, dependency work receives the next available grant,
+protected and degradable application work use work-conserving service floors, and resumptions
+precede initial starts within the selected class. The floors reserve no idle permits and add no
+capacity. A dependency can be eligible for worker overflow and still wait for an active permit or
+CPU behind non-preemptible JavaScript that already holds the finite gate.
+
+Initial external permit waits remain bounded by the request's original queue deadline: the
+applicable CoDel expiration or lane hard deadline. Direct separately scheduled nested transactional
+functions do not use that external deadline because they cannot be retried safely. Both ingress
+paths cancel an outstanding permit acquisition when response-channel closure shows that the caller
+has disappeared; dropping that acquisition uses cancellation-safe grant handoff and cannot leak a
+permit. The scheduler exposes one external waiter per active class and one internal dependency
+waiter, reserving worker eligibility for each exposed request. A non-consuming queue expiry
+companion continues enforcing every retained entry's deadline.
 
 Scheduler dependency ownership and active-permit priority intentionally differ at resource
 boundaries. A transactional descendant that retains an isolate-holding ancestor is eligible for
@@ -152,6 +157,11 @@ The self-hosted Compose template passes through:
 - `MAX_ISOLATE_ACTION_WORKERS` (default `0`, meaning derive from shared base);
 - `ISOLATE_QUEUE_SIZE` (default `2000`, for the external CoDel base);
 - `FUNRUN_ISOLATE_ACTIVE_THREADS` (default `0`, meaning unlimited).
+
+The optional `FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN` and
+`FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN` settings belong to the degradable-query integration.
+They redistribute the finite active total without changing `T`, `B`, or `R`; see
+[`degradable_reactive_queries/active_javascript_admission.md`](../degradable_reactive_queries/active_javascript_admission.md).
 
 Isolate capacities use strict parsing. `T` and `Q` must be positive, `R` must be smaller than `T`,
 `Q + R` must fit in `usize`, and an explicit independent-action cap cannot exceed `B`. Invalid
@@ -275,6 +285,7 @@ deployment operations. A synthetic stress fixture is not required.
 - Increasing queue depth retains more stale work without increasing service rate.
 - Treating a client or module marker as dependency status lets untrusted or application-owned
   metadata consume a liveness reserve.
-- Reserving active-JavaScript permits can oversubscribe CPU and move the wait below assignment.
+- Adding active-JavaScript overflow can oversubscribe CPU and move the wait below assignment.
+  Work-conserving service floors within the existing finite total avoid that failure mode.
 - Unlimited dependency admission cannot be made safe because recursive depth, fan-out, memory, and
   CPU remain finite.

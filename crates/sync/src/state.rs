@@ -1,5 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     hash::Hash,
     mem,
     sync::Arc,
@@ -144,6 +147,14 @@ pub struct SyncState {
     queries: BTreeMap<QueryId, SyncedQuery>,
     /// Queries being computed for the next transition.
     in_progress_queries: BTreeMap<QueryId, Query>,
+    /// Queries deliberately left without a subscription until a later retry.
+    /// This includes both ordinary feature unavailability and degradable
+    /// admission deferrals.
+    deferred_queries: BTreeSet<QueryId>,
+    /// The subset of `deferred_queries` deferred specifically by degradable
+    /// admission. This is the only selector for pressure retries and lifecycle
+    /// pending counts.
+    degradable_queries: BTreeSet<QueryId>,
 
     // If this is true, it means we have invalidated but have not yet refilled
     // some query subscription. `next_invalidated_query` blocks forever until
@@ -171,6 +182,8 @@ impl SyncState {
             invalidation_futures: FuturesUnordered::new(),
             queries: BTreeMap::new(),
             in_progress_queries: BTreeMap::new(),
+            deferred_queries: BTreeSet::new(),
+            degradable_queries: BTreeSet::new(),
             identity: Identity::Unknown(None),
             auth_token: AuthenticationToken::None,
 
@@ -212,11 +225,27 @@ impl SyncState {
 
     /// Check that all queries have a subscription and token.
     pub fn validate(&self) -> anyhow::Result<()> {
-        for query in self.queries.values() {
+        for (query_id, query) in &self.queries {
             anyhow::ensure!(query.result_hash.is_some());
-            anyhow::ensure!(self.refill_needed || query.subscription.is_some());
-            anyhow::ensure!(self.refill_needed || query.invalidation_future.is_some());
+            if self.deferred_queries.contains(query_id) {
+                anyhow::ensure!(query.subscription.is_none());
+                anyhow::ensure!(query.invalidation_future.is_none());
+            } else {
+                anyhow::ensure!(self.refill_needed || query.subscription.is_some());
+                anyhow::ensure!(self.refill_needed || query.invalidation_future.is_some());
+            }
         }
+        for query_id in &self.deferred_queries {
+            anyhow::ensure!(
+                self.queries.contains_key(query_id)
+                    || self.in_progress_queries.contains_key(query_id),
+                "Deferred query is not in the query set: {query_id}"
+            );
+        }
+        anyhow::ensure!(
+            self.degradable_queries.is_subset(&self.deferred_queries),
+            "Degradable query set is not a subset of deferred queries"
+        );
         Ok(())
     }
 
@@ -347,6 +376,8 @@ impl SyncState {
 
     /// Remove a query from the query set.
     pub fn remove(&mut self, query_id: QueryId) -> anyhow::Result<()> {
+        self.deferred_queries.remove(&query_id);
+        self.degradable_queries.remove(&query_id);
         if let Some(mut query) = self.queries.remove(&query_id) {
             if let Some(handle) = query.invalidation_future.take() {
                 handle.abort();
@@ -390,6 +421,37 @@ impl SyncState {
             }))
     }
 
+    pub fn degradable_fetches(&self) -> impl Iterator<Item = QueryToFetch> + '_ {
+        self.degradable_queries.iter().map(|query_id| {
+            if let Some(query) = self.queries.get(query_id) {
+                QueryToFetch {
+                    query: query.query.clone(),
+                    has_run_before: query.result_hash.is_some(),
+                }
+            } else {
+                QueryToFetch {
+                    query: self
+                        .in_progress_queries
+                        .get(query_id)
+                        .cloned()
+                        .expect("validated deferred query is missing from the query set"),
+                    has_run_before: false,
+                }
+            }
+        })
+    }
+
+    pub fn degradable_query_count(&self) -> usize {
+        self.degradable_queries.len()
+    }
+
+    pub fn has_feature_unavailable_fetches(&self) -> bool {
+        self.deferred_queries
+            .difference(&self.degradable_queries)
+            .next()
+            .is_some()
+    }
+
     pub fn refill_subscription(
         &mut self,
         query_id: QueryId,
@@ -407,6 +469,47 @@ impl SyncState {
             "Refilling subscription for query with no result"
         );
         query.subscription = Some(subscription);
+        self.deferred_queries.remove(&query_id);
+        self.degradable_queries.remove(&query_id);
+        Ok(())
+    }
+
+    fn mark_fetch_deferred(&mut self, query_id: QueryId) -> anyhow::Result<()> {
+        if !self.in_progress_queries.contains_key(&query_id) {
+            let query = self
+                .queries
+                .get_mut(&query_id)
+                .ok_or_else(|| anyhow::anyhow!("Nonexistent query ID: {}", query_id))?;
+            anyhow::ensure!(
+                query.subscription.is_none(),
+                "Deferred query still has a subscription"
+            );
+            anyhow::ensure!(
+                query.result_hash.is_some(),
+                "Deferred existing query has no previous result"
+            );
+            if let Some(handle) = query.invalidation_future.take() {
+                handle.abort();
+            }
+        }
+        self.deferred_queries.insert(query_id);
+        Ok(())
+    }
+
+    /// Preserve an existing result, if any, and include this query in the
+    /// backend-owned degradable pressure set.
+    pub fn defer_degradable_fetch(&mut self, query_id: QueryId) -> anyhow::Result<()> {
+        self.mark_fetch_deferred(query_id)?;
+        self.degradable_queries.insert(query_id);
+        Ok(())
+    }
+
+    /// Keep the query pending on the existing feature-unavailable retry path.
+    /// A pressure retry can discover this state after an earlier degradable
+    /// deferral, so it must also remove the query from the pressure set.
+    pub fn defer_feature_unavailable_fetch(&mut self, query_id: QueryId) -> anyhow::Result<()> {
+        self.mark_fetch_deferred(query_id)?;
+        self.degradable_queries.remove(&query_id);
         Ok(())
     }
 
@@ -457,6 +560,8 @@ impl SyncState {
 
         query.result_hash = Some(new_hash);
         query.subscription = Some(subscription);
+        self.deferred_queries.remove(&query_id);
+        self.degradable_queries.remove(&query_id);
 
         let result = if same_result {
             None
@@ -490,6 +595,10 @@ impl SyncState {
 
         for (&query_id, sq) in &mut self.queries {
             if sq.invalidation_future.is_some() {
+                continue;
+            }
+            if self.deferred_queries.contains(&query_id) {
+                anyhow::ensure!(sq.subscription.is_none());
                 continue;
             }
             let future = sq
@@ -554,5 +663,171 @@ fn hash_log_lines(hasher: &mut Sha256, log_lines: &RedactedLogLines) {
         // prefix but has a different length.
         hasher.update(&line.len().to_le_bytes());
         hasher.update(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sync_types::{
+        types::SerializedArgs,
+        Query,
+        UdfPath,
+    };
+
+    use super::*;
+
+    fn query(query_id: u32) -> Query {
+        Query {
+            query_id: QueryId::new(query_id),
+            udf_path: "test:default".parse::<UdfPath>().unwrap(),
+            args: SerializedArgs::from_args(vec![]).unwrap(),
+            journal: None,
+            component_path: None,
+        }
+    }
+
+    #[test]
+    fn deferral_preserves_previous_result_and_removal_stops_fetch() -> anyhow::Result<()> {
+        let mut state = SyncState::new(0);
+        let query = query(1);
+        let previous_result = JsonPackedValue::from_network("null".to_owned())?;
+        let previous_hash = hash_result(&Ok(previous_result), &RedactedLogLines::empty());
+        state.queries.insert(
+            query.query_id,
+            SyncedQuery {
+                query: query.clone(),
+                subscription: None,
+                result_hash: Some(previous_hash.clone()),
+                invalidation_future: None,
+            },
+        );
+        state.refill_needed = true;
+
+        state.defer_degradable_fetch(query.query_id)?;
+        let deferred = state.queries.get(&query.query_id).unwrap();
+        assert_eq!(deferred.result_hash.as_ref(), Some(&previous_hash));
+        assert!(state.deferred_queries.contains(&query.query_id));
+        assert!(state.degradable_queries.contains(&query.query_id));
+        assert!(deferred.subscription.is_none());
+        assert!(deferred.invalidation_future.is_none());
+        assert_eq!(
+            state
+                .need_fetch()
+                .map(|to_fetch| to_fetch.query)
+                .collect::<Vec<_>>(),
+            vec![query.clone()]
+        );
+        assert_eq!(
+            state
+                .degradable_fetches()
+                .map(|to_fetch| to_fetch.query)
+                .collect::<Vec<_>>(),
+            vec![query.clone()]
+        );
+        assert_eq!(state.degradable_query_count(), 1);
+
+        state.fill_invalidation_futures()?;
+        state.validate()?;
+        state.remove(query.query_id)?;
+        assert!(state.need_fetch().next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn new_deferred_query_stays_pending_until_removed() -> anyhow::Result<()> {
+        let mut state = SyncState::new(0);
+        let deferred_query = query(2);
+        let unrelated_pending = query(3);
+        state.insert(deferred_query.clone())?;
+        state.insert(unrelated_pending.clone())?;
+        state.defer_degradable_fetch(deferred_query.query_id)?;
+        assert_eq!(
+            state
+                .need_fetch()
+                .map(|to_fetch| to_fetch.query)
+                .collect::<Vec<_>>(),
+            vec![deferred_query.clone(), unrelated_pending.clone()]
+        );
+        assert_eq!(
+            state
+                .degradable_fetches()
+                .map(|to_fetch| to_fetch.query)
+                .collect::<Vec<_>>(),
+            vec![deferred_query.clone()]
+        );
+        assert_eq!(state.num_queries(), 2);
+
+        state.remove(deferred_query.query_id)?;
+        assert_eq!(state.degradable_query_count(), 0);
+        assert_eq!(
+            state
+                .need_fetch()
+                .map(|to_fetch| to_fetch.query)
+                .collect::<Vec<_>>(),
+            vec![unrelated_pending]
+        );
+        assert_eq!(state.num_queries(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn feature_unavailability_removes_a_query_from_the_pressure_retry_set() -> anyhow::Result<()> {
+        let mut state = SyncState::new(0);
+        let query = query(4);
+        state.insert(query.clone())?;
+        state.defer_degradable_fetch(query.query_id)?;
+
+        state.defer_feature_unavailable_fetch(query.query_id)?;
+
+        assert_eq!(
+            state
+                .need_fetch()
+                .map(|to_fetch| to_fetch.query)
+                .collect::<Vec<_>>(),
+            vec![query.clone()]
+        );
+        assert!(state.deferred_queries.contains(&query.query_id));
+        assert!(state.degradable_fetches().next().is_none());
+        assert_eq!(state.degradable_query_count(), 0);
+        assert!(state.has_feature_unavailable_fetches());
+        state.fill_invalidation_futures()?;
+        state.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn existing_deferred_query_can_move_to_feature_unavailability() -> anyhow::Result<()> {
+        let mut state = SyncState::new(0);
+        let query = query(5);
+        let previous_result = JsonPackedValue::from_network("null".to_owned())?;
+        state.queries.insert(
+            query.query_id,
+            SyncedQuery {
+                query: query.clone(),
+                subscription: None,
+                result_hash: Some(hash_result(
+                    &Ok(previous_result),
+                    &RedactedLogLines::empty(),
+                )),
+                invalidation_future: None,
+            },
+        );
+        state.refill_needed = true;
+        state.defer_degradable_fetch(query.query_id)?;
+
+        state.defer_feature_unavailable_fetch(query.query_id)?;
+
+        assert_eq!(
+            state
+                .need_fetch()
+                .map(|to_fetch| to_fetch.query)
+                .collect::<Vec<_>>(),
+            vec![query]
+        );
+        assert!(state.degradable_fetches().next().is_none());
+        assert!(state.has_feature_unavailable_fetches());
+        state.fill_invalidation_futures()?;
+        state.validate()?;
+        Ok(())
     }
 }

@@ -66,6 +66,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
             inner,
             parent_trace: _,
             scheduler_dependency: _,
+            active_javascript_class: _,
         }: Request<RT>,
         permit: ConcurrencyPermit,
     ) -> (String, bool) {
