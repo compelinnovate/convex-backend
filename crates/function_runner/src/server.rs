@@ -34,6 +34,7 @@ use common::{
     },
     schemas::DatabaseSchema,
     types::{
+        ActiveJavascriptClass,
         ConvexOrigin,
         DeploymentMetadata,
         IndexId,
@@ -143,6 +144,7 @@ pub struct RunRequestArgs {
 pub struct FunctionMetadata {
     pub path_and_args: ValidatedPathAndArgs,
     pub journal: QueryJournal,
+    pub active_javascript_class: ActiveJavascriptClass,
 }
 
 pub struct HttpActionMetadata {
@@ -366,6 +368,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 let FunctionMetadata {
                     path_and_args,
                     journal,
+                    active_javascript_class,
                 } = function_metadata.context("Missing function metadata for query or mutation")?;
                 // Initialize the UDF's RNG from some high-quality entropy. As with
                 // `unix_timestamp` below, the UDF is only deterministic modulo this
@@ -388,6 +391,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                         function_started_sender,
                         subfunctions_in_same_isolate,
                         scheduler_dependency,
+                        active_javascript_class,
                     )
                     .await?;
                 Ok((

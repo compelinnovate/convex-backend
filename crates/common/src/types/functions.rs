@@ -143,6 +143,32 @@ impl SchedulerDependencyClass {
     }
 }
 
+/// Service class used by the finite active-JavaScript admission gate.
+///
+/// The class is backend-owned. A client can opt an independent root query down
+/// to `Degradable`, but only the runtime can create `Dependency` work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ActiveJavascriptClass {
+    Dependency,
+    Protected,
+    Degradable,
+}
+
+impl ActiveJavascriptClass {
+    pub fn for_scheduler_dependency(self, dependency: SchedulerDependencyClass) -> Self {
+        if dependency.unblocks_ancestor() {
+            Self::Dependency
+        } else {
+            assert_ne!(
+                self,
+                Self::Dependency,
+                "dependency active JavaScript requires ancestor-unblocking scheduler ownership"
+            );
+            self
+        }
+    }
+}
+
 impl From<UdfType> for UdfTypeProto {
     fn from(u: UdfType) -> UdfTypeProto {
         match u {

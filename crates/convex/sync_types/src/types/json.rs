@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    num::NonZeroU32,
+};
 
 use anyhow::{
     bail,
@@ -23,14 +26,18 @@ use crate::{
     },
     AuthenticationToken,
     ClientMessage,
+    DegradableQueryPressureEpoch,
+    DegradableQueryPressureProtocolVersion,
     IdentityVersion,
     LogLinesMessage,
     Query,
     QueryId,
     QuerySetModification,
     QuerySetVersion,
+    QueryWorkloadClass,
     SerializedQueryJournal,
     ServerMessage,
+    ServerPressure,
     SessionRequestSeqNumber,
     StateModification,
     StateVersion,
@@ -206,6 +213,16 @@ enum ClientMessageJsonInner {
         #[serde(default)]
         #[serde(skip_serializing_if = "Option::is_none")]
         client_ts: Option<i64>,
+
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "double_option")]
+        query_workload_class: Option<Option<QueryWorkloadClass>>,
+
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "double_option")]
+        degradable_query_pressure_version: Option<Option<u32>>,
     },
     #[serde(rename_all = "camelCase")]
     ModifyQuerySet {
@@ -233,6 +250,8 @@ enum ClientMessageJsonInner {
         token: AuthenticationTokenJson,
     },
     #[serde(rename_all = "camelCase")]
+    RetryDegradableQueries { epoch: DegradableQueryPressureEpoch },
+    #[serde(rename_all = "camelCase")]
     Event {
         event_type: String,
         event: JsonValue,
@@ -254,6 +273,8 @@ impl TryFrom<ClientMessage> for JsonValue {
                 last_close_reason,
                 max_observed_timestamp,
                 client_ts,
+                query_workload_class,
+                degradable_query_pressure_version,
             } => (
                 ClientMessageJsonInner::Connect {
                     session_id: format!("{}", session_id.as_hyphenated()),
@@ -262,6 +283,12 @@ impl TryFrom<ClientMessage> for JsonValue {
                     max_observed_timestamp: max_observed_timestamp
                         .map(|ts| u64_to_string(ts.into())),
                     client_ts: client_ts.map(|ts| ts as i64),
+                    query_workload_class: query_workload_class.map(Some),
+                    degradable_query_pressure_version: degradable_query_pressure_version
+                        .map(|version| match version {
+                            DegradableQueryPressureProtocolVersion::V1 => 1,
+                        })
+                        .map(Some),
                 },
                 None,
                 None,
@@ -347,6 +374,11 @@ impl TryFrom<ClientMessage> for JsonValue {
                 None,
                 None,
             ),
+            ClientMessage::RetryDegradableQueries { epoch } => (
+                ClientMessageJsonInner::RetryDegradableQueries { epoch },
+                None,
+                None,
+            ),
             ClientMessage::Event(ClientEvent { event_type, event }) => (
                 ClientMessageJsonInner::Event { event_type, event },
                 None,
@@ -379,16 +411,35 @@ impl TryFrom<JsonValue> for ClientMessage {
                 last_close_reason,
                 max_observed_timestamp,
                 client_ts,
-            } => ClientMessage::Connect {
-                session_id: session_id.parse()?,
-                connection_count,
-                last_close_reason: last_close_reason.unwrap_or_else(|| "unknown".to_string()),
-                max_observed_timestamp: max_observed_timestamp
-                    .map(|s| string_to_u64(&s))
-                    .transpose()?
-                    .map(Timestamp::try_from)
-                    .transpose()?,
-                client_ts: client_ts.map(|ts| ts as u64),
+                query_workload_class,
+                degradable_query_pressure_version,
+            } => {
+                let query_workload_class = match query_workload_class {
+                    None => None,
+                    Some(Some(query_workload_class)) => Some(query_workload_class),
+                    Some(None) => bail!("queryWorkloadClass must not be null"),
+                };
+                let degradable_query_pressure_version = match degradable_query_pressure_version {
+                    None => None,
+                    Some(Some(1)) => Some(DegradableQueryPressureProtocolVersion::V1),
+                    Some(Some(version)) => {
+                        bail!("unsupported degradableQueryPressureVersion: {version}")
+                    },
+                    Some(None) => bail!("degradableQueryPressureVersion must not be null"),
+                };
+                ClientMessage::Connect {
+                    session_id: session_id.parse()?,
+                    connection_count,
+                    last_close_reason: last_close_reason.unwrap_or_else(|| "unknown".to_string()),
+                    max_observed_timestamp: max_observed_timestamp
+                        .map(|s| string_to_u64(&s))
+                        .transpose()?
+                        .map(Timestamp::try_from)
+                        .transpose()?,
+                    client_ts: client_ts.map(|ts| ts as u64),
+                    query_workload_class,
+                    degradable_query_pressure_version,
+                }
             },
             ClientMessageJsonInner::ModifyQuerySet {
                 base_version,
@@ -437,6 +488,9 @@ impl TryFrom<JsonValue> for ClientMessage {
                     AuthenticationTokenJson::User { value } => AuthenticationToken::User(value),
                     AuthenticationTokenJson::None => AuthenticationToken::None,
                 },
+            },
+            ClientMessageJsonInner::RetryDegradableQueries { epoch } => {
+                ClientMessage::RetryDegradableQueries { epoch }
             },
             ClientMessageJsonInner::Event { event_type, event } => {
                 ClientMessage::Event(ClientEvent { event_type, event })
@@ -594,14 +648,21 @@ impl<V: Into<JsonValue>> From<ServerMessage<V>> for JsonValue {
                 modifications,
                 client_clock_skew,
                 server_ts,
-            } => json!({
-                "type": "Transition",
-                "startVersion": JsonValue::from(start_version),
-                "endVersion": JsonValue::from(end_version),
-                "modifications": modifications.into_iter().map(JsonValue::from).collect::<Vec<JsonValue>>(),
-                "clientClockSkew": JsonValue::from(client_clock_skew),
-                "serverTs": JsonValue::from(server_ts),
-            }),
+                server_pressure,
+            } => {
+                let mut transition = json!({
+                    "type": "Transition",
+                    "startVersion": JsonValue::from(start_version),
+                    "endVersion": JsonValue::from(end_version),
+                    "modifications": modifications.into_iter().map(JsonValue::from).collect::<Vec<JsonValue>>(),
+                    "clientClockSkew": JsonValue::from(client_clock_skew),
+                    "serverTs": JsonValue::from(server_ts),
+                });
+                if let Some(server_pressure) = server_pressure {
+                    transition["serverPressure"] = JsonValue::from(server_pressure);
+                }
+                transition
+            },
             ServerMessage::MutationResponse {
                 request_id,
                 result: Ok(value),
@@ -707,6 +768,34 @@ impl<V: Into<JsonValue>> From<ServerMessage<V>> for JsonValue {
     }
 }
 
+impl From<ServerPressure> for JsonValue {
+    fn from(server_pressure: ServerPressure) -> Self {
+        match server_pressure {
+            ServerPressure::LegacyDegradableQueryCapacity { retry_after_ms } => json!({
+                "kind": "degradable_query_capacity",
+                "retryAfterMs": retry_after_ms.get(),
+            }),
+            ServerPressure::DegradableQueryCapacityActive {
+                epoch,
+                retry_after_ms,
+                pending_query_count,
+            } => json!({
+                "kind": "degradable_query_capacity",
+                "state": "active",
+                "epoch": epoch.get(),
+                "retryAfterMs": retry_after_ms.get(),
+                "pendingQueryCount": pending_query_count.get(),
+            }),
+            ServerPressure::DegradableQueryCapacityCleared { epoch } => json!({
+                "kind": "degradable_query_capacity",
+                "state": "cleared",
+                "epoch": epoch.get(),
+                "pendingQueryCount": 0,
+            }),
+        }
+    }
+}
+
 impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for ServerMessage<V> {
     type Error = anyhow::Error;
 
@@ -721,6 +810,8 @@ impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for Server
                 modifications: Vec<JsonValue>,
                 client_clock_skew: Option<i64>,
                 server_ts: Option<i64>,
+                #[serde(default, deserialize_with = "double_option")]
+                server_pressure: Option<Option<ServerPressureJson>>,
             },
             #[serde(rename_all = "camelCase")]
             MutationResponse {
@@ -759,6 +850,25 @@ impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for Server
             #[serde(rename_all = "camelCase")]
             Ping {},
         }
+        #[derive(Deserialize)]
+        #[serde(tag = "kind")]
+        enum ServerPressureJson {
+            #[serde(rename = "degradable_query_capacity")]
+            DegradableQueryCapacity {
+                #[serde(default)]
+                #[serde(deserialize_with = "double_option")]
+                state: Option<Option<String>>,
+                #[serde(default, rename = "retryAfterMs")]
+                #[serde(deserialize_with = "double_option")]
+                retry_after_ms: Option<Option<NonZeroU32>>,
+                #[serde(default)]
+                #[serde(deserialize_with = "double_option")]
+                epoch: Option<Option<DegradableQueryPressureEpoch>>,
+                #[serde(default, rename = "pendingQueryCount")]
+                #[serde(deserialize_with = "double_option")]
+                pending_query_count: Option<Option<u32>>,
+            },
+        }
         let s: ServerMessageJson = serde_json::from_value(value)?;
         let result = match s {
             ServerMessageJson::Transition {
@@ -767,15 +877,98 @@ impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for Server
                 modifications,
                 client_clock_skew,
                 server_ts,
-            } => ServerMessage::Transition {
-                start_version: start_version.try_into()?,
-                end_version: end_version.try_into()?,
-                modifications: modifications
-                    .into_iter()
-                    .map(|sm: JsonValue| sm.try_into())
-                    .collect::<anyhow::Result<Vec<StateModification<V>>>>()?,
-                client_clock_skew,
-                server_ts: server_ts.map(Timestamp::try_from).transpose()?,
+                server_pressure,
+            } => {
+                let server_pressure = match server_pressure {
+                    None => None,
+                    Some(Some(ServerPressureJson::DegradableQueryCapacity {
+                        state,
+                        retry_after_ms,
+                        epoch,
+                        pending_query_count,
+                    })) => Some(match state.as_ref().map(|state| state.as_deref()) {
+                        None => {
+                            anyhow::ensure!(
+                                epoch.is_none() && pending_query_count.is_none(),
+                                "legacy serverPressure must not include lifecycle fields"
+                            );
+                            ServerPressure::LegacyDegradableQueryCapacity {
+                                retry_after_ms: match retry_after_ms {
+                                    Some(Some(retry_after_ms)) => retry_after_ms,
+                                    Some(None) => {
+                                        bail!("legacy serverPressure retryAfterMs must not be null")
+                                    },
+                                    None => bail!("legacy serverPressure lacks retryAfterMs"),
+                                },
+                            }
+                        },
+                        Some(Some("active")) => {
+                            let pending_query_count = match pending_query_count {
+                                Some(Some(pending_query_count)) => pending_query_count,
+                                Some(None) => {
+                                    bail!(
+                                        "active serverPressure pendingQueryCount must not be null"
+                                    )
+                                },
+                                None => bail!("active serverPressure lacks pendingQueryCount"),
+                            };
+                            let pending_query_count = NonZeroU32::new(pending_query_count)
+                                .context(
+                                    "active serverPressure pendingQueryCount must be positive",
+                                )?;
+                            ServerPressure::DegradableQueryCapacityActive {
+                                epoch: match epoch {
+                                    Some(Some(epoch)) => epoch,
+                                    Some(None) => {
+                                        bail!("active serverPressure epoch must not be null")
+                                    },
+                                    None => bail!("active serverPressure lacks epoch"),
+                                },
+                                retry_after_ms: match retry_after_ms {
+                                    Some(Some(retry_after_ms)) => retry_after_ms,
+                                    Some(None) => {
+                                        bail!("active serverPressure retryAfterMs must not be null")
+                                    },
+                                    None => bail!("active serverPressure lacks retryAfterMs"),
+                                },
+                                pending_query_count,
+                            }
+                        },
+                        Some(Some("cleared")) => {
+                            anyhow::ensure!(
+                                retry_after_ms.is_none(),
+                                "cleared serverPressure must not include retryAfterMs"
+                            );
+                            anyhow::ensure!(
+                                pending_query_count == Some(Some(0)),
+                                "cleared serverPressure pendingQueryCount must be zero"
+                            );
+                            ServerPressure::DegradableQueryCapacityCleared {
+                                epoch: match epoch {
+                                    Some(Some(epoch)) => epoch,
+                                    Some(None) => {
+                                        bail!("cleared serverPressure epoch must not be null")
+                                    },
+                                    None => bail!("cleared serverPressure lacks epoch"),
+                                },
+                            }
+                        },
+                        Some(Some(state)) => bail!("unsupported serverPressure state: {state}"),
+                        Some(None) => bail!("serverPressure state must not be null"),
+                    }),
+                    Some(None) => bail!("serverPressure must not be null"),
+                };
+                ServerMessage::Transition {
+                    start_version: start_version.try_into()?,
+                    end_version: end_version.try_into()?,
+                    modifications: modifications
+                        .into_iter()
+                        .map(|sm: JsonValue| sm.try_into())
+                        .collect::<anyhow::Result<Vec<StateModification<V>>>>()?,
+                    client_clock_skew,
+                    server_ts: server_ts.map(Timestamp::try_from).transpose()?,
+                    server_pressure,
+                }
             },
             ServerMessageJson::MutationResponse {
                 request_id,
@@ -1010,4 +1203,476 @@ where
     D: Deserializer<'de>,
 {
     Deserialize::deserialize(deserializer).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    const SESSION_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TestValue(JsonValue);
+
+    impl From<TestValue> for JsonValue {
+        fn from(value: TestValue) -> Self {
+            value.0
+        }
+    }
+
+    impl TryFrom<JsonValue> for TestValue {
+        type Error = anyhow::Error;
+
+        fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
+            Ok(Self(value))
+        }
+    }
+
+    fn connect_json() -> JsonValue {
+        json!({
+            "type": "Connect",
+            "sessionId": SESSION_ID,
+            "connectionCount": 2,
+            "lastCloseReason": "InitialConnect",
+        })
+    }
+
+    fn connect_workload_class(message: ClientMessage) -> Option<QueryWorkloadClass> {
+        match message {
+            ClientMessage::Connect {
+                query_workload_class,
+                ..
+            } => query_workload_class,
+            _ => panic!("expected Connect"),
+        }
+    }
+
+    fn connect_pressure_version(
+        message: ClientMessage,
+    ) -> Option<DegradableQueryPressureProtocolVersion> {
+        match message {
+            ClientMessage::Connect {
+                degradable_query_pressure_version,
+                ..
+            } => degradable_query_pressure_version,
+            _ => panic!("expected Connect"),
+        }
+    }
+
+    fn transition(server_pressure: Option<ServerPressure>) -> ServerMessage<TestValue> {
+        ServerMessage::Transition {
+            start_version: StateVersion::initial(),
+            end_version: StateVersion::initial(),
+            modifications: vec![],
+            client_clock_skew: Some(-5),
+            server_ts: None,
+            server_pressure,
+        }
+    }
+
+    #[test]
+    fn connect_without_query_workload_class_preserves_wire_json() -> anyhow::Result<()> {
+        let message = ClientMessage::Connect {
+            session_id: SESSION_ID.parse()?,
+            connection_count: 2,
+            last_close_reason: "InitialConnect".to_string(),
+            max_observed_timestamp: None,
+            client_ts: None,
+            query_workload_class: None,
+            degradable_query_pressure_version: None,
+        };
+
+        let serialized = serde_json::to_string(&JsonValue::try_from(message)?)?;
+        assert_eq!(
+            serialized,
+            r#"{"type":"Connect","sessionId":"00000000-0000-0000-0000-000000000001","connectionCount":2,"lastCloseReason":"InitialConnect"}"#
+        );
+
+        let parsed = ClientMessage::try_from(connect_json())?;
+        assert_eq!(connect_workload_class(parsed), None);
+        Ok(())
+    }
+
+    #[test]
+    fn connect_accepts_degradable_query_workload_class() -> anyhow::Result<()> {
+        let mut json = connect_json();
+        json["queryWorkloadClass"] = json!("degradable");
+
+        let parsed = ClientMessage::try_from(json.clone())?;
+        assert_eq!(
+            connect_workload_class(parsed.clone()),
+            Some(QueryWorkloadClass::Degradable)
+        );
+        assert_eq!(JsonValue::try_from(parsed)?, json);
+        Ok(())
+    }
+
+    #[test]
+    fn connect_round_trips_pressure_lifecycle_capability() -> anyhow::Result<()> {
+        let mut json = connect_json();
+        json["degradableQueryPressureVersion"] = json!(1);
+
+        let parsed = ClientMessage::try_from(json.clone())?;
+        assert_eq!(
+            connect_pressure_version(parsed.clone()),
+            Some(DegradableQueryPressureProtocolVersion::V1)
+        );
+        assert_eq!(JsonValue::try_from(parsed)?, json);
+        Ok(())
+    }
+
+    #[test]
+    fn connect_rejects_malformed_pressure_lifecycle_capability() {
+        for invalid in [
+            JsonValue::Null,
+            json!(0),
+            json!(2),
+            json!(-1),
+            json!(1.5),
+            json!("1"),
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            let mut json = connect_json();
+            json["degradableQueryPressureVersion"] = invalid;
+            assert!(ClientMessage::try_from(json).is_err());
+        }
+    }
+
+    #[test]
+    fn retry_degradable_queries_round_trips_and_rejects_invalid_epoch() -> anyhow::Result<()> {
+        let json = json!({ "type": "RetryDegradableQueries", "epoch": 1 });
+        let parsed = ClientMessage::try_from(json.clone())?;
+        assert_eq!(
+            parsed,
+            ClientMessage::RetryDegradableQueries {
+                epoch: DegradableQueryPressureEpoch::first(),
+            }
+        );
+        assert_eq!(JsonValue::try_from(parsed)?, json);
+
+        for epoch in [
+            JsonValue::Null,
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("1"),
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            let mut invalid = json!({ "type": "RetryDegradableQueries", "epoch": 1 });
+            invalid["epoch"] = epoch;
+            assert!(ClientMessage::try_from(invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn connect_rejects_malformed_query_workload_class() {
+        for invalid in [
+            json!("normal"),
+            json!("future_class"),
+            JsonValue::Null,
+            json!(1),
+            json!({}),
+        ] {
+            let mut json = connect_json();
+            json["queryWorkloadClass"] = invalid;
+            assert!(ClientMessage::try_from(json).is_err());
+        }
+    }
+
+    #[test]
+    fn connect_tolerates_unrelated_future_properties() -> anyhow::Result<()> {
+        let mut json = connect_json();
+        json["futureProperty"] = json!({ "nested": true });
+
+        let parsed = ClientMessage::try_from(json)?;
+        assert_eq!(connect_workload_class(parsed), None);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_connect_shape_ignores_query_workload_class() -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct LegacyClientMessageJson {
+            #[serde(flatten)]
+            remaining: LegacyClientMessageJsonInner,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum LegacyClientMessageJsonInner {
+            #[serde(rename_all = "camelCase")]
+            Connect {
+                session_id: String,
+                connection_count: u32,
+                last_close_reason: Option<String>,
+                max_observed_timestamp: Option<String>,
+                client_ts: Option<i64>,
+            },
+        }
+
+        let mut json = connect_json();
+        json["queryWorkloadClass"] = json!("degradable");
+        json["degradableQueryPressureVersion"] = json!(1);
+        let LegacyClientMessageJson {
+            remaining:
+                LegacyClientMessageJsonInner::Connect {
+                    session_id,
+                    connection_count,
+                    last_close_reason,
+                    max_observed_timestamp,
+                    client_ts,
+                },
+        } = serde_json::from_value(json)?;
+        assert_eq!(session_id, SESSION_ID);
+        assert_eq!(connection_count, 2);
+        assert_eq!(last_close_reason.as_deref(), Some("InitialConnect"));
+        assert_eq!(max_observed_timestamp, None);
+        assert_eq!(client_ts, None);
+        Ok(())
+    }
+
+    #[test]
+    fn transition_without_server_pressure_preserves_wire_json() -> anyhow::Result<()> {
+        let message = transition(None);
+        let json = JsonValue::from(message.clone());
+
+        assert!(json.get("serverPressure").is_none());
+        assert_eq!(ServerMessage::<TestValue>::try_from(json)?, message);
+        Ok(())
+    }
+
+    #[test]
+    fn transition_round_trips_degradable_query_pressure() -> anyhow::Result<()> {
+        let pressure = ServerPressure::LegacyDegradableQueryCapacity {
+            retry_after_ms: NonZeroU32::new(250).unwrap(),
+        };
+        let message = transition(Some(pressure));
+        let json = JsonValue::from(message.clone());
+
+        assert_eq!(
+            json.get("serverPressure"),
+            Some(&json!({
+                "kind": "degradable_query_capacity",
+                "retryAfterMs": 250,
+            }))
+        );
+        assert_eq!(ServerMessage::<TestValue>::try_from(json)?, message);
+
+        let max_pressure = ServerPressure::LegacyDegradableQueryCapacity {
+            retry_after_ms: NonZeroU32::new(u32::MAX).unwrap(),
+        };
+        let max_message = transition(Some(max_pressure));
+        assert_eq!(
+            ServerMessage::<TestValue>::try_from(JsonValue::from(max_message.clone()))?,
+            max_message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transition_round_trips_degradable_query_pressure_lifecycle() -> anyhow::Result<()> {
+        let epoch = DegradableQueryPressureEpoch::first();
+        let active = transition(Some(ServerPressure::DegradableQueryCapacityActive {
+            epoch,
+            retry_after_ms: NonZeroU32::new(250).unwrap(),
+            pending_query_count: NonZeroU32::new(3).unwrap(),
+        }));
+        let active_json = JsonValue::from(active.clone());
+        assert_eq!(
+            active_json.get("serverPressure"),
+            Some(&json!({
+                "kind": "degradable_query_capacity",
+                "state": "active",
+                "epoch": 1,
+                "retryAfterMs": 250,
+                "pendingQueryCount": 3,
+            }))
+        );
+        assert_eq!(ServerMessage::<TestValue>::try_from(active_json)?, active);
+
+        let cleared = transition(Some(ServerPressure::DegradableQueryCapacityCleared {
+            epoch,
+        }));
+        let cleared_json = JsonValue::from(cleared.clone());
+        assert_eq!(
+            cleared_json.get("serverPressure"),
+            Some(&json!({
+                "kind": "degradable_query_capacity",
+                "state": "cleared",
+                "epoch": 1,
+                "pendingQueryCount": 0,
+            }))
+        );
+        assert_eq!(ServerMessage::<TestValue>::try_from(cleared_json)?, cleared);
+        Ok(())
+    }
+
+    #[test]
+    fn transition_rejects_malformed_pressure_lifecycle() {
+        let valid_active = json!({
+            "type": "Transition",
+            "startVersion": JsonValue::from(StateVersion::initial()),
+            "endVersion": JsonValue::from(StateVersion::initial()),
+            "modifications": [],
+            "serverPressure": {
+                "kind": "degradable_query_capacity",
+                "state": "active",
+                "epoch": 1,
+                "retryAfterMs": 250,
+                "pendingQueryCount": 3,
+            },
+        });
+        for (field, invalid) in [
+            ("epoch", json!(0)),
+            ("epoch", JsonValue::Null),
+            ("retryAfterMs", json!(0)),
+            ("retryAfterMs", JsonValue::Null),
+            ("pendingQueryCount", json!(0)),
+            ("pendingQueryCount", json!(-1)),
+            ("pendingQueryCount", JsonValue::Null),
+        ] {
+            let mut value = valid_active.clone();
+            value["serverPressure"][field] = invalid;
+            assert!(ServerMessage::<TestValue>::try_from(value).is_err());
+        }
+
+        for invalid in [
+            json!({
+                "kind": "degradable_query_capacity",
+                "state": "cleared",
+                "epoch": 1,
+                "pendingQueryCount": 1,
+            }),
+            json!({
+                "kind": "degradable_query_capacity",
+                "state": "cleared",
+                "epoch": null,
+                "pendingQueryCount": 0,
+            }),
+            json!({
+                "kind": "degradable_query_capacity",
+                "state": "cleared",
+                "epoch": 1,
+                "pendingQueryCount": null,
+            }),
+            json!({
+                "kind": "degradable_query_capacity",
+                "state": "cleared",
+                "epoch": 1,
+                "pendingQueryCount": 0,
+                "retryAfterMs": null,
+            }),
+            json!({
+                "kind": "degradable_query_capacity",
+                "state": null,
+                "retryAfterMs": 250,
+            }),
+            json!({
+                "kind": "degradable_query_capacity",
+                "retryAfterMs": 250,
+                "epoch": null,
+            }),
+            json!({
+                "kind": "degradable_query_capacity",
+                "retryAfterMs": 250,
+                "pendingQueryCount": null,
+            }),
+            json!({
+                "kind": "degradable_query_capacity",
+                "state": "cleared",
+                "epoch": 1,
+                "pendingQueryCount": 0,
+                "retryAfterMs": 250,
+            }),
+            json!({
+                "kind": "degradable_query_capacity",
+                "state": "future",
+                "epoch": 1,
+                "pendingQueryCount": 1,
+                "retryAfterMs": 250,
+            }),
+        ] {
+            let mut value = valid_active.clone();
+            value["serverPressure"] = invalid;
+            assert!(ServerMessage::<TestValue>::try_from(value).is_err());
+        }
+    }
+
+    #[test]
+    fn transition_rejects_malformed_server_pressure() -> anyhow::Result<()> {
+        let pressure = ServerPressure::LegacyDegradableQueryCapacity {
+            retry_after_ms: NonZeroU32::new(250).unwrap(),
+        };
+        let valid = JsonValue::from(transition(Some(pressure)));
+
+        for invalid_retry_after_ms in [
+            JsonValue::Null,
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!(u64::from(u32::MAX) + 1),
+            json!("250"),
+            json!(true),
+        ] {
+            let mut json = valid.clone();
+            json["serverPressure"]["retryAfterMs"] = invalid_retry_after_ms;
+            assert!(ServerMessage::<TestValue>::try_from(json).is_err());
+        }
+
+        let mut missing_retry = valid.clone();
+        missing_retry["serverPressure"]
+            .as_object_mut()
+            .unwrap()
+            .remove("retryAfterMs");
+        assert!(ServerMessage::<TestValue>::try_from(missing_retry).is_err());
+
+        let mut unknown_kind = valid.clone();
+        unknown_kind["serverPressure"]["kind"] = json!("future_pressure");
+        assert!(ServerMessage::<TestValue>::try_from(unknown_kind).is_err());
+
+        let mut null_pressure = valid.clone();
+        null_pressure["serverPressure"] = JsonValue::Null;
+        assert!(ServerMessage::<TestValue>::try_from(null_pressure).is_err());
+
+        let serialized = serde_json::to_string(&valid)?;
+        let non_finite = serialized.replace("\"retryAfterMs\":250", "\"retryAfterMs\":1e400");
+        assert!(serde_json::from_str::<JsonValue>(&non_finite).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_transition_shape_ignores_server_pressure() -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum LegacyServerMessage {
+            #[serde(rename_all = "camelCase")]
+            Transition {
+                start_version: JsonValue,
+                end_version: JsonValue,
+                modifications: Vec<JsonValue>,
+                client_clock_skew: Option<i64>,
+                server_ts: Option<i64>,
+            },
+        }
+
+        let pressure = ServerPressure::LegacyDegradableQueryCapacity {
+            retry_after_ms: NonZeroU32::new(250).unwrap(),
+        };
+        let json = JsonValue::from(transition(Some(pressure)));
+        let LegacyServerMessage::Transition {
+            start_version,
+            end_version,
+            modifications,
+            client_clock_skew,
+            server_ts,
+        } = serde_json::from_value(json)?;
+        assert_eq!(start_version, end_version);
+        assert!(modifications.is_empty());
+        assert_eq!(client_clock_skew, Some(-5));
+        assert_eq!(server_ts, None);
+        Ok(())
+    }
 }

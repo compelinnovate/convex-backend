@@ -92,8 +92,7 @@ struct Query {
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct SubscriberId(QueryId, usize);
 
-impl SubscriberId {
-}
+impl SubscriberId {}
 
 fn serialize_path_and_args(udf_path: UdfPath, args: BTreeMap<String, Value>) -> QueryToken {
     let json_path: String = udf_path.canonicalize().into();
@@ -311,6 +310,7 @@ impl RemoteQuerySet {
             modifications,
             client_clock_skew: _,
             server_ts: _,
+            server_pressure: _,
         } = transition
         else {
             panic!("not transition");

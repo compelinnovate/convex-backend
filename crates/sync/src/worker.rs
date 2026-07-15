@@ -1,5 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    num::NonZeroU32,
     sync::{
         atomic::{
             AtomicUsize,
@@ -11,6 +15,7 @@ use std::{
 };
 
 use ::metrics::StatusTimer;
+use anyhow::Context as _;
 use application::{
     api::{
         is_recoverable_subscription_stream_failure,
@@ -39,6 +44,7 @@ use common::{
     heap_size::HeapSize,
     http::ResolvedHostname,
     knobs::{
+        APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS,
         SEARCH_INDEXES_UNAVAILABLE_RETRY_DELAY,
         SYNC_MAX_SEND_TRANSITION_COUNT,
         SYNC_WORKER_QUERY_RETRY_INITIAL_BACKOFF_MS,
@@ -90,11 +96,15 @@ use model::session_requests::types::SessionRequestIdentifier;
 use sync_types::{
     AuthenticationToken,
     ClientMessage,
+    DegradableQueryPressureEpoch,
+    DegradableQueryPressureProtocolVersion,
     IdentityVersion,
     QueryId,
     QuerySetModification,
     QuerySetVersion,
+    QueryWorkloadClass,
     SerializedQueryJournal,
+    ServerPressure,
     SessionId,
     StateModification,
     StateVersion,
@@ -119,6 +129,9 @@ use crate::{
         log_query_modification_args_size,
         modify_query_to_transition_timer,
         mutation_queue_timer,
+        DegradableQueryClientRetryOutcome,
+        DegradableQueryPressureLifecycleState,
+        DegradableQueryRetryTrigger,
         TypedClientEvent,
     },
     state::{
@@ -240,6 +253,86 @@ impl SingleFlightReceiver {
 }
 
 pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const DEGRADABLE_QUERY_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+fn degradable_query_retry_after_ms() -> NonZeroU32 {
+    NonZeroU32::new(
+        DEGRADABLE_QUERY_RETRY_DELAY
+            .as_millis()
+            .try_into()
+            .expect("degradable query retry delay must fit in u32 milliseconds"),
+    )
+    .expect("degradable query retry delay must be positive")
+}
+
+fn pressure_for_transition(
+    protocol_version: Option<DegradableQueryPressureProtocolVersion>,
+    pressure_state: &mut Option<DegradableQueryPressureState>,
+    last_epoch: &mut Option<DegradableQueryPressureEpoch>,
+    deferred_query_count: usize,
+    had_degradable_deferral: bool,
+) -> anyhow::Result<Option<ServerPressure>> {
+    match protocol_version {
+        None => {
+            return Ok(had_degradable_deferral.then(|| {
+                ServerPressure::LegacyDegradableQueryCapacity {
+                    retry_after_ms: degradable_query_retry_after_ms(),
+                }
+            }));
+        },
+        Some(DegradableQueryPressureProtocolVersion::V1) => {},
+    }
+
+    let pending_query_count = u32::try_from(deferred_query_count)
+        .context("deferred query count exceeds the pressure protocol range")?;
+    let Some(pending_query_count) = NonZeroU32::new(pending_query_count) else {
+        return Ok(pressure_state
+            .take()
+            .map(|state| ServerPressure::DegradableQueryCapacityCleared { epoch: state.epoch }));
+    };
+
+    if pressure_state.is_none() {
+        let epoch = last_epoch
+            .map(DegradableQueryPressureEpoch::next)
+            .unwrap_or_else(DegradableQueryPressureEpoch::first);
+        *last_epoch = Some(epoch);
+        *pressure_state = Some(DegradableQueryPressureState {
+            epoch,
+            manual_retry_requested: false,
+            last_reported_pending_query_count: pending_query_count,
+        });
+        return Ok(Some(ServerPressure::DegradableQueryCapacityActive {
+            epoch,
+            retry_after_ms: degradable_query_retry_after_ms(),
+            pending_query_count,
+        }));
+    }
+
+    let state = pressure_state
+        .as_mut()
+        .expect("pressure state was checked above");
+    if !had_degradable_deferral && state.last_reported_pending_query_count == pending_query_count {
+        return Ok(None);
+    }
+    state.last_reported_pending_query_count = pending_query_count;
+    Ok(Some(ServerPressure::DegradableQueryCapacityActive {
+        epoch: state.epoch,
+        retry_after_ms: degradable_query_retry_after_ms(),
+        pending_query_count,
+    }))
+}
+
+fn degradable_retry_scheduled_after_transition(
+    scheduled: Option<DegradableQueryRetryTrigger>,
+) -> Option<DegradableQueryRetryTrigger> {
+    match scheduled {
+        // A timer can mature while an ordinary transition is running. That
+        // transition has just retried the complete degradable set, so only a
+        // client request received during the transition remains actionable.
+        Some(DegradableQueryRetryTrigger::Client) => Some(DegradableQueryRetryTrigger::Client),
+        Some(DegradableQueryRetryTrigger::Timer) | None => None,
+    }
+}
 
 pub struct SyncWorker<RT: Runtime> {
     api: Arc<dyn ApplicationApi>,
@@ -264,14 +357,21 @@ pub struct SyncWorker<RT: Runtime> {
     // Has an update been scheduled for the future?
     update_scheduled: bool,
 
-    /// If we've seen a FeatureTemporarilyUnavailable error, wait for this
-    /// Future to resolve before retrying
-    unavailable_query_retry_future: Option<Fuse<BoxFuture<'static, ()>>>,
+    /// Existing bounded retry for queries whose backing feature is temporarily
+    /// unavailable.
+    feature_unavailable_query_retry_future: Option<Fuse<BoxFuture<'static, ()>>>,
+    /// The degradable pressure timer is independent so a deferred-only retry
+    /// cannot replace or consume an ordinary feature retry.
+    degradable_query_retry_future: Option<Fuse<BoxFuture<'static, ()>>>,
+    /// A pressure retry uses a dedicated same-version transition. Routing it
+    /// through `update_scheduled` would take every successful subscription.
+    degradable_query_retry_scheduled: Option<DegradableQueryRetryTrigger>,
 
     /// Timers to track time between handling ModifyQuerySet message and sending
     /// the Transition with the update
     modify_query_to_transition_timers: BTreeMap<QuerySetVersion, StatusTimer>,
 
+    /// Present until the connection's single negotiation message is accepted.
     on_connect: Option<(StatusTimer, Box<dyn FnOnce(SessionId) + Send>)>,
     partition_id: u64,
     request_metadata: RequestMetadata,
@@ -279,6 +379,14 @@ pub struct SyncWorker<RT: Runtime> {
     /// The difference between the client's clock and the server's clock, in
     /// milliseconds. Includes latency between the client and server.
     client_clock_skew: Option<i64>,
+
+    /// Applied only to root reactive queries when degradable admission is
+    /// configured; otherwise retained only for declaration telemetry.
+    query_workload_class: Option<QueryWorkloadClass>,
+    degradable_query_pressure_version: Option<DegradableQueryPressureProtocolVersion>,
+    degradable_query_pressure_state: Option<DegradableQueryPressureState>,
+    last_degradable_query_pressure_epoch: Option<DegradableQueryPressureEpoch>,
+    query_workload_connection_metrics: Option<metrics::QueryWorkloadConnectionMetrics>,
 }
 
 enum QueryResult {
@@ -287,9 +395,7 @@ enum QueryResult {
         log_lines: RedactedLogLines,
         journal: SerializedQueryJournal,
     },
-    /// Skip returning results of this query because a feature it depends on
-    /// (e.g. search indexes or table summaries) is temporarily unavailable
-    TemporarilyUnavailable,
+    Deferred(QueryDeferralReason),
     Refresh,
 }
 
@@ -334,13 +440,25 @@ where
     .await
 }
 
+#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum QueryDeferralReason {
+    FeatureTemporarilyUnavailable,
+    DegradableQueryCapacity,
+}
+
+struct DegradableQueryPressureState {
+    epoch: DegradableQueryPressureEpoch,
+    manual_retry_requested: bool,
+    last_reported_pending_query_count: NonZeroU32,
+}
+
 struct TransitionState {
-    udf_results: Vec<(QueryId, QueryResult, Arc<dyn SubscriptionTrait>)>,
+    udf_results: Vec<(QueryId, QueryResult, Option<Arc<dyn SubscriptionTrait>>)>,
     state_modifications: BTreeMap<QueryId, StateModification<JsonPackedValue>>,
     current_version: StateVersion,
     new_version: StateVersion,
     timer: StatusTimer,
-    temporarily_unavailable: bool,
+    query_deferrals: BTreeSet<QueryDeferralReason>,
 }
 
 impl<RT: Runtime> SyncWorker<RT> {
@@ -371,12 +489,19 @@ impl<RT: Runtime> SyncWorker<RT> {
             action_futures: FuturesUnordered::new(),
             transition_future: None,
             update_scheduled: false,
-            unavailable_query_retry_future: None,
+            feature_unavailable_query_retry_future: None,
+            degradable_query_retry_future: None,
+            degradable_query_retry_scheduled: None,
             modify_query_to_transition_timers: BTreeMap::new(),
             on_connect: Some((connect_timer(partition_id), on_connect)),
             partition_id,
             request_metadata,
             client_clock_skew: None,
+            query_workload_class: None,
+            degradable_query_pressure_version: None,
+            degradable_query_pressure_state: None,
+            last_degradable_query_pressure_epoch: None,
+            query_workload_connection_metrics: None,
         }
     }
 
@@ -384,10 +509,10 @@ impl<RT: Runtime> SyncWorker<RT> {
         self.update_scheduled = true;
     }
 
-    fn schedule_unavailable_query_retry(&mut self) {
-        if self.unavailable_query_retry_future.is_none() {
+    fn schedule_feature_unavailable_query_retry(&mut self) {
+        if self.feature_unavailable_query_retry_future.is_none() {
             let rt = self.rt.clone();
-            self.unavailable_query_retry_future = Some(
+            self.feature_unavailable_query_retry_future = Some(
                 async move {
                     rt.wait(*SEARCH_INDEXES_UNAVAILABLE_RETRY_DELAY).await;
                 }
@@ -395,6 +520,86 @@ impl<RT: Runtime> SyncWorker<RT> {
                 .fuse(),
             );
         }
+    }
+
+    fn schedule_degradable_query_retry_after_delay(&mut self) {
+        // Every completed transition that leaves pressure active has just
+        // attempted the complete degradable set. Start the next delay from
+        // that attempt instead of retaining an older timer that may already be
+        // ready and immediately amplifying recovery work.
+        let rt = self.rt.clone();
+        self.degradable_query_retry_future = Some(
+            async move {
+                rt.wait(DEGRADABLE_QUERY_RETRY_DELAY).await;
+            }
+            .boxed()
+            .fuse(),
+        );
+    }
+
+    fn schedule_degradable_query_retry(&mut self, trigger: DegradableQueryRetryTrigger) {
+        // A user request takes attribution precedence over a timer that became
+        // ready in the same worker turn. Both select the same deferred set.
+        if self.degradable_query_retry_scheduled != Some(DegradableQueryRetryTrigger::Client) {
+            self.degradable_query_retry_scheduled = Some(trigger);
+        }
+    }
+
+    fn handle_degradable_query_retry_request(&mut self, epoch: DegradableQueryPressureEpoch) {
+        let outcome = match self.degradable_query_pressure_version {
+            None => DegradableQueryClientRetryOutcome::Unsupported,
+            Some(DegradableQueryPressureProtocolVersion::V1) => {
+                if let Some(state) = self.degradable_query_pressure_state.as_mut() {
+                    if state.epoch != epoch {
+                        DegradableQueryClientRetryOutcome::Stale
+                    } else if state.manual_retry_requested {
+                        DegradableQueryClientRetryOutcome::Duplicate
+                    } else {
+                        state.manual_retry_requested = true;
+                        // The accepted manual attempt establishes a new retry boundary.
+                        // If it still defers, completion re-arms the automatic delay.
+                        self.degradable_query_retry_future = None;
+                        self.schedule_degradable_query_retry(DegradableQueryRetryTrigger::Client);
+                        DegradableQueryClientRetryOutcome::Scheduled
+                    }
+                } else {
+                    DegradableQueryClientRetryOutcome::Inactive
+                }
+            },
+        };
+        metrics::log_degradable_query_client_retry(outcome);
+    }
+
+    fn server_pressure_for_transition(
+        &mut self,
+        query_deferrals: &BTreeSet<QueryDeferralReason>,
+    ) -> anyhow::Result<Option<ServerPressure>> {
+        let had_degradable_deferral =
+            query_deferrals.contains(&QueryDeferralReason::DegradableQueryCapacity);
+        let server_pressure = pressure_for_transition(
+            self.degradable_query_pressure_version,
+            &mut self.degradable_query_pressure_state,
+            &mut self.last_degradable_query_pressure_epoch,
+            self.state.degradable_query_count(),
+            had_degradable_deferral,
+        )?;
+        match server_pressure {
+            Some(ServerPressure::DegradableQueryCapacityActive {
+                pending_query_count,
+                ..
+            }) => metrics::log_degradable_query_pressure_lifecycle(
+                DegradableQueryPressureLifecycleState::Active,
+                Some(pending_query_count),
+            ),
+            Some(ServerPressure::DegradableQueryCapacityCleared { .. }) => {
+                metrics::log_degradable_query_pressure_lifecycle(
+                    DegradableQueryPressureLifecycleState::Cleared,
+                    None,
+                )
+            },
+            Some(ServerPressure::LegacyDegradableQueryCapacity { .. }) | None => {},
+        }
+        Ok(server_pressure)
     }
 
     /// Run the sync protocol worker, returning `Ok(())` on clean exit and `Err`
@@ -413,7 +618,8 @@ impl<RT: Runtime> SyncWorker<RT> {
     async fn go_inner(&mut self) -> anyhow::Result<()> {
         let mut ping_timeout = self.rt.wait(HEARTBEAT_INTERVAL);
         let mut pending = future::pending().boxed().fuse();
-        let mut unavailable_retry_pending = future::pending().boxed().fuse();
+        let mut feature_retry_pending = future::pending().boxed().fuse();
+        let mut degradable_retry_pending = future::pending().boxed().fuse();
 
         // Create a new subscription client for every sync socket. Thus we don't require
         // the subscription client to auto-recover on connection failures.
@@ -464,12 +670,24 @@ impl<RT: Runtime> SyncWorker<RT> {
                     self.transition_future = None;
                     Some(self.finish_update_queries(transition_state?)?)
                 },
-                _ = self.unavailable_query_retry_future
+                _ = self.feature_unavailable_query_retry_future
                         .as_mut()
-                        .unwrap_or(&mut unavailable_retry_pending) => {
+                        .unwrap_or(&mut feature_retry_pending) => {
+                    self.feature_unavailable_query_retry_future = None;
                     tracing::info!("Scheduling an update to queries after a query failed because of async bootstrapping.");
-                    self.unavailable_query_retry_future = None;
-                    self.schedule_update();
+                    if self.state.has_feature_unavailable_fetches() {
+                        self.schedule_update();
+                    }
+                    None
+                },
+                _ = self.degradable_query_retry_future
+                        .as_mut()
+                        .unwrap_or(&mut degradable_retry_pending) => {
+                    self.degradable_query_retry_future = None;
+                    tracing::info!("Scheduling a deferred-only update after degradable query capacity was unavailable.");
+                    if self.state.degradable_fetches().next().is_some() {
+                        self.schedule_degradable_query_retry(DegradableQueryRetryTrigger::Timer);
+                    }
                     None
                 },
                 _ = self.tx.message_consumed().fuse() => {
@@ -500,11 +718,36 @@ impl<RT: Runtime> SyncWorker<RT> {
                 && self.tx.transition_count() < *SYNC_MAX_SEND_TRANSITION_COUNT
                 && self.transition_future.is_none()
             {
+                // A normal transition retries every structurally deferred query. Cancel the old
+                // feature deadline so it cannot mature against pre-completion state and
+                // schedule a redundant all-query transition; completion re-arms
+                // it after a fresh deferral.
+                self.feature_unavailable_query_retry_future = None;
                 let identity = self.revalidate_identity().await?;
                 let new_transition_future =
                     self.begin_update_queries(identity, subscription_client.clone())?;
                 self.transition_future = Some(new_transition_future.boxed().fuse());
                 self.update_scheduled = false;
+                // The normal path already includes every deferred query and
+                // takes precedence over a pending pressure-only retry.
+                self.degradable_query_retry_scheduled = None;
+            } else if self.degradable_query_retry_scheduled.is_some()
+                && self.tx.transition_count() < *SYNC_MAX_SEND_TRANSITION_COUNT
+                && self.transition_future.is_none()
+            {
+                let trigger = self
+                    .degradable_query_retry_scheduled
+                    .take()
+                    .expect("degradable retry was checked above");
+                if self.state.degradable_fetches().next().is_some() {
+                    let identity = self.revalidate_identity().await?;
+                    let retry_future = self.begin_retry_deferred_queries(
+                        identity,
+                        subscription_client.clone(),
+                        trigger,
+                    )?;
+                    self.transition_future = Some(retry_future.boxed().fuse());
+                }
             }
         }
         Ok(())
@@ -554,7 +797,8 @@ impl<RT: Runtime> SyncWorker<RT> {
                         | ClientMessage::ModifyQuerySet { .. }
                         | ClientMessage::Mutation { .. }
                         | ClientMessage::Action { .. }
-                        | ClientMessage::Authenticate { .. },
+                        | ClientMessage::Authenticate { .. }
+                        | ClientMessage::RetryDegradableQueries { .. },
                         _,
                     )) => {
                         metrics::log_subscription_reconnect_delay("client_activity");
@@ -604,16 +848,29 @@ impl<RT: Runtime> SyncWorker<RT> {
                 max_observed_timestamp,
                 connection_count,
                 client_ts,
+                query_workload_class,
+                degradable_query_pressure_version,
             } => {
-                if let Some((timer, on_connect)) = self.on_connect.take() {
-                    timer.finish();
-                    on_connect(session_id);
-                }
+                let (connect_timer, on_connect) = self
+                    .on_connect
+                    .take()
+                    .context("received duplicate Connect message")?;
+                connect_timer.finish();
+                on_connect(session_id);
 
                 if let Some(ts) = client_ts {
                     self.client_clock_skew =
                         Some(ts as i64 - self.rt.unix_timestamp().as_ms_since_epoch()? as i64);
                 }
+
+                drop(self.query_workload_connection_metrics.take());
+                self.query_workload_class = query_workload_class;
+                self.degradable_query_pressure_version = degradable_query_pressure_version;
+                self.query_workload_connection_metrics =
+                    Some(metrics::QueryWorkloadConnectionMetrics::new(
+                        self.query_workload_class,
+                        APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS.is_some(),
+                    ));
 
                 self.state.set_session_id(session_id);
                 if let Some(max_observed_timestamp) = max_observed_timestamp {
@@ -863,6 +1120,9 @@ impl<RT: Runtime> SyncWorker<RT> {
                     .modify_identity(identity, auth_token, base_version)?;
                 self.schedule_update();
             },
+            ClientMessage::RetryDegradableQueries { epoch } => {
+                self.handle_degradable_query_retry_request(epoch);
+            },
             ClientMessage::Event(client_event) => {
                 tracing::info!(
                     "Event with type {}: {}",
@@ -990,6 +1250,12 @@ impl<RT: Runtime> SyncWorker<RT> {
         let need_fetch: Vec<_> = self.state.need_fetch().collect();
         let host = self.host.clone();
         let client_version = self.config.client_version.clone();
+        let query_workload_class = if APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS.is_some()
+        {
+            self.query_workload_class
+        } else {
+            None
+        };
         let partition_id = self.partition_id;
         let request_metadata = self.request_metadata.clone();
         let mut backoff = Backoff::new(
@@ -1025,6 +1291,7 @@ impl<RT: Runtime> SyncWorker<RT> {
                     identity.clone(),
                     identity_changed,
                     client_version.clone(),
+                    query_workload_class,
                     partition_id,
                     subscriptions_client.clone(),
                     remaining_subscriptions.clone(),
@@ -1046,18 +1313,80 @@ impl<RT: Runtime> SyncWorker<RT> {
                         continue;
                     },
                     other => {
-                        let (udf_results, temporarily_unavailable) = other?;
+                        let (udf_results, query_deferrals) = other?;
                         break Ok(TransitionState {
                             udf_results,
                             state_modifications,
                             current_version,
                             new_version,
                             timer,
-                            temporarily_unavailable,
+                            query_deferrals,
                         });
                     },
                 }
             }
+        }
+        .in_span(root))
+    }
+
+    fn begin_retry_deferred_queries(
+        &mut self,
+        identity: Identity,
+        subscriptions_client: Arc<dyn SubscriptionClient>,
+        trigger: DegradableQueryRetryTrigger,
+    ) -> anyhow::Result<impl Future<Output = anyhow::Result<TransitionState>> + use<RT>> {
+        let root = get_sampled_span(
+            &self.host.deployment_name,
+            "sync-worker/retry-deferred-queries",
+            &mut self.rt.rng(),
+        )
+        .with_property(|| ("udf_type", UdfType::Query.to_lowercase_string()));
+        let timer = metrics::update_queries_timer(self.partition_id);
+        let current_version = self.state.current_version();
+        let deferred_queries: Vec<_> = self.state.degradable_fetches().collect();
+        let deferred_query_count = u32::try_from(deferred_queries.len())
+            .context("deferred retry query count exceeds the metrics range")?;
+        let deferred_query_count = NonZeroU32::new(deferred_query_count)
+            .context("deferred retry unexpectedly selected no queries")?;
+        metrics::log_degradable_query_retry_attempt(trigger, deferred_query_count);
+
+        let api = self.api.clone();
+        let rt = self.rt.clone();
+        let host = self.host.clone();
+        let client_version = self.config.client_version.clone();
+        let query_workload_class = if APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS.is_some()
+        {
+            self.query_workload_class
+        } else {
+            None
+        };
+        let partition_id = self.partition_id;
+        let request_metadata = self.request_metadata.clone();
+        Ok(async move {
+            let (udf_results, query_deferrals) = Self::run_update_queries(
+                api,
+                rt,
+                host,
+                request_metadata,
+                deferred_queries,
+                identity,
+                false,
+                client_version,
+                query_workload_class,
+                partition_id,
+                subscriptions_client,
+                BTreeMap::new(),
+                current_version.ts,
+            )
+            .await?;
+            Ok(TransitionState {
+                udf_results,
+                state_modifications: BTreeMap::new(),
+                current_version,
+                new_version: current_version,
+                timer,
+                query_deferrals,
+            })
         }
         .in_span(root))
     }
@@ -1071,13 +1400,14 @@ impl<RT: Runtime> SyncWorker<RT> {
         identity: Identity,
         identity_changed: bool,
         client_version: ClientVersion,
+        query_workload_class: Option<QueryWorkloadClass>,
         partition_id: u64,
         subscriptions_client: Arc<dyn SubscriptionClient>,
         mut remaining_subscriptions: BTreeMap<QueryId, Arc<dyn SubscriptionTrait>>,
         new_ts: Timestamp,
     ) -> anyhow::Result<(
-        Vec<(QueryId, QueryResult, Arc<dyn SubscriptionTrait>)>,
-        bool,
+        Vec<(QueryId, QueryResult, Option<Arc<dyn SubscriptionTrait>>)>,
+        BTreeSet<QueryDeferralReason>,
     )> {
         let future_results = join_update_query_tasks(
             "update_query",
@@ -1147,6 +1477,7 @@ impl<RT: Runtime> SyncWorker<RT> {
                                             ExportPath::from(query.udf_path.clone().canonicalize()),
                                             query.args.clone(),
                                             caller.clone(),
+                                            query_workload_class,
                                             ExecuteQueryTimestamp::At(new_ts),
                                             query.journal.clone(),
                                             Some(invocation),
@@ -1166,6 +1497,7 @@ impl<RT: Runtime> SyncWorker<RT> {
                                             path,
                                             query.args.clone(),
                                             caller.clone(),
+                                            query_workload_class,
                                             ExecuteQueryTimestamp::At(new_ts),
                                             query.journal.clone(),
                                             Some(invocation),
@@ -1193,8 +1525,21 @@ impl<RT: Runtime> SyncWorker<RT> {
                             };
                             match udf_return_result {
                                 Err(e) => {
-                                    if e.is_feature_temporarily_unavailable() {
-                                        (QueryResult::TemporarilyUnavailable, None)
+                                    if e.is_degradable_query_capacity() {
+                                        metrics::log_degradable_query_deferral();
+                                        (
+                                            QueryResult::Deferred(
+                                                QueryDeferralReason::DegradableQueryCapacity,
+                                            ),
+                                            None,
+                                        )
+                                    } else if e.is_feature_temporarily_unavailable() {
+                                        (
+                                            QueryResult::Deferred(
+                                                QueryDeferralReason::FeatureTemporarilyUnavailable,
+                                            ),
+                                            None,
+                                        )
                                     } else {
                                         anyhow::bail!(e)
                                     }
@@ -1239,17 +1584,15 @@ impl<RT: Runtime> SyncWorker<RT> {
         .await?;
 
         let mut udf_results = vec![];
-        let mut temporarily_unavailable = false;
+        let mut query_deferrals = BTreeSet::new();
         for (query_id, result, maybe_subscription) in future_results {
-            if matches!(result, QueryResult::TemporarilyUnavailable) {
-                temporarily_unavailable = true;
+            if let QueryResult::Deferred(reason) = &result {
+                query_deferrals.insert(*reason);
             }
-            if let Some(subscription) = maybe_subscription {
-                udf_results.push((query_id, result, subscription));
-            }
+            udf_results.push((query_id, result, maybe_subscription));
         }
 
-        Ok((udf_results, temporarily_unavailable))
+        Ok((udf_results, query_deferrals))
     }
 
     fn finish_update_queries(
@@ -1260,16 +1603,18 @@ impl<RT: Runtime> SyncWorker<RT> {
             current_version,
             new_version,
             timer,
-            temporarily_unavailable,
+            query_deferrals,
         }: TransitionState,
     ) -> anyhow::Result<ServerMessage> {
-        for (query_id, result, subscription) in udf_results {
+        for (query_id, result, maybe_subscription) in udf_results {
             match result {
                 QueryResult::Rerun {
                     result,
                     log_lines,
                     journal,
                 } => {
+                    let subscription = maybe_subscription
+                        .context("Successful query rerun is missing its subscription")?;
                     let modification = self.state.complete_fetch(
                         query_id,
                         result,
@@ -1283,19 +1628,41 @@ impl<RT: Runtime> SyncWorker<RT> {
                     state_modifications.insert(query_id, modification);
                 },
                 QueryResult::Refresh => {
+                    let subscription = maybe_subscription
+                        .context("Refreshed query is missing its subscription")?;
                     self.state.refill_subscription(query_id, subscription)?;
                 },
-                QueryResult::TemporarilyUnavailable => {
-                    anyhow::bail!(
-                        "No QueryResult::TemporarilyUnavailable should have a udf result and \
-                         subscription"
-                    )
+                QueryResult::Deferred(QueryDeferralReason::DegradableQueryCapacity) => {
+                    anyhow::ensure!(
+                        maybe_subscription.is_none(),
+                        "Deferred query unexpectedly retained a subscription"
+                    );
+                    self.state.defer_degradable_fetch(query_id)?;
+                },
+                QueryResult::Deferred(QueryDeferralReason::FeatureTemporarilyUnavailable) => {
+                    anyhow::ensure!(
+                        maybe_subscription.is_none(),
+                        "Feature-unavailable query unexpectedly retained a subscription"
+                    );
+                    self.state.defer_feature_unavailable_fetch(query_id)?;
                 },
             }
         }
 
-        if temporarily_unavailable {
-            self.schedule_unavailable_query_retry();
+        self.degradable_query_retry_scheduled =
+            degradable_retry_scheduled_after_transition(self.degradable_query_retry_scheduled);
+        if self.state.degradable_query_count() > 0 {
+            self.schedule_degradable_query_retry_after_delay();
+        } else {
+            self.degradable_query_retry_future = None;
+        }
+        if query_deferrals.contains(&QueryDeferralReason::FeatureTemporarilyUnavailable) {
+            self.schedule_feature_unavailable_query_retry();
+        }
+
+        let server_pressure = self.server_pressure_for_transition(&query_deferrals)?;
+        if server_pressure.is_some() {
+            metrics::log_degradable_query_capacity_pressure_transition();
         }
 
         // Resubscribe for queries that don't have an active invalidation
@@ -1310,6 +1677,7 @@ impl<RT: Runtime> SyncWorker<RT> {
             modifications: state_modifications.into_values().collect(),
             client_clock_skew: self.client_clock_skew,
             server_ts: None,
+            server_pressure,
         };
         timer.finish();
         metrics::log_query_set_size(self.partition_id, self.state.num_queries());
@@ -1341,4 +1709,100 @@ pub(crate) fn authentication_update_error(error: anyhow::Error) -> anyhow::Error
         return error;
     }
     ErrorMetadata::auth_update_failed(error.short_msg().to_string(), error.msg().to_string()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn degradable_capacity_is_not_a_generic_query_retry() {
+        let error: anyhow::Error = ErrorMetadata::degradable_query_capacity().into();
+        assert!(error.is_degradable_query_capacity());
+        assert!(error.is_feature_temporarily_unavailable());
+        assert!(!error.is_overloaded());
+        assert!(!error.is_rejected_before_execution());
+        assert!(!is_retriable_sync_worker_error(&error));
+    }
+
+    #[test]
+    fn completed_transition_discards_only_a_stale_timer_retry() {
+        assert_eq!(degradable_retry_scheduled_after_transition(None), None);
+        assert_eq!(
+            degradable_retry_scheduled_after_transition(Some(DegradableQueryRetryTrigger::Timer)),
+            None
+        );
+        assert_eq!(
+            degradable_retry_scheduled_after_transition(Some(DegradableQueryRetryTrigger::Client)),
+            Some(DegradableQueryRetryTrigger::Client)
+        );
+    }
+
+    #[test]
+    fn pressure_lifecycle_retains_epoch_updates_count_and_clears() -> anyhow::Result<()> {
+        let mut state = None;
+        let mut last_epoch = None;
+        let legacy = pressure_for_transition(None, &mut state, &mut last_epoch, 1, true)?;
+        let Some(ServerPressure::LegacyDegradableQueryCapacity { retry_after_ms }) = legacy else {
+            panic!("legacy client did not receive legacy pressure")
+        };
+        assert_eq!(
+            u128::from(retry_after_ms.get()),
+            DEGRADABLE_QUERY_RETRY_DELAY.as_millis()
+        );
+
+        let version = Some(DegradableQueryPressureProtocolVersion::V1);
+        let active = pressure_for_transition(version, &mut state, &mut last_epoch, 2, true)?;
+        let Some(ServerPressure::DegradableQueryCapacityActive {
+            epoch,
+            pending_query_count,
+            ..
+        }) = active
+        else {
+            panic!("first deferral did not open an epoch")
+        };
+        assert_eq!(epoch, DegradableQueryPressureEpoch::first());
+        assert_eq!(pending_query_count.get(), 2);
+
+        assert_eq!(
+            pressure_for_transition(version, &mut state, &mut last_epoch, 2, false)?,
+            None
+        );
+        let repeated = pressure_for_transition(version, &mut state, &mut last_epoch, 2, true)?;
+        assert!(matches!(
+            repeated,
+            Some(ServerPressure::DegradableQueryCapacityActive {
+                epoch: repeated_epoch,
+                ..
+            }) if repeated_epoch == epoch
+        ));
+
+        let reduced = pressure_for_transition(version, &mut state, &mut last_epoch, 1, false)?;
+        assert!(matches!(
+            reduced,
+            Some(ServerPressure::DegradableQueryCapacityActive {
+                epoch: reduced_epoch,
+                pending_query_count,
+                ..
+            }) if reduced_epoch == epoch && pending_query_count.get() == 1
+        ));
+        assert_eq!(
+            pressure_for_transition(version, &mut state, &mut last_epoch, 0, false)?,
+            Some(ServerPressure::DegradableQueryCapacityCleared { epoch })
+        );
+        assert_eq!(
+            pressure_for_transition(version, &mut state, &mut last_epoch, 0, false)?,
+            None
+        );
+
+        let next = pressure_for_transition(version, &mut state, &mut last_epoch, 1, true)?;
+        assert!(matches!(
+            next,
+            Some(ServerPressure::DegradableQueryCapacityActive {
+                epoch: next_epoch,
+                ..
+            }) if next_epoch == epoch.next()
+        ));
+        Ok(())
+    }
 }

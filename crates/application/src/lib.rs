@@ -362,6 +362,7 @@ use sync_types::{
     CanonicalizedModulePath,
     CanonicalizedUdfPath,
     FunctionName,
+    QueryWorkloadClass,
     SerializedQueryJournal,
 };
 use system_table_cleanup::SystemTableCleanupWorker;
@@ -1305,6 +1306,68 @@ impl<RT: Runtime> Application<RT> {
         invocation: QueryInvocation,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<RedactedQueryReturn> {
+        self.read_only_udf_at_ts_with_classes(
+            request_context,
+            path,
+            args,
+            identity,
+            ts,
+            journal,
+            caller,
+            invocation,
+            scheduler_dependency,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_only_udf_at_ts_with_workload_class(
+        &self,
+        request_context: RequestContext,
+        path: PublicFunctionPath,
+        args: SerializedArgs,
+        identity: Identity,
+        ts: Timestamp,
+        journal: Option<Option<String>>,
+        caller: FunctionCaller,
+        invocation: QueryInvocation,
+        query_workload_class: Option<QueryWorkloadClass>,
+    ) -> anyhow::Result<RedactedQueryReturn> {
+        self.read_only_udf_at_ts_with_classes(
+            request_context,
+            path,
+            args,
+            identity,
+            ts,
+            journal,
+            caller,
+            invocation,
+            SchedulerDependencyClass::Independent,
+            query_workload_class,
+        )
+        .await
+    }
+
+    async fn read_only_udf_at_ts_with_classes(
+        &self,
+        request_context: RequestContext,
+        path: PublicFunctionPath,
+        args: SerializedArgs,
+        identity: Identity,
+        ts: Timestamp,
+        journal: Option<Option<String>>,
+        caller: FunctionCaller,
+        invocation: QueryInvocation,
+        scheduler_dependency: SchedulerDependencyClass,
+        query_workload_class: Option<QueryWorkloadClass>,
+    ) -> anyhow::Result<RedactedQueryReturn> {
+        if query_workload_class.is_some() {
+            anyhow::ensure!(
+                matches!(&caller, FunctionCaller::SyncWorker(_))
+                    && !scheduler_dependency.unblocks_ancestor(),
+                "Only independent root sync queries may declare a query workload class"
+            );
+        }
         let request_id = request_context.request_id.clone();
         let persistence_version = self.database.persistence_version();
         let block_logging = self
@@ -1324,7 +1387,7 @@ impl<RT: Runtime> Application<RT> {
                 })
                 .transpose()?;
             self.runner
-                .run_query_at_ts_with_scheduler_dependency(
+                .run_query_at_ts_with_classes(
                     request_context.clone(),
                     path,
                     args,
@@ -1334,6 +1397,7 @@ impl<RT: Runtime> Application<RT> {
                     caller,
                     invocation,
                     scheduler_dependency,
+                    query_workload_class,
                 )
                 .await?
         });

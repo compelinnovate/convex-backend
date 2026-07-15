@@ -82,6 +82,145 @@ fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
     value
 }
 
+/// Optional admission and watchdog policy for one local Node executor pool.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalNodeExecutorPoolPolicy {
+    /// Maximum independent Node actions admitted concurrently to this pool.
+    pub max_concurrency: Option<usize>,
+    /// Maximum failed-health interval tolerated before retiring this pool's
+    /// event loop.
+    pub max_event_loop_unresponsive_seconds: Option<u64>,
+    /// Queue duration after which admission records an operator warning metric.
+    pub queue_warning_seconds: Option<u64>,
+}
+
+struct UniqueLocalNodeExecutorPoolPolicies(BTreeMap<String, LocalNodeExecutorPoolPolicy>);
+
+impl<'de> Deserialize<'de> for UniqueLocalNodeExecutorPoolPolicies {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PoliciesVisitor;
+
+        impl<'de> Visitor<'de> for PoliciesVisitor {
+            type Value = UniqueLocalNodeExecutorPoolPolicies;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON object keyed by Node pool name")
+            }
+
+            fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut policies = BTreeMap::new();
+                while let Some((pool_name, policy)) =
+                    entries.next_entry::<String, LocalNodeExecutorPoolPolicy>()?
+                {
+                    if policies.insert(pool_name.clone(), policy).is_some() {
+                        return Err(A::Error::custom(format_args!(
+                            "duplicate Node pool name {pool_name:?}"
+                        )));
+                    }
+                }
+                Ok(UniqueLocalNodeExecutorPoolPolicies(policies))
+            }
+        }
+
+        deserializer.deserialize_map(PoliciesVisitor)
+    }
+}
+
+fn valid_local_node_pool_policy_name(name: &str) -> bool {
+    // This is the host-policy form of model::config::NodeExecutorPoolName:
+    // named routes use the same grammar, while the reserved `default` key is
+    // accepted only here to address the ordinary executor pool.
+    if name == "default" {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 32
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .skip(1)
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+fn parse_local_node_executor_pool_policies(
+    value: &str,
+) -> anyhow::Result<BTreeMap<String, LocalNodeExecutorPoolPolicy>> {
+    let UniqueLocalNodeExecutorPoolPolicies(policies) =
+        serde_json::from_str(value).context("expected a JSON object keyed by Node pool name")?;
+    anyhow::ensure!(
+        policies.len() <= MAX_LOCAL_NODE_EXECUTOR_POOL_POLICIES,
+        "at most {MAX_LOCAL_NODE_EXECUTOR_POOL_POLICIES} local Node pool policies may be \
+         configured"
+    );
+    for (pool_name, policy) in &policies {
+        anyhow::ensure!(
+            valid_local_node_pool_policy_name(pool_name),
+            "invalid Node pool name {pool_name:?}"
+        );
+        anyhow::ensure!(
+            policy.max_concurrency.is_some()
+                || policy.max_event_loop_unresponsive_seconds.is_some()
+                || policy.queue_warning_seconds.is_some(),
+            "Node pool {pool_name:?} has an empty policy"
+        );
+        if let Some(max_concurrency) = policy.max_concurrency {
+            validate_usize_strict_nonzero("maxConcurrency", max_concurrency)?;
+        }
+        anyhow::ensure!(
+            policy.queue_warning_seconds.is_none() || policy.max_concurrency.is_some(),
+            "Node pool {pool_name:?} queueWarningSeconds requires maxConcurrency"
+        );
+        anyhow::ensure!(
+            policy
+                .max_event_loop_unresponsive_seconds
+                .is_none_or(|seconds| seconds > 0),
+            "Node pool {pool_name:?} maxEventLoopUnresponsiveSeconds must be greater than zero"
+        );
+        anyhow::ensure!(
+            policy
+                .queue_warning_seconds
+                .is_none_or(|seconds| seconds > 0),
+            "Node pool {pool_name:?} queueWarningSeconds must be greater than zero"
+        );
+    }
+    Ok(policies)
+}
+
+/// Per-pool local Node admission and event-loop watchdog overrides.
+///
+/// The value is a strict JSON object keyed by the application-declared pool
+/// name. The reserved `default` key configures the ordinary Node pool. Missing
+/// pools retain the existing application-wide concurrency and watchdog policy.
+pub static LOCAL_NODE_EXECUTOR_POOL_POLICIES: LazyLock<
+    BTreeMap<String, LocalNodeExecutorPoolPolicy>,
+> = LazyLock::new(
+    || match std::env::var("LOCAL_NODE_EXECUTOR_POOL_POLICIES") {
+        Ok(value) => {
+            let policies =
+                parse_local_node_executor_pool_policies(&value).unwrap_or_else(|error| {
+                    panic!("Invalid LOCAL_NODE_EXECUTOR_POOL_POLICIES: {error:#}")
+                });
+            tracing::info!(
+                configured_pool_policies = policies.len(),
+                "Configured local Node executor pool policies"
+            );
+            policies
+        },
+        Err(std::env::VarError::NotPresent) => BTreeMap::new(),
+        Err(std::env::VarError::NotUnicode(..)) => {
+            panic!("Invalid non-Unicode value for LOCAL_NODE_EXECUTOR_POOL_POLICIES")
+        },
+    },
+);
+
 fn env_config_duration_millis_strict(name: &str, default: usize) -> Duration {
     let millis = env_config_usize_strict(name, default)
         .try_into()
@@ -1366,11 +1505,10 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
     )
 });
 
-/// Maximum elastic capacity shared by degradable root reactive-query
-/// cache-miss leaders and isolate module analysis. Absence disables degradable
-/// admission and preserves unpaced analysis. A configured cap leaves at least
-/// one shared-base application and isolate-worker slot. A finite active-
-/// JavaScript gate either exceeds the cap or configures class minimums.
+/// Maximum concurrent degradable root reactive-query cache-miss leaders.
+/// Absence disables degradable admission. A configured cap leaves at least one
+/// shared-base application and isolate-worker slot. A finite active-JavaScript
+/// gate either exceeds the cap or configures class minimums.
 pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
     LazyLock::new(|| {
         let capacity =
@@ -1807,6 +1945,17 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
 /// patches/dependency_capacity/README.md.
 pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> =
     LazyLock::new(|| env_config_usize_strict("FUNRUN_ISOLATE_ACTIVE_THREADS", 0));
+
+/// Minimum protected active-JavaScript occupancy under protected/degradable
+/// contention. Zero disables class-aware admission and requires the matching
+/// degradable minimum to be zero.
+pub static FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN: LazyLock<usize> =
+    LazyLock::new(|| env_config_usize_strict("FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN", 0));
+
+/// Minimum degradable active-JavaScript occupancy under protected/degradable
+/// contention. Capacity unused by either class remains available to the other.
+pub static FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN: LazyLock<usize> =
+    LazyLock::new(|| env_config_usize_strict("FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN", 0));
 
 /// Isolate worker usage at which the funrun load reporter's
 /// `effective_load` saturates to 1.0.
@@ -2490,5 +2639,36 @@ mod strict_capacity_tests {
         assert!(
             validate_usize_strict_nonzero("CAP", tokio::sync::Semaphore::MAX_PERMITS + 1).is_err()
         );
+    }
+
+    #[test]
+    fn degradable_query_capacity_leaves_each_finite_shared_base() {
+        assert!(validate_degradable_query_leader_capacity(4, 16, 300, 1, 8, 0, 0).is_ok());
+        assert!(validate_degradable_query_leader_capacity(4, 16, 300, 1, 0, 0, 0).is_ok());
+        assert!(validate_degradable_query_leader_capacity(0, 16, 300, 1, 8, 0, 0).is_err());
+        assert!(validate_degradable_query_leader_capacity(15, 16, 300, 1, 20, 0, 0).is_err());
+        assert!(validate_degradable_query_leader_capacity(299, 512, 300, 1, 512, 0, 0).is_err());
+        assert!(validate_degradable_query_leader_capacity(8, 16, 300, 1, 8, 0, 0).is_err());
+        assert!(validate_degradable_query_leader_capacity(1, 16, 1, 1, 8, 0, 0).is_err());
+    }
+
+    #[test]
+    fn degradable_query_capacity_can_exceed_class_aware_active_capacity() {
+        assert!(validate_degradable_query_leader_capacity(32, 256, 62, 20, 28, 4, 14).is_ok());
+        assert!(validate_degradable_query_leader_capacity(32, 256, 62, 20, 28, 0, 14).is_err());
+        assert!(validate_degradable_query_leader_capacity(32, 256, 62, 20, 28, 15, 14).is_err());
+        assert!(validate_degradable_query_leader_capacity(32, 256, 62, 20, 0, 4, 14).is_err());
+        assert!(validate_degradable_query_leader_capacity(8, 256, 62, 20, 28, 4, 14).is_err());
+    }
+
+    #[test]
+    fn active_javascript_minimums_require_finite_capacity_and_degradable_admission() {
+        assert!(validate_active_javascript_class_minimums(28, 4, 14, Some(32)).is_ok());
+        assert!(validate_active_javascript_class_minimums(28, 0, 0, None).is_ok());
+        assert!(validate_active_javascript_class_minimums(28, 0, 14, Some(32)).is_err());
+        assert!(validate_active_javascript_class_minimums(0, 4, 14, Some(32)).is_err());
+        assert!(validate_active_javascript_class_minimums(28, 15, 14, Some(32)).is_err());
+        assert!(validate_active_javascript_class_minimums(28, 4, 14, None).is_err());
+        assert!(validate_active_javascript_class_minimums(28, 4, 14, Some(8)).is_err());
     }
 }

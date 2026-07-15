@@ -1,6 +1,7 @@
 use std::{
+    array,
+    collections::VecDeque,
     mem,
-    pin::pin,
     sync::Arc,
     time::{
         Duration,
@@ -8,33 +9,46 @@ use std::{
     },
 };
 
-use common::runtime::Runtime;
+use common::{
+    runtime::Runtime,
+    types::ActiveJavascriptClass,
+};
 use fastrace::{
     func_path,
     Span,
 };
 use futures::Future;
 use parking_lot::Mutex;
-use scopeguard::ScopeGuard;
 use slab::Slab;
-use tokio::sync::Notify;
+use tokio::sync::oneshot;
 
 use crate::metrics::{
     concurrency_permit_acquire_timer,
+    decrement_active_javascript_occupancy,
+    decrement_active_javascript_waiters,
+    increment_active_javascript_occupancy,
+    increment_active_javascript_waiters,
+    initialize_active_javascript_metrics,
     log_concurrency_permit_used,
 };
 
-/// ConcurrencyLimiter is used to limit how many isolate threads can be
-/// actively running at the same time. We use it to avoid oversubscribing the
-/// CPU, which would result in unexpected user timeouts and arbitrary slow
-/// downs throughout the system.
+/// Whether active JavaScript is starting or resuming after an asynchronous
+/// wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConcurrencyPermitPhase {
+    Initial,
+    Resume,
+}
+
+/// Limits how many isolate threads can actively run JavaScript at the same
+/// time.
 ///
-/// When the max number of permits has been handed out, `acquire` calls queue up
-/// in a "high priority" and a "low priority" queue. The high priority queue is
-/// used for functions that are re-acquiring a permit after execution has
-/// already started, while low priority is given to new function invocations.
-/// When a permit becomes available, it is always given to a high priority
-/// waiter (if present) before any low priority waiter.
+/// Dependency work always runs first because it releases an isolate-holding
+/// ancestor. When class minimums are configured, protected and degradable work
+/// each receive a non-preemptive service floor under contention and borrow all
+/// capacity the other class does not need. Elastic occupancy is balanced
+/// between the two classes. Resumptions precede initial starts within the
+/// selected class.
 #[derive(Clone, Debug)]
 pub struct ConcurrencyLimiter {
     inner: Arc<ConcurrencyLimiterInner>,
@@ -42,38 +56,155 @@ pub struct ConcurrencyLimiter {
 
 #[derive(Debug)]
 struct ConcurrencyLimiterInner {
-    low_priority: Notify,
-    high_priority: Notify,
     tracker: Mutex<ActivePermitsTracker>,
     max_permits: usize,
+    protected_minimum: usize,
+    degradable_minimum: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaiterState {
+    Waiting,
+    Granted,
+}
+
+#[derive(Debug)]
+struct Waiter {
+    queue: WaiterQueue,
+    state: WaiterState,
+    sender: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Debug)]
+struct ActivePermit {
+    client_id: Arc<String>,
+    started: Instant,
+    class: ActiveJavascriptClass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaiterQueue {
+    DependencyResume,
+    DependencyInitial,
+    ProtectedResume,
+    ProtectedInitial,
+    DegradableResume,
+    DegradableInitial,
+}
+
+impl WaiterQueue {
+    const COUNT: usize = 6;
+
+    fn new(class: ActiveJavascriptClass, phase: ConcurrencyPermitPhase) -> Self {
+        match (class, phase) {
+            (ActiveJavascriptClass::Dependency, ConcurrencyPermitPhase::Resume) => {
+                Self::DependencyResume
+            },
+            (ActiveJavascriptClass::Dependency, ConcurrencyPermitPhase::Initial) => {
+                Self::DependencyInitial
+            },
+            (ActiveJavascriptClass::Protected, ConcurrencyPermitPhase::Resume) => {
+                Self::ProtectedResume
+            },
+            (ActiveJavascriptClass::Protected, ConcurrencyPermitPhase::Initial) => {
+                Self::ProtectedInitial
+            },
+            (ActiveJavascriptClass::Degradable, ConcurrencyPermitPhase::Resume) => {
+                Self::DegradableResume
+            },
+            (ActiveJavascriptClass::Degradable, ConcurrencyPermitPhase::Initial) => {
+                Self::DegradableInitial
+            },
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::DependencyResume => 0,
+            Self::DependencyInitial => 1,
+            Self::ProtectedResume => 2,
+            Self::ProtectedInitial => 3,
+            Self::DegradableResume => 4,
+            Self::DegradableInitial => 5,
+        }
+    }
+
+    fn class(self) -> ActiveJavascriptClass {
+        match self {
+            Self::DependencyResume | Self::DependencyInitial => ActiveJavascriptClass::Dependency,
+            Self::ProtectedResume | Self::ProtectedInitial => ActiveJavascriptClass::Protected,
+            Self::DegradableResume | Self::DegradableInitial => ActiveJavascriptClass::Degradable,
+        }
+    }
+
+    fn phase(self) -> &'static str {
+        match self {
+            Self::DependencyResume | Self::ProtectedResume | Self::DegradableResume => "resume",
+            Self::DependencyInitial | Self::ProtectedInitial | Self::DegradableInitial => "initial",
+        }
+    }
 }
 
 #[derive(Debug)]
 struct ActivePermitsTracker {
-    // invariant: `active_permits.len() <= max_permits`
-    active_permits: Slab<(Arc<String>, Instant)>,
-    // invariant: `(active_permits.len() + waiting_high_priority).saturating_sub(max_permits)`
-    // equals the number of unwoken high-priority `Notified` futures
-    waiting_high_priority: usize,
+    active_permits: Slab<ActivePermit>,
+    active_by_class: [usize; 3],
+    granted_by_class: [usize; 3],
+    waiters: Slab<Waiter>,
+    queues: [VecDeque<usize>; WaiterQueue::COUNT],
+    next_elastic_class: ActiveJavascriptClass,
 }
 
 impl ConcurrencyLimiter {
     pub fn new(max_concurrency: usize) -> Self {
+        Self::new_with_class_minimums(max_concurrency, 0, 0)
+    }
+
+    pub fn new_with_class_minimums(
+        max_concurrency: usize,
+        protected_minimum: usize,
+        degradable_minimum: usize,
+    ) -> Self {
         assert!(
             max_concurrency > 0,
             "max_concurrency must be greater than zero"
         );
-        Self {
+        assert_eq!(
+            protected_minimum == 0,
+            degradable_minimum == 0,
+            "protected and degradable minimums must be enabled together"
+        );
+        assert!(
+            protected_minimum
+                .checked_add(degradable_minimum)
+                .is_some_and(|sum| sum <= max_concurrency),
+            "active-JavaScript class minimums exceed total capacity"
+        );
+        let limiter = Self {
             inner: Arc::new(ConcurrencyLimiterInner {
-                low_priority: Notify::new(),
-                high_priority: Notify::new(),
                 tracker: Mutex::new(ActivePermitsTracker {
                     active_permits: Slab::new(),
-                    waiting_high_priority: 0,
+                    active_by_class: [0; 3],
+                    granted_by_class: [0; 3],
+                    waiters: Slab::new(),
+                    queues: array::from_fn(|_| VecDeque::new()),
+                    next_elastic_class: ActiveJavascriptClass::Degradable,
                 }),
                 max_permits: max_concurrency,
+                protected_minimum,
+                degradable_minimum,
             }),
-        }
+        };
+        initialize_active_javascript_metrics(
+            if max_concurrency == usize::MAX {
+                0
+            } else {
+                max_concurrency
+            },
+            protected_minimum,
+            degradable_minimum,
+        );
+        limiter
     }
 
     pub fn unlimited() -> Self {
@@ -84,12 +215,26 @@ impl ConcurrencyLimiter {
         self.inner.tracker.lock().active_permits.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn waiting_permits(
+        &self,
+        class: ActiveJavascriptClass,
+        phase: ConcurrencyPermitPhase,
+    ) -> usize {
+        let queue = WaiterQueue::new(class, phase);
+        self.inner.tracker.lock().queues[queue.index()].len()
+    }
+
     pub fn max_permits(&self) -> Option<usize> {
         if self.inner.max_permits == usize::MAX {
             None
         } else {
             Some(self.inner.max_permits)
         }
+    }
+
+    pub(crate) fn class_aware_admission_enabled(&self) -> bool {
+        self.inner.protected_minimum > 0
     }
 
     // If a client uses a thread for too long. We still want to log periodically.
@@ -115,75 +260,135 @@ impl ConcurrencyLimiter {
         }
     }
 
+    /// Compatibility entry point for callers without an explicit service class.
     pub async fn acquire(&self, client_id: Arc<String>, high_priority: bool) -> ConcurrencyPermit {
-        let timer = concurrency_permit_acquire_timer();
-        let mut span = None;
-        let mut tracker = loop {
-            let mut notify_future = pin!(None);
-            {
-                let mut tracker = self.inner.tracker.lock();
-                if tracker.admits_low_priority(self.inner.max_permits) {
-                    break tracker;
-                }
-                span.get_or_insert_with(|| Span::enter_with_local_parent(func_path!()));
-                let notify = if high_priority {
-                    tracker.waiting_high_priority += 1;
-                    &self.inner.high_priority
-                } else {
-                    &self.inner.low_priority
-                };
-                notify_future.as_mut().set(Some(notify.notified()));
-                // N.B.: enable while still holding the lock.
-                let had_permit = notify_future.as_mut().as_pin_mut().unwrap().enable();
-                // There should never be a permit saved in the `high_priority`
-                // Notify since we do our own accounting to transfer the permits to
-                // low_priority.
-                assert!(!(had_permit && high_priority));
-                drop(tracker);
-            }
-            // In case of cancellation, decrement `waiting_high_priority` and notify
-            // low-priority waiters if appropriate
-            let mut guard = scopeguard::guard(notify_future, |mut notify_future| {
-                if high_priority {
-                    let mut tracker = self.inner.tracker.lock();
-                    tracker.waiting_high_priority -= 1;
-                    // If we've been notified, consume it and transfer the
-                    // notification to the next waiter. Do this under lock so
-                    // that it goes to the right queue.
-                    if notify_future.as_mut().as_pin_mut().unwrap().enable() {
-                        if tracker.admits_low_priority(self.inner.max_permits) {
-                            self.inner.low_priority.notify_one();
-                        } else {
-                            self.inner.high_priority.notify_one();
-                        }
-                    }
-                    // Otherwise drop the future right away so that we
-                    // definitely don't get a notification
-                    notify_future.as_mut().set(None);
-                }
-                // For low priority waiters, the `Notified` future will drop and
-                // eventually transfer its notification automatically
-            });
-            guard.as_mut().as_pin_mut().unwrap().await;
-            ScopeGuard::into_inner(guard);
+        self.acquire_with_class(
+            client_id,
+            ActiveJavascriptClass::Protected,
             if high_priority {
-                let mut tracker = self.inner.tracker.lock();
-                // high-priority is always FIFO, so we can continue as soon as
-                // we are notified
-                tracker.waiting_high_priority -= 1;
-                break tracker;
-            }
-            // ... but low-priority callers can barge so we
-            // need to re-check that there are available permits
+                ConcurrencyPermitPhase::Resume
+            } else {
+                ConcurrencyPermitPhase::Initial
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn acquire_with_class(
+        &self,
+        client_id: Arc<String>,
+        class: ActiveJavascriptClass,
+        phase: ConcurrencyPermitPhase,
+    ) -> ConcurrencyPermit {
+        // Zero minimums disable class-aware admission completely. Preserve the
+        // previous phase-only policy so adding this code does not reprioritize
+        // dependencies or degradable declarations without an explicit opt-in.
+        let class = if !self.class_aware_admission_enabled() {
+            ActiveJavascriptClass::Protected
+        } else {
+            class
         };
-        assert!(tracker.active_permits.len() < self.inner.max_permits);
-        let permit_id = tracker.register(client_id.clone());
+        let queue = WaiterQueue::new(class, phase);
+        let timer = concurrency_permit_acquire_timer(class, queue.phase());
+        let (sender, receiver) = oneshot::channel();
+        let waiter_id = {
+            let mut tracker = self.inner.tracker.lock();
+            let waiter_id = tracker.waiters.insert(Waiter {
+                queue,
+                state: WaiterState::Waiting,
+                sender: Some(sender),
+            });
+            tracker.queues[queue.index()].push_back(waiter_id);
+            increment_active_javascript_waiters(class, queue.phase());
+            tracker.dispatch(&self.inner);
+            waiter_id
+        };
+        let mut guard = WaiterGuard {
+            limiter: self.clone(),
+            waiter_id: Some(waiter_id),
+        };
+        let _span = Span::enter_with_local_parent(func_path!());
+        receiver
+            .await
+            .expect("active-JavaScript waiter disappeared before its grant");
+
+        let permit_id = {
+            let mut tracker = self.inner.tracker.lock();
+            let waiter = tracker.waiters.remove(waiter_id);
+            assert_eq!(
+                waiter.state,
+                WaiterState::Granted,
+                "active-JavaScript waiter awoke without a grant"
+            );
+            let class_index = class_index(class);
+            tracker.granted_by_class[class_index] = tracker.granted_by_class[class_index]
+                .checked_sub(1)
+                .expect("active-JavaScript granted count underflow");
+            tracker.register(client_id.clone(), class)
+        };
+        guard.waiter_id = None;
         timer.finish(true);
-        drop(tracker);
         ConcurrencyPermit {
             permit_id,
             limiter: self.clone(),
             client_id,
+            class,
+        }
+    }
+
+    pub(crate) async fn acquire_internal_dependency(
+        &self,
+        client_id: Arc<String>,
+    ) -> ConcurrencyPermit {
+        // Direct internal callbacks used the resumption tier before service
+        // classes existed. Preserve that ordering when class-aware admission
+        // is disabled; with service floors enabled, dependency class supplies
+        // the priority and the callback remains an initial start.
+        let phase = if !self.class_aware_admission_enabled() {
+            ConcurrencyPermitPhase::Resume
+        } else {
+            ConcurrencyPermitPhase::Initial
+        };
+        self.acquire_with_class(client_id, ActiveJavascriptClass::Dependency, phase)
+            .await
+    }
+
+    fn cancel_waiter(&self, waiter_id: usize) {
+        let mut tracker = self.inner.tracker.lock();
+        let Some(waiter) = tracker.waiters.try_remove(waiter_id) else {
+            return;
+        };
+        match waiter.state {
+            WaiterState::Waiting => {
+                let queue = &mut tracker.queues[waiter.queue.index()];
+                let position = queue
+                    .iter()
+                    .position(|queued_id| *queued_id == waiter_id)
+                    .expect("waiting active-JavaScript waiter missing from its queue");
+                queue.remove(position);
+                decrement_active_javascript_waiters(waiter.queue.class(), waiter.queue.phase());
+            },
+            WaiterState::Granted => {
+                let class_index = class_index(waiter.queue.class());
+                tracker.granted_by_class[class_index] = tracker.granted_by_class[class_index]
+                    .checked_sub(1)
+                    .expect("active-JavaScript granted count underflow");
+                decrement_active_javascript_occupancy(waiter.queue.class());
+            },
+        }
+        tracker.dispatch(&self.inner);
+    }
+}
+
+struct WaiterGuard {
+    limiter: ConcurrencyLimiter,
+    waiter_id: Option<usize>,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if let Some(waiter_id) = self.waiter_id.take() {
+            self.limiter.cancel_waiter(waiter_id);
         }
     }
 }
@@ -191,25 +396,200 @@ impl ConcurrencyLimiter {
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
 struct PermitId(usize);
 
+fn class_index(class: ActiveJavascriptClass) -> usize {
+    match class {
+        ActiveJavascriptClass::Dependency => 0,
+        ActiveJavascriptClass::Protected => 1,
+        ActiveJavascriptClass::Degradable => 2,
+    }
+}
+
 impl ActivePermitsTracker {
-    fn register(&mut self, client_id: Arc<String>) -> PermitId {
-        PermitId(self.active_permits.insert((client_id, Instant::now())))
+    fn register(&mut self, client_id: Arc<String>, class: ActiveJavascriptClass) -> PermitId {
+        self.active_by_class[class_index(class)] += 1;
+        PermitId(self.active_permits.insert(ActivePermit {
+            client_id,
+            started: Instant::now(),
+            class,
+        }))
     }
 
-    fn deregister(&mut self, id: PermitId) -> Duration {
-        let (_, start) = self.active_permits.remove(id.0);
-        start.elapsed()
+    fn deregister(&mut self, id: PermitId) -> (Duration, ActiveJavascriptClass) {
+        let permit = self.active_permits.remove(id.0);
+        let class_index = class_index(permit.class);
+        self.active_by_class[class_index] = self.active_by_class[class_index]
+            .checked_sub(1)
+            .expect("active-JavaScript class count underflow");
+        decrement_active_javascript_occupancy(permit.class);
+        (permit.started.elapsed(), permit.class)
     }
 
-    fn admits_low_priority(&self, max_permits: usize) -> bool {
-        self.active_permits.len() + self.waiting_high_priority < max_permits
+    fn total_occupancy(&self) -> usize {
+        self.active_permits.len() + self.granted_by_class.iter().sum::<usize>()
+    }
+
+    fn class_occupancy(&self, class: ActiveJavascriptClass) -> usize {
+        let index = class_index(class);
+        self.active_by_class[index] + self.granted_by_class[index]
+    }
+
+    fn class_has_waiter(&self, class: ActiveJavascriptClass) -> bool {
+        match class {
+            ActiveJavascriptClass::Dependency => {
+                !self.queues[WaiterQueue::DependencyResume.index()].is_empty()
+                    || !self.queues[WaiterQueue::DependencyInitial.index()].is_empty()
+            },
+            ActiveJavascriptClass::Protected => {
+                !self.queues[WaiterQueue::ProtectedResume.index()].is_empty()
+                    || !self.queues[WaiterQueue::ProtectedInitial.index()].is_empty()
+            },
+            ActiveJavascriptClass::Degradable => {
+                !self.queues[WaiterQueue::DegradableResume.index()].is_empty()
+                    || !self.queues[WaiterQueue::DegradableInitial.index()].is_empty()
+            },
+        }
+    }
+
+    fn select_class(&mut self, inner: &ConcurrencyLimiterInner) -> Option<ActiveJavascriptClass> {
+        if self.class_has_waiter(ActiveJavascriptClass::Dependency) {
+            return Some(ActiveJavascriptClass::Dependency);
+        }
+
+        let protected_waiting = self.class_has_waiter(ActiveJavascriptClass::Protected);
+        let degradable_waiting = self.class_has_waiter(ActiveJavascriptClass::Degradable);
+        match (protected_waiting, degradable_waiting) {
+            (false, false) => return None,
+            (true, false) => return Some(ActiveJavascriptClass::Protected),
+            (false, true) => return Some(ActiveJavascriptClass::Degradable),
+            (true, true) => {},
+        }
+
+        if inner.protected_minimum == 0 {
+            // Preserve the original two-tier behavior when class minimums are
+            // disabled: every resumption precedes every initial start.
+            let protected_resume = !self.queues[WaiterQueue::ProtectedResume.index()].is_empty();
+            let degradable_resume = !self.queues[WaiterQueue::DegradableResume.index()].is_empty();
+            return match (protected_resume, degradable_resume) {
+                (true, false) => Some(ActiveJavascriptClass::Protected),
+                (false, true) => Some(ActiveJavascriptClass::Degradable),
+                _ => Some(self.take_next_elastic_class()),
+            };
+        }
+
+        let protected_occupancy = self.class_occupancy(ActiveJavascriptClass::Protected);
+        let degradable_occupancy = self.class_occupancy(ActiveJavascriptClass::Degradable);
+        let protected_below = protected_occupancy < inner.protected_minimum;
+        let degradable_below = degradable_occupancy < inner.degradable_minimum;
+        match (protected_below, degradable_below) {
+            (true, false) => Some(ActiveJavascriptClass::Protected),
+            (false, true) => Some(ActiveJavascriptClass::Degradable),
+            (true, true) => {
+                // Compare satisfaction ratios without floating point. Filling
+                // floors proportionally prevents the larger floor from delaying
+                // all progress in the smaller class during a cold burst.
+                let protected_scaled =
+                    protected_occupancy as u128 * inner.degradable_minimum as u128;
+                let degradable_scaled =
+                    degradable_occupancy as u128 * inner.protected_minimum as u128;
+                if protected_scaled < degradable_scaled {
+                    Some(ActiveJavascriptClass::Protected)
+                } else if degradable_scaled < protected_scaled {
+                    Some(ActiveJavascriptClass::Degradable)
+                } else {
+                    Some(self.take_next_elastic_class())
+                }
+            },
+            (false, false) => {
+                let protected_elastic = protected_occupancy - inner.protected_minimum;
+                let degradable_elastic = degradable_occupancy - inner.degradable_minimum;
+                // Balance elastic occupancy, not only the handoff sequence.
+                // Otherwise a class that initially borrowed the whole gate can
+                // lose every elastic slot as its incumbents finish, even while
+                // both classes remain continuously runnable.
+                if protected_elastic < degradable_elastic {
+                    Some(ActiveJavascriptClass::Protected)
+                } else if degradable_elastic < protected_elastic {
+                    Some(ActiveJavascriptClass::Degradable)
+                } else {
+                    Some(self.take_next_elastic_class())
+                }
+            },
+        }
+    }
+
+    fn take_next_elastic_class(&mut self) -> ActiveJavascriptClass {
+        let selected = self.next_elastic_class;
+        self.next_elastic_class = match selected {
+            ActiveJavascriptClass::Protected => ActiveJavascriptClass::Degradable,
+            ActiveJavascriptClass::Degradable => ActiveJavascriptClass::Protected,
+            ActiveJavascriptClass::Dependency => {
+                panic!("dependency cannot be the next elastic active-JavaScript class")
+            },
+        };
+        selected
+    }
+
+    fn pop_waiter(&mut self, class: ActiveJavascriptClass) -> Option<usize> {
+        let queues = match class {
+            ActiveJavascriptClass::Dependency => [
+                WaiterQueue::DependencyResume,
+                WaiterQueue::DependencyInitial,
+            ],
+            ActiveJavascriptClass::Protected => {
+                [WaiterQueue::ProtectedResume, WaiterQueue::ProtectedInitial]
+            },
+            ActiveJavascriptClass::Degradable => [
+                WaiterQueue::DegradableResume,
+                WaiterQueue::DegradableInitial,
+            ],
+        };
+        for queue in queues {
+            if let Some(waiter_id) = self.queues[queue.index()].pop_front() {
+                return Some(waiter_id);
+            }
+        }
+        None
+    }
+
+    fn dispatch(&mut self, inner: &ConcurrencyLimiterInner) {
+        while self.total_occupancy() < inner.max_permits {
+            let Some(class) = self.select_class(inner) else {
+                return;
+            };
+            let waiter_id = self
+                .pop_waiter(class)
+                .expect("selected active-JavaScript class has no waiter");
+            let waiter = self
+                .waiters
+                .get_mut(waiter_id)
+                .expect("queued active-JavaScript waiter is missing");
+            assert_eq!(waiter.state, WaiterState::Waiting);
+            waiter.state = WaiterState::Granted;
+            self.granted_by_class[class_index(class)] += 1;
+            decrement_active_javascript_waiters(class, waiter.queue.phase());
+            increment_active_javascript_occupancy(class);
+            let sender = waiter
+                .sender
+                .take()
+                .expect("waiting active-JavaScript waiter has no sender");
+            if sender.send(()).is_err() {
+                self.waiters.remove(waiter_id);
+                self.granted_by_class[class_index(class)] -= 1;
+                decrement_active_javascript_occupancy(class);
+            }
+        }
     }
 
     fn reset_start_time(&mut self) -> Vec<(Arc<String>, Instant)> {
         let now = Instant::now();
         self.active_permits
             .iter_mut()
-            .map(|(_, (client, start))| (client.clone(), mem::replace(start, now)))
+            .map(|(_, permit)| {
+                (
+                    permit.client_id.clone(),
+                    mem::replace(&mut permit.started, now),
+                )
+            })
             .collect()
     }
 }
@@ -217,9 +597,9 @@ impl ActivePermitsTracker {
 #[derive(Debug)]
 pub struct ConcurrencyPermit {
     permit_id: PermitId,
-
     limiter: ConcurrencyLimiter,
     client_id: Arc<String>,
+    class: ActiveJavascriptClass,
 }
 
 impl ConcurrencyPermit {
@@ -236,7 +616,15 @@ impl ConcurrencyPermit {
     pub fn suspend(self) -> SuspendedPermit {
         let client_id = self.client_id.clone();
         let limiter = self.limiter.clone();
-        SuspendedPermit { client_id, limiter }
+        let class = self.class;
+        // The service class follows the execution across every async wait. A
+        // resume classified as a fresh protected start can starve an admitted
+        // degradable tree after the tree has already consumed lifetime capacity.
+        SuspendedPermit {
+            client_id,
+            limiter,
+            class,
+        }
     }
 
     pub fn limiter(&self) -> &ConcurrencyLimiter {
@@ -247,12 +635,9 @@ impl ConcurrencyPermit {
 impl Drop for ConcurrencyPermit {
     fn drop(&mut self) {
         let mut tracker = self.limiter.inner.tracker.lock();
-        let duration = tracker.deregister(self.permit_id);
-        if tracker.admits_low_priority(self.limiter.inner.max_permits) {
-            self.limiter.inner.low_priority.notify_one();
-        } else {
-            self.limiter.inner.high_priority.notify_one();
-        }
+        let (duration, class) = tracker.deregister(self.permit_id);
+        assert_eq!(class, self.class, "active-JavaScript permit class drifted");
+        tracker.dispatch(&self.limiter.inner);
         drop(tracker);
         log_concurrency_permit_used(self.client_id.clone(), duration);
     }
@@ -261,12 +646,13 @@ impl Drop for ConcurrencyPermit {
 pub struct SuspendedPermit {
     limiter: ConcurrencyLimiter,
     client_id: Arc<String>,
+    class: ActiveJavascriptClass,
 }
 
 impl SuspendedPermit {
     pub async fn acquire(self) -> ConcurrencyPermit {
         self.limiter
-            .acquire(self.client_id, true /* high_priority */)
+            .acquire_with_class(self.client_id, self.class, ConcurrencyPermitPhase::Resume)
             .await
     }
 }
@@ -274,16 +660,35 @@ impl SuspendedPermit {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         sync::Arc,
         task::Poll,
     };
 
-    use futures::poll;
+    use common::types::ActiveJavascriptClass;
+    use futures::{
+        poll,
+        FutureExt,
+    };
 
-    use super::ConcurrencyLimiter;
+    use super::{
+        ConcurrencyLimiter,
+        ConcurrencyPermit,
+        ConcurrencyPermitPhase,
+    };
+
+    fn acquire<'a>(
+        limiter: &'a ConcurrencyLimiter,
+        name: impl Into<String>,
+        class: ActiveJavascriptClass,
+        phase: ConcurrencyPermitPhase,
+    ) -> impl Future<Output = ConcurrencyPermit> + 'a {
+        let name = name.into();
+        limiter.acquire_with_class(Arc::new(name), class, phase)
+    }
 
     #[tokio::test]
-    async fn high_priority_waiter_overtakes_older_low_priority_waiter() {
+    async fn resumption_overtakes_initial_start_without_class_minimums() {
         let limiter = ConcurrencyLimiter::new(1);
         let initial_permit = limiter.acquire(Arc::new("initial".to_owned()), false).await;
         let mut low_priority = Box::pin(limiter.acquire(Arc::new("low".to_owned()), false));
@@ -302,70 +707,178 @@ mod tests {
             panic!("low-priority waiter was not notified after the high-priority permit dropped");
         };
         drop(low_priority_permit);
-
-        let tracker = limiter.inner.tracker.lock();
-        assert_eq!(tracker.active_permits.len(), 0);
-        assert_eq!(tracker.waiting_high_priority, 0);
     }
 
     #[tokio::test]
-    async fn cancelling_unnotified_high_priority_waiter_preserves_capacity() {
-        let limiter = ConcurrencyLimiter::new(1);
-        let initial_permit = limiter.acquire(Arc::new("initial".to_owned()), false).await;
-        let mut high_priority = Box::pin(limiter.acquire(Arc::new("high".to_owned()), true));
-        assert!(matches!(poll!(high_priority.as_mut()), Poll::Pending));
-        let mut low_priority = Box::pin(limiter.acquire(Arc::new("low".to_owned()), false));
-        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
-        assert_eq!(limiter.inner.tracker.lock().waiting_high_priority, 1);
-
-        drop(high_priority);
-        assert_eq!(limiter.inner.tracker.lock().waiting_high_priority, 0);
-        drop(initial_permit);
-
-        let Poll::Ready(low_priority_permit) = poll!(low_priority.as_mut()) else {
-            panic!("cancelling an unnotified high-priority waiter lost capacity");
-        };
-        drop(low_priority_permit);
-
-        let tracker = limiter.inner.tracker.lock();
-        assert_eq!(tracker.active_permits.len(), 0);
-        assert_eq!(tracker.waiting_high_priority, 0);
-    }
-
-    #[tokio::test]
-    async fn cancelling_notified_high_priority_waiter_transfers_notification() {
-        let limiter = ConcurrencyLimiter::new(1);
-        let initial_permit = limiter.acquire(Arc::new("initial".to_owned()), false).await;
-        let mut first_high_priority =
-            Box::pin(limiter.acquire(Arc::new("first high".to_owned()), true));
-        assert!(matches!(poll!(first_high_priority.as_mut()), Poll::Pending));
-        let mut second_high_priority =
-            Box::pin(limiter.acquire(Arc::new("second high".to_owned()), true));
-        assert!(matches!(
-            poll!(second_high_priority.as_mut()),
-            Poll::Pending
+    async fn dependency_precedes_both_service_classes() {
+        let limiter = ConcurrencyLimiter::new_with_class_minimums(2, 1, 1);
+        let held = limiter.acquire(Arc::new("held".to_owned()), false).await;
+        let second_held = limiter
+            .acquire(Arc::new("second-held".to_owned()), false)
+            .await;
+        let mut protected = Box::pin(acquire(
+            &limiter,
+            "protected",
+            ActiveJavascriptClass::Protected,
+            ConcurrencyPermitPhase::Resume,
         ));
-        let mut low_priority = Box::pin(limiter.acquire(Arc::new("low".to_owned()), false));
-        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
-        assert_eq!(limiter.inner.tracker.lock().waiting_high_priority, 2);
+        let mut degradable = Box::pin(acquire(
+            &limiter,
+            "degradable",
+            ActiveJavascriptClass::Degradable,
+            ConcurrencyPermitPhase::Resume,
+        ));
+        let mut dependency = Box::pin(acquire(
+            &limiter,
+            "dependency",
+            ActiveJavascriptClass::Dependency,
+            ConcurrencyPermitPhase::Initial,
+        ));
+        assert!(protected.as_mut().now_or_never().is_none());
+        assert!(degradable.as_mut().now_or_never().is_none());
+        assert!(dependency.as_mut().now_or_never().is_none());
 
-        drop(initial_permit);
-        drop(first_high_priority);
+        drop(held);
+        let dependency_permit = dependency.await;
+        assert!(protected.as_mut().now_or_never().is_none());
+        assert!(degradable.as_mut().now_or_never().is_none());
+        drop(dependency_permit);
+        drop(second_held);
+    }
 
-        assert_eq!(limiter.inner.tracker.lock().waiting_high_priority, 1);
-        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
-        let Poll::Ready(second_high_priority_permit) = poll!(second_high_priority.as_mut()) else {
-            panic!("notification was not transferred to the next high-priority waiter");
+    #[tokio::test]
+    async fn degradable_uses_ordinary_admission_without_class_minimums() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let permit = acquire(
+            &limiter,
+            "degradable",
+            ActiveJavascriptClass::Degradable,
+            ConcurrencyPermitPhase::Initial,
+        )
+        .await;
+        assert_eq!(permit.class, ActiveJavascriptClass::Protected);
+    }
+
+    #[tokio::test]
+    async fn resumption_precedes_initial_start_within_a_class() {
+        let limiter = ConcurrencyLimiter::new_with_class_minimums(2, 1, 1);
+        let first = limiter.acquire(Arc::new("first".to_owned()), false).await;
+        let second = limiter.acquire(Arc::new("second".to_owned()), false).await;
+        let mut initial = Box::pin(acquire(
+            &limiter,
+            "initial",
+            ActiveJavascriptClass::Degradable,
+            ConcurrencyPermitPhase::Initial,
+        ));
+        let mut resume = Box::pin(acquire(
+            &limiter,
+            "resume",
+            ActiveJavascriptClass::Degradable,
+            ConcurrencyPermitPhase::Resume,
+        ));
+        assert!(matches!(poll!(initial.as_mut()), Poll::Pending));
+        assert!(matches!(poll!(resume.as_mut()), Poll::Pending));
+
+        drop(first);
+        let Poll::Ready(resumed) = poll!(resume.as_mut()) else {
+            panic!("degradable resumption did not precede its initial start");
         };
-        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
-        drop(second_high_priority_permit);
-        let Poll::Ready(low_priority_permit) = poll!(low_priority.as_mut()) else {
-            panic!("notification was not transferred to the low-priority waiter");
-        };
-        drop(low_priority_permit);
+        assert!(matches!(poll!(initial.as_mut()), Poll::Pending));
+        drop(resumed);
+        drop(second);
+    }
 
-        let tracker = limiter.inner.tracker.lock();
-        assert_eq!(tracker.active_permits.len(), 0);
-        assert_eq!(tracker.waiting_high_priority, 0);
+    #[tokio::test]
+    async fn class_minimums_are_work_conserving_and_balance_elastic_occupancy() {
+        let limiter = ConcurrencyLimiter::new_with_class_minimums(6, 1, 3);
+        let held: Vec<_> = futures::future::join_all(
+            (0..6).map(|index| limiter.acquire(Arc::new(format!("held-{index}")), false)),
+        )
+        .await;
+        let mut protected: Vec<_> = (0..6)
+            .map(|index| {
+                Box::pin(acquire(
+                    &limiter,
+                    format!("protected-{index}"),
+                    ActiveJavascriptClass::Protected,
+                    ConcurrencyPermitPhase::Initial,
+                ))
+            })
+            .collect();
+        let mut degradable: Vec<_> = (0..6)
+            .map(|index| {
+                Box::pin(acquire(
+                    &limiter,
+                    format!("degradable-{index}"),
+                    ActiveJavascriptClass::Degradable,
+                    ConcurrencyPermitPhase::Initial,
+                ))
+            })
+            .collect();
+        for waiter in protected.iter_mut().chain(degradable.iter_mut()) {
+            assert!(waiter.as_mut().now_or_never().is_none());
+        }
+
+        drop(held);
+        let mut protected_permits = Vec::new();
+        let mut degradable_permits = Vec::new();
+        for waiter in &mut protected {
+            if let Some(permit) = waiter.as_mut().now_or_never() {
+                protected_permits.push(permit);
+            }
+        }
+        for waiter in &mut degradable {
+            if let Some(permit) = waiter.as_mut().now_or_never() {
+                degradable_permits.push(permit);
+            }
+        }
+        assert_eq!((protected_permits.len(), degradable_permits.len()), (2, 4));
+        drop(protected_permits);
+        drop(degradable_permits);
+    }
+
+    #[tokio::test]
+    async fn cancelling_waiting_requests_preserves_capacity() {
+        let limiter = ConcurrencyLimiter::new_with_class_minimums(2, 1, 1);
+        let first = limiter.acquire(Arc::new("first".to_owned()), false).await;
+        let second = limiter.acquire(Arc::new("second".to_owned()), false).await;
+        let mut cancelled = Box::pin(acquire(
+            &limiter,
+            "cancelled",
+            ActiveJavascriptClass::Degradable,
+            ConcurrencyPermitPhase::Resume,
+        ));
+        assert!(cancelled.as_mut().now_or_never().is_none());
+        drop(cancelled);
+        drop(first);
+        drop(second);
+
+        let replacement = acquire(
+            &limiter,
+            "replacement",
+            ActiveJavascriptClass::Protected,
+            ConcurrencyPermitPhase::Initial,
+        )
+        .await;
+        drop(replacement);
+        assert_eq!(limiter.active_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_granted_request_transfers_capacity() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let held = limiter.acquire(Arc::new("held".to_owned()), false).await;
+        let mut cancelled = Box::pin(limiter.acquire(Arc::new("cancelled".to_owned()), true));
+        let mut replacement = Box::pin(limiter.acquire(Arc::new("replacement".to_owned()), true));
+        assert!(matches!(poll!(cancelled.as_mut()), Poll::Pending));
+        assert!(matches!(poll!(replacement.as_mut()), Poll::Pending));
+
+        drop(held);
+        drop(cancelled);
+        let Poll::Ready(replacement) = poll!(replacement.as_mut()) else {
+            panic!("cancelled grant did not transfer active-JavaScript capacity");
+        };
+        drop(replacement);
+        assert_eq!(limiter.active_permits(), 0);
     }
 }
