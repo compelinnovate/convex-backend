@@ -39,7 +39,10 @@ pub fn log_cron_job_failure(e: &anyhow::Error) {
     )
 }
 
-register_convex_histogram!(CRON_JOB_EXECUTION_LAG_SECONDS, "Cron job execution lag");
+register_convex_histogram!(
+    CRON_JOB_EXECUTION_LAG_SECONDS,
+    "Ready-queue lag sample in seconds for registered cron jobs"
+);
 pub fn log_cron_job_execution_lag(lag: Duration) {
     log_distribution(&CRON_JOB_EXECUTION_LAG_SECONDS, lag.as_secs_f64());
 }

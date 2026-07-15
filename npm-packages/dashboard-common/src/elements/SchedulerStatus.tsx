@@ -1,7 +1,11 @@
-import { formatDistance } from "date-fns";
 import { cn } from "@ui/cn";
 import { HealthCard } from "@common/elements/HealthCard";
-import { useSchedulerLag } from "@common/lib/appMetrics";
+import {
+  formatSchedulerLag,
+  SCHEDULER_LAG_CRITICAL_SECONDS,
+  SCHEDULER_LAG_WARNING_SECONDS,
+  useSchedulerLag,
+} from "@common/lib/appMetrics";
 import { ChartForFunctionRate } from "@common/features/health/components/ChartForFunctionRate";
 import { ChartData } from "@common/lib/charts/types";
 
@@ -10,23 +14,24 @@ export function SchedulerStatus({
   lag: lagProp,
 }: {
   small?: boolean;
-  lag?: ChartData | null | undefined;
+  lag?: ChartData | null;
 }) {
   const lagFromHook = useSchedulerLag();
   const lag = lagProp ?? lagFromHook;
-  const lagData = lag?.data as Array<{ time: string; lag: number }> | undefined;
-  const behindBySeconds =
-    60 * ((lagData && lagData[lagData.length - 1]?.lag) || 0);
+  const lagData = lag?.data as
+    | Array<{ time: string; lag: number | null }>
+    | undefined;
+  const behindBySeconds = lagData?.[lagData.length - 1]?.lag ?? 0;
 
   const health =
-    behindBySeconds <= 20
+    behindBySeconds <= SCHEDULER_LAG_WARNING_SECONDS
       ? "healthy"
-      : behindBySeconds > 300
-        ? "error"
-        : "warning";
+      : behindBySeconds > SCHEDULER_LAG_CRITICAL_SECONDS
+      ? "error"
+      : "warning";
 
   if (small) {
-    if (!health || health === "healthy") {
+    if (health === "healthy") {
       return null;
     }
     return (
@@ -42,8 +47,7 @@ export function SchedulerStatus({
         <div className="truncate text-center text-pretty text-content-secondary">
           <div className="flex gap-1">
             <p className="text-content-secondary">
-              Scheduling is behind by{" "}
-              {formatDistance(0, behindBySeconds * 1000)}.
+              Scheduling is behind by {formatSchedulerLag(behindBySeconds)}.
             </p>
           </div>
         </div>
@@ -53,7 +57,7 @@ export function SchedulerStatus({
   return (
     <HealthCard
       title="Scheduler Status"
-      tip="The status of function scheduling. Scheduling is unhealthy when functions are executing after their scheduled time."
+      tip="The ready-queue lag for scheduled functions. Sustained lag means a pending function remained ready past its target time."
     >
       <ChartForFunctionRate chartData={lag} kind="schedulerStatus" />
     </HealthCard>

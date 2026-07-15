@@ -4,6 +4,9 @@ import {
   ExclamationTriangleIcon,
 } from "@radix-ui/react-icons";
 import {
+  formatSchedulerLag,
+  SCHEDULER_LAG_CRITICAL_SECONDS,
+  SCHEDULER_LAG_WARNING_SECONDS,
   useSchedulerLag,
   useFunctionConcurrency,
 } from "@common/lib/appMetrics";
@@ -33,16 +36,34 @@ export function useConcurrencyStatus(
 
     // Check scheduler status
     if (lag && lag.data.length > 0) {
-      const currentLag = lag.data[lag.data.length - 1].lag;
-      const wasBehind = lag.data.some((d) => d.lag > 0);
+      const currentLagSeconds = lag.data[lag.data.length - 1].lag;
+      const wasBehind = lag.data.some(
+        (d) => d.lag !== null && d.lag > SCHEDULER_LAG_WARNING_SECONDS,
+      );
 
-      if (currentLag > 1) {
+      if (
+        currentLagSeconds !== null &&
+        currentLagSeconds > SCHEDULER_LAG_CRITICAL_SECONDS
+      ) {
         result.push({
           severity: "critical",
-          message: `Scheduler is ${currentLag} minutes behind`,
+          message: `Scheduler is ${formatSchedulerLag(
+            currentLagSeconds,
+          )} behind`,
           type: "scheduler",
         });
-      } else if (wasBehind && currentLag === 0) {
+      } else if (
+        currentLagSeconds !== null &&
+        currentLagSeconds > SCHEDULER_LAG_WARNING_SECONDS
+      ) {
+        result.push({
+          severity: "warning",
+          message: `Scheduler is ${formatSchedulerLag(
+            currentLagSeconds,
+          )} behind`,
+          type: "scheduler",
+        });
+      } else if (currentLagSeconds !== null && wasBehind) {
         result.push({
           severity: "warning",
           message: "Scheduler was behind but has recovered",
@@ -51,34 +72,29 @@ export function useConcurrencyStatus(
       }
     }
 
-    // Check concurrency limits for each function type (only if enabled)
-    if (showConcurrencyIssues && queued && running) {
+    // Report observed queueing without treating it as proof that a configured
+    // concurrency limit was reached. The metrics do not include those limits.
+    if (showConcurrencyIssues && queued) {
       const queuedData = queued.data as Array<Record<string, number>>;
-      const runningData = running.data as Array<Record<string, number>>;
 
       for (const lineKey of queued.lineKeys) {
         const functionType = lineKey.name;
-        const currentQueued =
+        const latestBucketQueued =
           queuedData[queuedData.length - 1]?.[functionType] ?? 0;
         const hasBeenQueued = queuedData.some(
           (d) => (d[functionType] ?? 0) > 0,
         );
 
-        // Check if currently maxed out - queued functions with running at capacity
-        if (currentQueued > 0) {
-          const currentRunning =
-            runningData[runningData.length - 1]?.[functionType] ?? 0;
-          if (currentRunning > 0) {
-            result.push({
-              severity: "critical",
-              message: `${functionType} currently at concurrency limit`,
-              type: "concurrency",
-            });
-          }
+        if (latestBucketQueued > 0) {
+          result.push({
+            severity: "warning",
+            message: `Queueing observed for ${functionType} in the latest minute`,
+            type: "concurrency",
+          });
         } else if (hasBeenQueued) {
           result.push({
             severity: "warning",
-            message: `${functionType} hit concurrency limit`,
+            message: `Queueing observed for ${functionType} in the last hour`,
             type: "concurrency",
           });
         }
@@ -86,16 +102,15 @@ export function useConcurrencyStatus(
     }
 
     return result;
-  }, [lag, queued, running, showConcurrencyIssues]);
+  }, [lag, queued, showConcurrencyIssues]);
 
   const closedDescription = useMemo(() => {
-    // Don't show anything until necessary data has loaded
-    if (!lag) {
-      return null;
-    }
-
-    // If concurrency issues are enabled, wait for all data to load
-    if (showConcurrencyIssues && (!queued || !running)) {
+    // Missing data must not hide an issue established by another series. Wait
+    // for every relevant series only before showing the healthy chart count.
+    if (
+      issues.length === 0 &&
+      (!lag || (showConcurrencyIssues && (!queued || !running)))
+    ) {
       return null;
     }
 

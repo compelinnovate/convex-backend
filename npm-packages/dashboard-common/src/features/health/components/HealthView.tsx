@@ -116,7 +116,7 @@ export function HealthView({
                     </HealthCard>
                     <HealthCard
                       title="Queued Functions"
-                      tip="The maximum number of functions waiting to be ran in a given minute. Functions are queued when the concurrency limit has been reached. If a function is queued for too long, it will discarded."
+                      tip="The maximum number of functions waiting to start in a given minute. Queueing alone does not show that a configured concurrency limit was reached."
                     >
                       <ChartForFunctionRate
                         chartData={queued}

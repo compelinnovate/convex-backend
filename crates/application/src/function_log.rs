@@ -80,6 +80,7 @@ use udf::{
 };
 use udf_metrics::{
     CounterBucket,
+    GaugeBucket,
     MetricName,
     MetricStore,
     MetricStoreConfig,
@@ -103,6 +104,9 @@ use value::{
     },
     sha256::Sha256Digest,
 };
+
+const SCHEDULED_JOB_METRICS_BUCKET_WIDTH: Duration = Duration::from_secs(15);
+const SCHEDULED_JOB_METRICS_MAX_BUCKETS: usize = 240;
 
 pub enum OutstandingFunctionState {
     Running,
@@ -533,6 +537,7 @@ impl FromStr for TableRate {
 #[derive(Clone)]
 pub struct FunctionExecutionLog<RT: Runtime> {
     inner: Arc<Mutex<Inner<RT>>>,
+    scheduled_job_metrics: Arc<Mutex<MetricStore>>,
     usage_tracking: UsageCounter,
     rt: RT,
     concurrency_stats_logger: Arc<Mutex<Box<dyn SpawnHandle>>>,
@@ -541,22 +546,29 @@ pub struct FunctionExecutionLog<RT: Runtime> {
 impl<RT: Runtime> FunctionExecutionLog<RT> {
     pub fn new(rt: RT, usage_tracking: UsageCounter, log_manager: Arc<dyn LogSender>) -> Self {
         let base_ts = rt.system_time();
+        let metrics_config = MetricStoreConfig {
+            bucket_width: *knobs::UDF_METRICS_BUCKET_WIDTH,
+            max_buckets: *knobs::UDF_METRICS_MAX_BUCKETS,
+            histogram_min_duration: *knobs::UDF_METRICS_MIN_DURATION,
+            histogram_max_duration: *knobs::UDF_METRICS_MAX_DURATION,
+            histogram_significant_figures: *knobs::UDF_METRICS_SIGNIFICANT_FIGURES,
+        };
+        let scheduled_job_metrics_config = MetricStoreConfig {
+            bucket_width: SCHEDULED_JOB_METRICS_BUCKET_WIDTH,
+            max_buckets: SCHEDULED_JOB_METRICS_MAX_BUCKETS,
+            ..metrics_config
+        };
+        let scheduled_job_metrics = Arc::new(Mutex::new(MetricStore::new(
+            base_ts,
+            scheduled_job_metrics_config,
+        )));
         let inner = Arc::new(Mutex::new(Inner {
             rt: rt.clone(),
             num_execution_completions: 0,
             log: WithHeapSize::default(),
             log_waiters: vec![].into(),
             log_manager,
-            metrics: MetricStore::new(
-                base_ts,
-                MetricStoreConfig {
-                    bucket_width: *knobs::UDF_METRICS_BUCKET_WIDTH,
-                    max_buckets: *knobs::UDF_METRICS_MAX_BUCKETS,
-                    histogram_min_duration: *knobs::UDF_METRICS_MIN_DURATION,
-                    histogram_max_duration: *knobs::UDF_METRICS_MAX_DURATION,
-                    histogram_significant_figures: *knobs::UDF_METRICS_SIGNIFICANT_FIGURES,
-                },
-            ),
+            metrics: MetricStore::new(base_ts, metrics_config),
         }));
 
         let inner_for_task = inner.clone();
@@ -610,6 +622,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
 
         Self {
             inner,
+            scheduled_job_metrics,
             rt,
             usage_tracking,
             concurrency_stats_logger,
@@ -1282,8 +1295,24 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         }
     }
 
-    /// Indicates that as of now (`timestamp`), the next scheduled job is at
-    /// `next_job_ts` (None if there are no pending jobs)
+    /// Records that as of `timestamp`, the next scheduled job is at
+    /// `next_job_ts` (None if there are no pending jobs).
+    ///
+    /// Scheduler lag is extrapolated from this state, so callers must record
+    /// every observation rather than applying structured-log rate limits
+    /// here.
+    pub fn record_scheduled_job_lag(&self, next_job_ts: Option<SystemTime>, timestamp: SystemTime) {
+        let result = record_scheduled_job_lag_sample(
+            &mut self.scheduled_job_metrics.lock(),
+            next_job_ts,
+            timestamp,
+        );
+        if let Err(e) = result {
+            Inner::<RT>::log_metrics_error(e);
+        }
+    }
+
+    /// Emits rate-limited structured scheduler statistics.
     pub fn log_scheduled_job_stats(
         &self,
         next_job_ts: Option<SystemTime>,
@@ -1886,33 +1915,8 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
     }
 
     pub fn scheduled_job_lag(&self, window: MetricsWindow) -> anyhow::Result<Timeseries> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
-        let buckets = metrics
-            .query_gauge(scheduled_job_next_ts_metric(), window.start..window.end)?
-            .into_iter()
-            .collect();
-        let mut timeseries = window.resample_gauges(&metrics, buckets)?;
-        // For buckets where no value is recorded, interpolate the previous known value
-        // but increase it by the timestep (since lag naturally increases over
-        // time)
-        for i in 1..timeseries.len() {
-            if timeseries[i].1.is_none()
-                && let Some(prev) = timeseries[i - 1].1
-            {
-                let offset = timeseries[i].0.duration_since(timeseries[i - 1].0)?;
-                timeseries[i].1 = Some(prev + offset.as_secs_f64());
-            }
-        }
-        // Then clamp negative values to zero
-        for (_, bucket) in &mut timeseries {
-            if let Some(value) = bucket {
-                *value = value.max(0.);
-            }
-        }
-        Ok(timeseries)
+        let metrics = self.scheduled_job_metrics.lock().clone();
+        query_scheduled_job_lag(&window, &metrics)
     }
 
     /// Log the current number of outstanding functions as a gauge that tracks
@@ -1949,10 +1953,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         let metric_names = metrics.metric_names_for_type(MetricType::Gauge);
         for metric_name in metric_names {
             if metric_name.starts_with("outstanding_functions:") {
-                let buckets = metrics
-                    .query_gauge(&metric_name, window.start..window.end)?
-                    .into_iter()
-                    .collect();
+                let buckets = metrics.query_gauge(&metric_name, window.start..window.end)?;
                 let timeseries = window.resample_gauges(&metrics, buckets)?;
                 result.insert(metric_name.to_string(), timeseries);
             }
@@ -2016,6 +2017,78 @@ fn cache_hit_percentage(hits: Option<f64>, misses: Option<f64>) -> Option<f64> {
         // There are misses but not hits, so the hit rate is 0.
         (None, Some(_misses)) => Some(0.),
         (None, None) => None,
+    }
+}
+
+fn resample_scheduled_job_lag(
+    window: &MetricsWindow,
+    metrics: &MetricStore,
+    buckets: Vec<&GaugeBucket>,
+) -> anyhow::Result<Timeseries> {
+    let samples = buckets
+        .into_iter()
+        .map(|bucket| (metrics.bucket_start(bucket.index), f64::from(bucket.value)))
+        .collect_vec();
+    let mut next_sample = 0;
+    let mut latest_sample = None;
+    let mut result = Vec::with_capacity(window.num_buckets);
+
+    for output_index in 0..window.num_buckets {
+        let output_time = window.bucket_start(output_index)?;
+        while next_sample < samples.len() && samples[next_sample].0 <= output_time {
+            latest_sample = Some(samples[next_sample]);
+            next_sample += 1;
+        }
+        let value = match latest_sample {
+            Some((sample_time, sample_value)) => {
+                let elapsed = output_time.duration_since(sample_time)?;
+                Some((sample_value + elapsed.as_secs_f64()).max(0.0))
+            },
+            None => None,
+        };
+        result.push((output_time, value));
+    }
+    Ok(result)
+}
+
+fn query_scheduled_job_lag(
+    window: &MetricsWindow,
+    metrics: &MetricStore,
+) -> anyhow::Result<Timeseries> {
+    // A scheduler that errors before obtaining another queue decision has no new
+    // sample. Seed the window with its latest retained state so a known overdue
+    // queue does not disappear merely because the query's start moved past it.
+    let query_start = metrics.base_ts().min(window.start);
+    let buckets = metrics.query_gauge(scheduled_job_next_ts_metric(), query_start..window.end)?;
+    resample_scheduled_job_lag(window, metrics, buckets)
+}
+
+fn record_scheduled_job_lag_sample(
+    metrics: &mut MetricStore,
+    next_job_ts: Option<SystemTime>,
+    now: SystemTime,
+) -> Result<(), UdfMetricsError> {
+    let observed_value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(now, ts));
+    // MetricStore retains one gauge value per source bucket and associates it with
+    // the bucket start. Store lag at that timestamp so later interpolation
+    // reconstructs `output_time - next_job_ts` instead of treating a
+    // mid-bucket sample as if it occurred at the start and manufacturing lag
+    // after the scheduler caught up.
+    let bucket_start = metrics.bucket_start_containing(now);
+    let value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(bucket_start, ts));
+    match metrics.add_gauge(scheduled_job_next_ts_metric(), now, value) {
+        Ok(()) => Ok(()),
+        // Timestamp order no longer represents observation order after a backward
+        // wall-clock step. Reset this dedicated timeline so no pre-jump ready time
+        // remains available for extrapolation after the new observation.
+        Err(
+            UdfMetricsError::SamplePrecedesBaseTimestamp { .. }
+            | UdfMetricsError::SamplePrecedesCutoff { .. },
+        ) => {
+            metrics.reset_timeline(now);
+            metrics.add_gauge(scheduled_job_next_ts_metric(), now, observed_value)
+        },
+        Err(err) => Err(err),
     }
 }
 
@@ -2089,7 +2162,7 @@ impl<RT: Runtime> Inner<RT> {
             return;
         }
         LAST_LOGGED_ERROR.set(Some(now));
-        tracing::error!("Failed to log execution metrics: {}", error);
+        tracing::error!("Failed to log application metrics: {}", error);
         if let UdfMetricsError::InternalError(mut e) = error {
             report_error_sync(&mut e);
         }
@@ -2168,7 +2241,6 @@ impl<RT: Runtime> Inner<RT> {
         now: SystemTime,
         num_running_jobs: u64,
     ) -> anyhow::Result<()> {
-        let name = scheduled_job_next_ts_metric();
         // -Infinity means there is no scheduled job
         let value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(now, ts));
         if value > 0.0 {
@@ -2187,17 +2259,6 @@ impl<RT: Runtime> Inner<RT> {
                     num_running_jobs,
                 },
             }]);
-        }
-        match self.metrics.add_gauge(name, now, value) {
-            Ok(()) => (),
-            Err(UdfMetricsError::SamplePrecedesCutoff { ts: _, cutoff }) => {
-                // `now` was too old; automatically promote the sample to the cutoff time
-                // instead
-                let value =
-                    next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(cutoff, ts));
-                self.metrics.add_gauge(name, cutoff, value)?;
-            },
-            Err(err) => return Err(err.into()),
         }
         Ok(())
     }
@@ -2224,6 +2285,205 @@ fn signed_duration_since(t1: SystemTime, t2: SystemTime) -> f32 {
     match t1.duration_since(t2) {
         Ok(d) => d.as_secs_f32(),
         Err(e) => -e.duration().as_secs_f32(),
+    }
+}
+
+#[cfg(test)]
+mod scheduled_job_lag_tests {
+    use super::*;
+
+    fn scheduled_job_metrics(base: SystemTime) -> MetricStore {
+        MetricStore::new(
+            base,
+            MetricStoreConfig {
+                bucket_width: SCHEDULED_JOB_METRICS_BUCKET_WIDTH,
+                max_buckets: SCHEDULED_JOB_METRICS_MAX_BUCKETS,
+                histogram_min_duration: Duration::from_millis(1),
+                histogram_max_duration: Duration::from_secs(15 * 60),
+                histogram_significant_figures: 3,
+            },
+        )
+    }
+
+    #[test]
+    fn resampling_uses_lag_at_the_source_bucket_start() -> anyhow::Result<()> {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        let mut metrics = scheduled_job_metrics(base);
+        let sample_time = SystemTime::UNIX_EPOCH + Duration::from_secs(45);
+        let next_job_time = SystemTime::UNIX_EPOCH + Duration::from_secs(46);
+        record_scheduled_job_lag_sample(&mut metrics, Some(next_job_time), sample_time)?;
+
+        let window = MetricsWindow {
+            start: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            end: SystemTime::UNIX_EPOCH + Duration::from_secs(75),
+            num_buckets: 3,
+        };
+        let buckets =
+            metrics.query_gauge(scheduled_job_next_ts_metric(), window.start..window.end)?;
+        let result = resample_scheduled_job_lag(&window, &metrics, buckets)?;
+
+        assert_eq!(result[0].1, None);
+        assert_eq!(result[1].1, Some(0.0));
+        assert_eq!(result[2].1, Some(14.0));
+        Ok(())
+    }
+
+    #[test]
+    fn backward_clock_step_before_the_store_base_discards_pre_jump_state() -> anyhow::Result<()> {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut metrics = scheduled_job_metrics(base);
+        let latest_bucket_start = base + Duration::from_secs(30);
+        record_scheduled_job_lag_sample(
+            &mut metrics,
+            Some(base + Duration::from_secs(20)),
+            latest_bucket_start,
+        )?;
+
+        record_scheduled_job_lag_sample(
+            &mut metrics,
+            // Future relative to the post-jump clock, but earlier than the
+            // pre-jump store timeline.
+            Some(base - Duration::from_secs(5)),
+            base - Duration::from_secs(10),
+        )?;
+
+        let window = MetricsWindow {
+            start: base - Duration::from_secs(10),
+            end: base + Duration::from_secs(5),
+            num_buckets: 1,
+        };
+        let result = query_scheduled_job_lag(&window, &metrics)?;
+
+        assert_eq!(metrics.base_ts(), base - Duration::from_secs(10));
+        assert_eq!(result, vec![(base - Duration::from_secs(10), Some(0.0))]);
+        Ok(())
+    }
+
+    #[test]
+    fn backward_clock_step_before_the_latest_bucket_removes_stale_ready_time() -> anyhow::Result<()>
+    {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut metrics = scheduled_job_metrics(base);
+        let previous_ready_time = base + Duration::from_secs(5);
+        record_scheduled_job_lag_sample(&mut metrics, Some(previous_ready_time), base)?;
+        record_scheduled_job_lag_sample(
+            &mut metrics,
+            Some(previous_ready_time),
+            base + Duration::from_secs(30),
+        )?;
+
+        let post_jump_now = base + Duration::from_secs(10);
+        record_scheduled_job_lag_sample(
+            &mut metrics,
+            Some(base + Duration::from_secs(20)),
+            post_jump_now,
+        )?;
+
+        let window = MetricsWindow {
+            start: post_jump_now,
+            end: post_jump_now + SCHEDULED_JOB_METRICS_BUCKET_WIDTH,
+            num_buckets: 1,
+        };
+        let result = query_scheduled_job_lag(&window, &metrics)?;
+
+        // Retaining the pre-jump bucket would extrapolate five seconds of lag.
+        assert_eq!(metrics.base_ts(), post_jump_now);
+        assert_eq!(result, vec![(post_jump_now, Some(0.0))]);
+        Ok(())
+    }
+
+    #[test]
+    fn sub_interval_future_change_does_not_extrapolate_stale_lag() -> anyhow::Result<()> {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        let mut metrics = scheduled_job_metrics(base);
+        let previous_ready_time = SystemTime::UNIX_EPOCH + Duration::from_secs(46);
+        record_scheduled_job_lag_sample(
+            &mut metrics,
+            Some(previous_ready_time),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(40),
+        )?;
+
+        let next_ready_time = previous_ready_time + Duration::from_secs(10);
+        record_scheduled_job_lag_sample(
+            &mut metrics,
+            Some(next_ready_time),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(41),
+        )?;
+
+        let window = MetricsWindow {
+            start: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            end: SystemTime::UNIX_EPOCH + Duration::from_secs(65),
+            num_buckets: 3,
+        };
+        let buckets =
+            metrics.query_gauge(scheduled_job_next_ts_metric(), window.start..window.end)?;
+        let result = resample_scheduled_job_lag(&window, &metrics, buckets)?;
+
+        // Extrapolating the previous ready time would report four seconds here.
+        assert_eq!(
+            result[2],
+            (SystemTime::UNIX_EPOCH + Duration::from_secs(50), Some(0.0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_queue_does_not_extrapolate_stale_lag() -> anyhow::Result<()> {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        let mut metrics = scheduled_job_metrics(base);
+        record_scheduled_job_lag_sample(
+            &mut metrics,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(46)),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(40),
+        )?;
+        record_scheduled_job_lag_sample(
+            &mut metrics,
+            None,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(41),
+        )?;
+
+        let window = MetricsWindow {
+            start: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            end: SystemTime::UNIX_EPOCH + Duration::from_secs(65),
+            num_buckets: 3,
+        };
+        let buckets =
+            metrics.query_gauge(scheduled_job_next_ts_metric(), window.start..window.end)?;
+        let result = resample_scheduled_job_lag(&window, &metrics, buckets)?;
+
+        assert_eq!(
+            result[2],
+            (SystemTime::UNIX_EPOCH + Duration::from_secs(50), Some(0.0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_state_before_the_window_continues_extrapolating() -> anyhow::Result<()> {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        let mut metrics = scheduled_job_metrics(base);
+        let next_job_time = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        record_scheduled_job_lag_sample(
+            &mut metrics,
+            Some(next_job_time),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        )?;
+
+        let window = MetricsWindow {
+            start: SystemTime::UNIX_EPOCH + Duration::from_secs(3705),
+            end: SystemTime::UNIX_EPOCH + Duration::from_secs(3750),
+            num_buckets: 3,
+        };
+        let result = query_scheduled_job_lag(&window, &metrics)?;
+
+        assert_eq!(
+            result[0],
+            (
+                SystemTime::UNIX_EPOCH + Duration::from_secs(3705),
+                Some(3685.0)
+            )
+        );
+        Ok(())
     }
 }
 

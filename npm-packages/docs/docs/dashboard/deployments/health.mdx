@@ -40,8 +40,10 @@ Cache hit rate only applies to query functions.
 />
 
 The scheduler status card shows the status of the
-[scheduler](/scheduling/scheduled-functions). If the scheduler falls behind due
-to too many scheduled tasks, the status will display the lag time in minutes.
+[scheduler](/scheduling/scheduled-functions). If a pending function remains
+ready after its scheduled time, the card displays the ready-queue lag in
+milliseconds, seconds, or minutes. A gap means that no backend sample was
+available; it does not represent zero lag.
 
 ## Last Deployed
 
