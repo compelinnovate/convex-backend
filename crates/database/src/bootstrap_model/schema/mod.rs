@@ -16,7 +16,10 @@ use common::{
         SchemaMetadata,
         SchemaState,
     },
-    document::ResolvedDocument,
+    document::{
+        ParsedDocument,
+        ResolvedDocument,
+    },
     runtime::Runtime,
     schemas::{
         DatabaseSchema,
@@ -54,6 +57,7 @@ pub static SCHEMA_STATE_FIELD: LazyLock<FieldPath> =
     LazyLock::new(|| "state".parse().expect("invalid state field"));
 
 const MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS: Duration = Duration::from_secs(60 * 60); // 1 hour
+const MAX_SCHEMA_HISTORY_DELETIONS_PER_TRANSACTION: usize = 16;
 
 pub struct SchemasTable;
 impl SystemTable for SchemasTable {
@@ -123,29 +127,40 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
         &mut self,
         active_table_to_delete: TableName,
     ) -> anyhow::Result<()> {
+        // Check the combined invariant before an active-schema error can mask it.
+        let in_progress_schema = self.get_in_progress_schema().await?;
         if let Some((_id, active_schema)) = self.get_by_state(SchemaState::Active).await?
             && let Err(schema_error) =
                 active_schema.check_delete_table(active_table_to_delete.clone())
         {
             anyhow::bail!(schema_error.to_error_metadata());
         }
+        if let Some((id, in_progress_schema, _state)) = in_progress_schema
+            && let Err(enforcement_error) =
+                in_progress_schema.check_delete_table(active_table_to_delete)
+        {
+            anyhow::ensure!(
+                self.mark_failed(id, enforcement_error.into()).await?,
+                "In-progress schema changed state within one enforcement transaction"
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_in_progress_schema(
+        &mut self,
+    ) -> anyhow::Result<Option<(ResolvedDocumentId, Arc<DatabaseSchema>, SchemaState)>> {
         let pending_schema = self.get_by_state(SchemaState::Pending).await?;
         let validated_schema = self.get_by_state(SchemaState::Validated).await?;
         match (pending_schema, validated_schema) {
-            (None, None) => {},
-            (Some((id, in_progress_schema)), None) | (None, Some((id, in_progress_schema))) => {
-                if let Err(enforcement_error) =
-                    in_progress_schema.check_delete_table(active_table_to_delete)
-                {
-                    self.mark_failed(id, enforcement_error.into()).await?;
-                }
-            },
+            (None, None) => Ok(None),
+            (Some((id, schema)), None) => Ok(Some((id, schema, SchemaState::Pending))),
+            (None, Some((id, schema))) => Ok(Some((id, schema, SchemaState::Validated))),
             (Some(_), Some(_)) => {
                 anyhow::bail!("Invalid schema state: both pending and validated schemas exist")
             },
         }
-
-        Ok(())
     }
 
     /// You probably want to use `enforce`.
@@ -159,6 +174,8 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
         table_mapping_for_schema: &NamespacedTableMapping,
     ) -> anyhow::Result<()> {
         let table_name = table_mapping_for_schema.tablet_name(document.id().tablet_id)?;
+        // Check the combined invariant before an active-schema error can mask it.
+        let in_progress_schema = self.get_in_progress_schema().await?;
         if let Some((_id, active_schema)) = self.get_by_state(SchemaState::Active).await?
             && let Err(schema_error) = active_schema.check_new_document(
                 document,
@@ -169,26 +186,43 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
         {
             anyhow::bail!(schema_error.to_error_metadata());
         }
-        let pending_schema = self.get_by_state(SchemaState::Pending).await?;
-        let validated_schema = self.get_by_state(SchemaState::Validated).await?;
-        match (pending_schema, validated_schema) {
-            (None, None) => {},
-            (Some((id, in_progress_schema)), None) | (None, Some((id, in_progress_schema))) => {
-                if let Err(enforcement_error) = in_progress_schema.check_new_document(
-                    document,
-                    table_name,
-                    table_mapping_for_schema,
-                    self.tx.virtual_system_mapping(),
-                ) {
-                    self.mark_failed(id, enforcement_error.into()).await?;
-                }
-            },
-            (Some(_), Some(_)) => {
-                anyhow::bail!("Invalid schema state: both pending and validated schemas exist")
-            },
+        if let Some((id, in_progress_schema, _state)) = in_progress_schema
+            && let Err(enforcement_error) = in_progress_schema.check_new_document(
+                document,
+                table_name,
+                table_mapping_for_schema,
+                self.tx.virtual_system_mapping(),
+            )
+        {
+            anyhow::ensure!(
+                self.mark_failed(id, enforcement_error.into()).await?,
+                "In-progress schema changed state within one enforcement transaction"
+            );
         }
 
         Ok(())
+    }
+
+    async fn get_exact_schema(
+        &mut self,
+        document_id: ResolvedDocumentId,
+    ) -> anyhow::Result<Option<Arc<ParsedDocument<SchemaMetadata>>>> {
+        // A resolved ID can still read a retained inactive tablet. Resolve through
+        // the active system table first so a stale lifecycle request cannot act on
+        // a recreated schema-table generation.
+        if !self
+            .tx
+            .table_mapping()
+            .namespace(self.namespace)
+            .name_exists(&SCHEMAS_TABLE)
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .tx
+            .get_system::<SchemasTable>(self.namespace, document_id.developer_id)
+            .await?
+            .filter(|schema| schema.id() == document_id))
     }
 
     pub async fn get_by_state(
@@ -200,7 +234,19 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
             "Getting schema by state is only permitted for Pending, Validated, or Active states, \
              since Failed or Overwritten states may have multiple documents."
         );
-        self.tx.get_schema_by_state(self.namespace, state)
+        let Some(schema_tablet_id) = self
+            .tx
+            .table_mapping()
+            .namespace(self.namespace)
+            .id_if_exists(&SCHEMAS_TABLE)
+        else {
+            return Ok(None);
+        };
+        let schema = self.tx.get_schema_by_state(self.namespace, state)?;
+        // SchemaRegistry retains unique-state entries by namespace when a system
+        // table is recreated. Its read dependency uses the current tablet, but the
+        // cached result can still belong to the retained inactive generation.
+        Ok(schema.filter(|(id, _schema)| id.tablet_id == schema_tablet_id))
     }
 
     #[fastrace::trace]
@@ -216,40 +262,25 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
                     .await?;
             }
         }
-        if let Some((id, active_schema)) = self.get_by_state(SchemaState::Active).await?
+        let active_schema = self.get_by_state(SchemaState::Active).await?;
+        let in_progress_schema = self.get_in_progress_schema().await?;
+        if let Some((id, active_schema)) = active_schema
             && *active_schema == schema
         {
-            if let Some((id, _pending_schema)) = self.get_by_state(SchemaState::Pending).await? {
-                self.mark_overwritten(id).await?;
-            }
-            if let Some((id, _validated_schema)) = self.get_by_state(SchemaState::Validated).await?
-            {
-                self.mark_overwritten(id).await?;
+            if let Some((in_progress_id, _in_progress_schema, state)) = in_progress_schema {
+                self.mark_overwritten(in_progress_id, state).await?;
+                self.delete_old_failed_and_overwritten_schemas(&[in_progress_id])
+                    .await?;
             }
             return Ok((id, SchemaState::Active));
         }
-        match (
-            self.get_by_state(SchemaState::Pending).await?,
-            self.get_by_state(SchemaState::Validated).await?,
-        ) {
-            (Some(_), Some(_)) => {
-                anyhow::bail!("Invalid schema state: both pending and validated schemas exist")
-            },
-            (Some((id, existing_schema)), None) => {
-                if *existing_schema == schema {
-                    return Ok((id, SchemaState::Pending));
-                } else {
-                    self.mark_overwritten(id).await?;
-                }
-            },
-            (None, Some((id, existing_schema))) => {
-                if *existing_schema == schema {
-                    return Ok((id, SchemaState::Validated));
-                } else {
-                    self.mark_overwritten(id).await?;
-                }
-            },
-            (None, None) => {},
+        if let Some((id, existing_schema, state)) = in_progress_schema {
+            if *existing_schema == schema {
+                return Ok((id, state));
+            }
+            self.mark_overwritten(id, state).await?;
+            self.delete_old_failed_and_overwritten_schemas(&[id])
+                .await?;
         }
 
         let schema_metadata = SchemaMetadata::new(SchemaState::Pending, schema)?;
@@ -261,13 +292,15 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
 
     pub async fn mark_validated(&mut self, document_id: ResolvedDocumentId) -> anyhow::Result<()> {
         let doc = self
-            .tx
-            .get(document_id)
+            .get_exact_schema(document_id)
             .await?
             .context("Schema to mark as validated must exist.")?;
-        let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
-        match schema.state {
+        match &doc.state {
             SchemaState::Pending => {
+                anyhow::ensure!(
+                    self.get_by_state(SchemaState::Validated).await?.is_none(),
+                    "Invalid schema state: both pending and validated schemas exist"
+                );
                 SystemMetadataModel::new(self.tx, self.namespace)
                     .patch(
                         document_id,
@@ -297,11 +330,10 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
         schema_id: ResolvedDocumentId,
     ) -> anyhow::Result<SchemaMetadata> {
         let doc = self
-            .tx
-            .get(schema_id)
+            .get_exact_schema(schema_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("No document found for schema ID {schema_id}"))?;
-        let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
+        let schema = Arc::unwrap_or_clone(doc).into_value();
         match schema.state {
             SchemaState::Pending => {
                 anyhow::bail!("Expected schema to be Validated, but it's Pending {schema_id}")
@@ -324,13 +356,29 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
     pub async fn mark_active(&mut self, document_id: ResolvedDocumentId) -> anyhow::Result<()> {
         // Make sure it's already Validated or Active.
         let schema = self.get_validated_or_active(document_id).await?;
-        let mut model = SchemaValidationProgressModel::new(self.tx, self.namespace);
-        model.delete_schema_validation_progress(document_id).await?;
+        // Check the combined in-progress invariant before the Active no-op can
+        // delete mixed-version progress or hide contradictory lifecycle state.
+        let in_progress_schema = self.get_in_progress_schema().await?;
         match schema.state {
-            // Already active: no-op
-            SchemaState::Active => Ok(()),
+            // Already active: clean any mixed-version progress and otherwise no-op.
+            SchemaState::Active => {
+                SchemaValidationProgressModel::new(self.tx, self.namespace)
+                    .delete_schema_validation_progress(document_id)
+                    .await?;
+                Ok(())
+            },
             // If it's validated, mark as active.
             SchemaState::Validated => {
+                anyhow::ensure!(
+                    matches!(
+                        in_progress_schema,
+                        Some((id, _, SchemaState::Validated)) if id == document_id
+                    ),
+                    "Schema to mark active is not the current validated schema"
+                );
+                SchemaValidationProgressModel::new(self.tx, self.namespace)
+                    .delete_schema_validation_progress(document_id)
+                    .await?;
                 self.clear_active().await?;
                 SystemMetadataModel::new(self.tx, self.namespace)
                     .patch(
@@ -348,19 +396,22 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
 
     #[async_recursion]
     /// Mark pending or validated schemas as failed. Error if the schema is
-    /// already active, and do nothing if it is already overwritten or failed.
+    /// already active. Returns whether the exact schema is failed after this
+    /// call; an overwritten schema or a terminal schema removed by retention
+    /// returns false.
     pub async fn mark_failed(
         &mut self,
         document_id: ResolvedDocumentId,
         error: SchemaValidationError,
-    ) -> anyhow::Result<()> {
-        let doc = self
-            .tx
-            .get(document_id)
-            .await?
-            .context("Schema to mark as failed must exist.")?;
-        let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
-        match schema.state {
+    ) -> anyhow::Result<bool> {
+        let Some(doc) = self.get_exact_schema(document_id).await? else {
+            // A schema worker retries in a new transaction. A replacement older
+            // than the retention window can be pruned between those attempts.
+            // Enforcement callers use one snapshot and reject this result as an
+            // internal inconsistency.
+            return Ok(false);
+        };
+        let schema_is_failed = match doc.state.clone() {
             SchemaState::Pending | SchemaState::Validated => {
                 let error_message = error.to_string();
                 let table_name = match error {
@@ -384,91 +435,124 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
                         )?,
                     )
                     .await?;
+                true
             },
             SchemaState::Active => {
                 anyhow::bail!("Active schemas cannot be marked as failed.")
             },
-            SchemaState::Failed { .. } | SchemaState::Overwritten => {},
-        }
-        self.delete_old_failed_and_overwritten_schemas().await?;
-        let mut model = SchemaValidationProgressModel::new(self.tx, self.namespace);
-        model.delete_schema_validation_progress(document_id).await?;
-        Ok(())
+            SchemaState::Failed { .. } => true,
+            SchemaState::Overwritten => false,
+        };
+        self.delete_old_failed_and_overwritten_schemas(&[document_id])
+            .await?;
+        // User writes can fail a pending schema. Do not make those transactions read
+        // the hot progress row: tracker checkpoints fence on this schema state and the
+        // schema worker removes inactive progress after cancellation or restart.
+        Ok(schema_is_failed)
     }
 
     pub async fn overwrite_all(&mut self) -> anyhow::Result<bool> {
-        let mut is_any_schema_overwritten = false;
-        for state in [
-            SchemaState::Pending,
-            SchemaState::Active,
-            SchemaState::Validated,
-        ] {
-            is_any_schema_overwritten =
-                self.overwrite_by_state(state).await? || is_any_schema_overwritten;
+        let mut schemas_to_overwrite = Vec::new();
+        if let Some((id, _schema, state)) = self.get_in_progress_schema().await? {
+            schemas_to_overwrite.push((id, state));
         }
-        Ok(is_any_schema_overwritten)
+        if let Some((id, _schema)) = self.get_by_state(SchemaState::Active).await? {
+            schemas_to_overwrite.push((id, SchemaState::Active));
+        }
+        for (id, state) in &schemas_to_overwrite {
+            self.mark_overwritten(*id, state.clone()).await?;
+        }
+        if !schemas_to_overwrite.is_empty() {
+            let schemas_to_keep: Vec<_> = schemas_to_overwrite.iter().map(|(id, _)| *id).collect();
+            self.delete_old_failed_and_overwritten_schemas(&schemas_to_keep)
+                .await?;
+        }
+        Ok(!schemas_to_overwrite.is_empty())
     }
 
     pub async fn clear_active(&mut self) -> anyhow::Result<()> {
-        self.overwrite_by_state(SchemaState::Active)
-            .await
-            .map(|_| ())
-    }
-
-    async fn overwrite_by_state(&mut self, state: SchemaState) -> anyhow::Result<bool> {
-        if let Some((id, _schema)) = self.get_by_state(state).await? {
-            self.mark_overwritten(id).await?;
-            Ok(true)
-        } else {
-            Ok(false)
+        // Applying no schema is still a lifecycle transition. Do not overwrite
+        // the active schema while preserving contradictory in-progress state.
+        self.get_in_progress_schema().await?;
+        if let Some((id, _schema)) = self.get_by_state(SchemaState::Active).await? {
+            self.mark_overwritten(id, SchemaState::Active).await?;
+            self.delete_old_failed_and_overwritten_schemas(&[id])
+                .await?;
         }
+        Ok(())
     }
 
-    /// Deletes failed and overwritten schemas older than an hour, returning the
-    /// number of documents deleted. Keeps schemas table small.
-    async fn delete_old_failed_and_overwritten_schemas(&mut self) -> anyhow::Result<usize> {
-        let mut num_deleted = 0;
-        for schema_doc in self
+    /// Deletes a bounded batch of failed and overwritten schemas older than an
+    /// hour. Keeps schemas table small without making a schema transition own
+    /// an unbounded cleanup.
+    async fn delete_old_failed_and_overwritten_schemas(
+        &mut self,
+        schemas_to_keep: &[ResolvedDocumentId],
+    ) -> anyhow::Result<()> {
+        let oldest_schema_to_keep = (*self
             .tx
-            .query_system(
-                self.namespace,
-                &SystemIndex::<SchemasTable>::by_creation_time(),
-            )?
-            .all()
-            .await?
-        {
+            .begin_timestamp()
+            .sub(MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS)
+            .context("Should be able to subtract an hour from creation time")?)
+        .try_into()?;
+        let namespace = self.namespace;
+        let mut num_deleted = 0;
+        let creation_time_index = SystemIndex::<SchemasTable>::by_creation_time();
+        let mut schemas = self
+            .tx
+            .query_system(namespace, &creation_time_index)?
+            .build();
+        while let Some(schema_doc) = schemas.next().await? {
             // Only delete failed and overwritten schemas
             match schema_doc.state {
                 SchemaState::Failed { .. } | SchemaState::Overwritten => {},
                 SchemaState::Active | SchemaState::Pending | SchemaState::Validated => continue,
             }
+            // A schema changed by this transaction may still have a live checkpoint
+            // from before the transition. Keep it for out-of-transaction cleanup.
+            if schemas_to_keep.contains(&schema_doc.id()) {
+                continue;
+            }
             // Break if the schemas are not old enough to be deleted
-            if schema_doc.creation_time()
-                > (*self
-                    .tx
-                    .begin_timestamp()
-                    .sub(MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS)
-                    .context("Should be able to subtract an hour from creation time")?)
-                .try_into()?
-            {
+            if schema_doc.creation_time() > oldest_schema_to_keep {
                 break;
             }
-            SystemMetadataModel::new(self.tx, self.namespace)
+            // Unprotected schemas were terminal before this transaction began, so a
+            // state-fenced worker cannot publish another checkpoint for them.
+            SchemaValidationProgressModel::new(schemas.tx(), namespace)
+                .delete_schema_validation_progress(schema_doc.id())
+                .await?;
+            SystemMetadataModel::new(schemas.tx(), namespace)
                 .delete(schema_doc.id())
                 .await?;
             num_deleted += 1;
+            if num_deleted >= MAX_SCHEMA_HISTORY_DELETIONS_PER_TRANSACTION {
+                break;
+            }
         }
-        Ok(num_deleted)
+        Ok(())
     }
 
-    async fn mark_overwritten(&mut self, id: ResolvedDocumentId) -> anyhow::Result<()> {
+    async fn mark_overwritten(
+        &mut self,
+        id: ResolvedDocumentId,
+        previous_state: SchemaState,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            previous_state.is_unique(),
+            "Only a unique schema state can be overwritten",
+        );
         SystemMetadataModel::new(self.tx, self.namespace)
             .patch(
                 id,
                 patch_value!("state" => Some(SchemaState::Overwritten.try_into()?))?,
             )
             .await?;
-        self.delete_old_failed_and_overwritten_schemas().await?;
+        if previous_state == SchemaState::Pending {
+            // Pending-schema replacement must win over progress bookkeeping. The
+            // state-fenced tracker or the schema worker's next pass removes this row.
+            return Ok(());
+        }
         let mut model = SchemaValidationProgressModel::new(self.tx, self.namespace);
         model.delete_schema_validation_progress(id).await?;
         Ok(())
