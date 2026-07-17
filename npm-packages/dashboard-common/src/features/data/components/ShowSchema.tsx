@@ -104,7 +104,8 @@ export function ShowSchema({
                   ? "Schema validation in progress..."
                   : "Code push in progress..."}
                 {schemaValidationProgress &&
-                  schemaValidationProgress.totalDocs !== null && (
+                  schemaValidationProgress.totalDocs !== null &&
+                  schemaValidationProgress.totalDocs > 0 && (
                     <div className="grow sm:px-6">
                       <ProgressBarWithPercent
                         // totalDocs is not necessarily taken from the same snapshot as the snapshot being iterated over to increment numDocsValidated

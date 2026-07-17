@@ -157,6 +157,7 @@ runtime = { workspace = true, features = ["testing"] }
 search = { workspace = true, features = ["testing"] }
 search_index_workers = { workspace = true, features = ["testing"] }
 shape_inference = { workspace = true, features = ["testing"] }
+sqlite = { workspace = true }
 storage = { workspace = true, features = ["testing"] }
 storage_zip_reader = { workspace = true, features = ["testing"] }
 streaming_export = { workspace = true, features = ["testing"] }

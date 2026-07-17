@@ -1,15 +1,16 @@
-import { DatabaseReader } from "../../_generated/server";
-import { Doc } from "../../_generated/dataModel";
+import type { DatabaseReader } from "../../_generated/server";
 import { queryPrivateSystem } from "../secretSystemTables";
 import { v } from "convex/values";
 
-type SchemaMetadata = Doc<"_schemas">;
+const maxSafeInteger = BigInt(Number.MAX_SAFE_INTEGER);
 
-export const getSchemaByState = async (
+type UniqueSchemaState = "pending" | "validated" | "active";
+
+export const getSchemaByState = (
   db: DatabaseReader,
-  state: SchemaMetadata["state"]["state"],
+  state: UniqueSchemaState,
 ) =>
-  await db
+  db
     .query("_schemas")
     .withIndex("by_state", (q) => q.eq("state", { state }))
     .unique();
@@ -20,9 +21,11 @@ export default queryPrivateSystem("ViewData")({
     active?: string;
     inProgress?: string;
   }> {
-    const active = await getSchemaByState(db, "active");
-    const pending = await getSchemaByState(db, "pending");
-    const validated = await getSchemaByState(db, "validated");
+    const [active, pending, validated] = await Promise.all([
+      getSchemaByState(db, "active"),
+      getSchemaByState(db, "pending"),
+      getSchemaByState(db, "validated"),
+    ]);
 
     if (pending && validated) {
       throw new Error("Unexpectedly found both pending and validated schemas");
@@ -30,7 +33,7 @@ export default queryPrivateSystem("ViewData")({
 
     return {
       active: active?.schema,
-      inProgress: pending?.schema || validated?.schema,
+      inProgress: pending?.schema ?? validated?.schema,
     };
   },
 });
@@ -40,7 +43,13 @@ export const schemaValidationProgress = queryPrivateSystem("ViewData")({
   handler: async function ({
     db,
   }): Promise<{ numDocsValidated: number; totalDocs: number | null } | null> {
-    const pending = await getSchemaByState(db, "pending");
+    const [pending, validated] = await Promise.all([
+      getSchemaByState(db, "pending"),
+      getSchemaByState(db, "validated"),
+    ]);
+    if (pending && validated) {
+      throw new Error("Unexpectedly found both pending and validated schemas");
+    }
     if (!pending) {
       return null;
     }
@@ -51,11 +60,28 @@ export const schemaValidationProgress = queryPrivateSystem("ViewData")({
     if (!schemaValidationProgressDoc) {
       return null;
     }
+    if (
+      schemaValidationProgressDoc.numDocsValidated < BigInt(0) ||
+      (schemaValidationProgressDoc.totalDocs !== null &&
+        schemaValidationProgressDoc.totalDocs < BigInt(0))
+    ) {
+      throw new Error("Schema validation progress counts must be nonnegative");
+    }
+    if (
+      schemaValidationProgressDoc.numDocsValidated > maxSafeInteger ||
+      (schemaValidationProgressDoc.totalDocs !== null &&
+        schemaValidationProgressDoc.totalDocs > maxSafeInteger)
+    ) {
+      throw new Error(
+        "Schema validation progress counts exceed the safe integer range",
+      );
+    }
     return {
       numDocsValidated: Number(schemaValidationProgressDoc.numDocsValidated),
-      totalDocs: schemaValidationProgressDoc.totalDocs
-        ? Number(schemaValidationProgressDoc.totalDocs)
-        : null,
+      totalDocs:
+        schemaValidationProgressDoc.totalDocs !== null
+          ? Number(schemaValidationProgressDoc.totalDocs)
+          : null,
     };
   },
 });

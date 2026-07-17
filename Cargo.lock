@@ -391,6 +391,7 @@ dependencies = [
  "short_future",
  "slugify",
  "smallvec",
+ "sqlite",
  "storage",
  "storage_zip_reader",
  "streaming_export",

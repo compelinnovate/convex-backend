@@ -155,19 +155,19 @@ pub type SchemasForImport = Vec<(
 pub async fn schemas_for_import<RT: Runtime>(
     tx: &mut Transaction<RT>,
 ) -> anyhow::Result<SchemasForImport> {
-    let mut namespaces = tx.table_mapping().namespaces_for_name(&SCHEMAS_TABLE);
-    namespaces.sort();
+    let namespaces: BTreeSet<_> = tx
+        .table_mapping()
+        .namespaces_for_name(&SCHEMAS_TABLE)
+        .into_iter()
+        .collect();
     let mut schemas = vec![];
     for namespace in namespaces {
         let mut schema_model = SchemaModel::new(tx, namespace);
-        for schema_state in [
-            SchemaState::Active,
-            SchemaState::Validated,
-            SchemaState::Pending,
-        ] {
-            if let Some(schema) = schema_model.get_by_state(schema_state.clone()).await? {
-                schemas.push((namespace, schema_state, schema));
-            }
+        if let Some(schema) = schema_model.get_by_state(SchemaState::Active).await? {
+            schemas.push((namespace, SchemaState::Active, schema));
+        }
+        if let Some((id, schema, state)) = schema_model.get_in_progress_schema().await? {
+            schemas.push((namespace, state, (id, schema)));
         }
     }
     Ok(schemas)
