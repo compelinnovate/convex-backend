@@ -7,6 +7,7 @@ use common::{
     backoff::Backoff,
     errors::report_error,
     log_streaming::{
+        error_message_for_log_stream,
         LogEvent,
         StructuredLogEvent,
     },
@@ -156,19 +157,19 @@ impl SentrySink {
                 continue;
             };
 
+            let error_message = error_message_for_log_stream(error);
             let exception = match self.config.version {
                 ExceptionFormatVersion::V1 => {
                     // The legacy format used `type` to capture the error message
                     // and `value` to capture the stacktrace as a string. The newer
                     // format uses `value` to capture the error message and `stacktrace`
                     // to capture the stacktrace as an array of frames.
-                    let ty = error.message.clone();
                     let stacktrace: Option<Vec<String>> = error
                         .frames
                         .as_ref()
                         .map(|frames| frames.0.iter().map(|frame| frame.to_string()).collect());
                     Exception {
-                        ty: ty.to_string(),
+                        ty: error_message.clone(),
                         value: stacktrace.map(|st| st.join("\n")),
                         ..Default::default()
                     }
@@ -189,7 +190,7 @@ impl SentrySink {
                     });
                     Exception {
                         ty: "Error".to_string(),
-                        value: Some(error.message.clone()),
+                        value: Some(error_message),
                         stacktrace: stacktrace_for_sentry,
                         ..Default::default()
                     }

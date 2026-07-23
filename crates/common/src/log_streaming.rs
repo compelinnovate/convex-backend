@@ -404,6 +404,41 @@ impl Display for LogEventFormatVersion {
     }
 }
 
+const REDACTED_ARGUMENT_VALIDATION_ERROR: &str =
+    "ArgumentValidationError: Function arguments did not match the validator. Argument values and \
+     validator details were redacted from log streams.";
+const REDACTED_RETURNS_VALIDATION_ERROR: &str = "ReturnsValidationError: Function return value \
+                                                 did not match the validator. Return value and \
+                                                 validator details were redacted from log streams.";
+
+fn redacted_validation_error_message(error: &JsError) -> Option<&'static str> {
+    // Validator errors include the complete rejected value and validator. Preserve
+    // their stable class but do not copy potentially sensitive function
+    // arguments or return values into durable external log streams.
+    if error.message.starts_with("ArgumentValidationError:") {
+        Some(REDACTED_ARGUMENT_VALIDATION_ERROR)
+    } else if error.message.starts_with("ReturnsValidationError:") {
+        Some(REDACTED_RETURNS_VALIDATION_ERROR)
+    } else {
+        None
+    }
+}
+
+/// Returns a function error message for a durable log stream without validator
+/// values.
+pub fn error_message_for_log_stream(error: &JsError) -> String {
+    redacted_validation_error_message(error)
+        .unwrap_or(&error.message)
+        .to_string()
+}
+
+fn function_execution_error_for_log_stream(error: &JsError) -> String {
+    match redacted_validation_error_message(error) {
+        Some(message) => message.to_string(),
+        None => error.to_string(),
+    }
+}
+
 /// Structured log
 impl LogEvent {
     pub fn default_for_verification<RT: Runtime>(runtime: &RT) -> anyhow::Result<Self> {
@@ -473,7 +508,10 @@ impl LogEvent {
                     run_reason: _,
                 } => {
                     let (reason, status) = match error {
-                        Some(err) => (Some(err.to_string()), "failure"),
+                        Some(err) => (
+                            Some(function_execution_error_for_log_stream(err)),
+                            "failure",
+                        ),
                         None => (None, "success"),
                     };
                     let execution_time_ms = execution_time.as_millis();
@@ -504,7 +542,7 @@ impl LogEvent {
                     udf_server_version,
                     request_metadata: _,
                 } => {
-                    let message = &error.message;
+                    let message = error_message_for_log_stream(error);
                     let frames: Option<Vec<String>> = error
                         .frames
                         .as_ref()
@@ -643,7 +681,10 @@ impl LogEvent {
                 } => {
                     let function_source = source.to_json_map();
                     let (status, error_message) = match error {
-                        Some(error) => ("failure", Some(error.to_string())),
+                        Some(error) => (
+                            "failure",
+                            Some(function_execution_error_for_log_stream(error)),
+                        ),
                         None => ("success", None),
                     };
                     #[derive(Serialize)]
@@ -725,7 +766,7 @@ impl LogEvent {
                     udf_server_version,
                     request_metadata: _,
                 } => {
-                    let message = &error.message;
+                    let message = error_message_for_log_stream(error);
                     let frames: Option<Vec<String>> = error
                         .frames
                         .as_ref()
@@ -957,4 +998,180 @@ pub struct StreamFunctionLogs {
 #[derive(Deserialize, Debug)]
 pub struct StreamUdfExecutionQueryArgs {
     pub cursor: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::Value as JsonValue;
+
+    use super::{
+        error_message_for_log_stream,
+        function_execution_error_for_log_stream,
+        AggregatedFunctionUsageStats,
+        FunctionEventSource,
+        FunctionRunReason,
+        LogEvent,
+        LogEventFormatVersion,
+        StructuredLogEvent,
+        REDACTED_ARGUMENT_VALIDATION_ERROR,
+        REDACTED_RETURNS_VALIDATION_ERROR,
+    };
+    use crate::{
+        components::ComponentPath,
+        errors::JsError,
+        execution_context::{
+            ExecutionContext,
+            ExecutionId,
+        },
+        runtime::UnixTimestamp,
+        types::{
+            ModuleEnvironment,
+            UdfType,
+        },
+        RequestId,
+        RequestMetadata,
+    };
+
+    fn test_source() -> FunctionEventSource {
+        FunctionEventSource {
+            context: ExecutionContext::new_from_parts(
+                RequestId::new(),
+                ExecutionId::new(),
+                None,
+                true,
+                RequestMetadata::system(),
+            ),
+            component_path: ComponentPath::root(),
+            udf_path: "test:validator".to_string(),
+            udf_type: UdfType::Mutation,
+            module_environment: ModuleEnvironment::Isolate,
+            cached: None,
+            mutation_queue_length: None,
+            mutation_retry_count: None,
+        }
+    }
+
+    fn function_execution_event(message: &str) -> LogEvent {
+        LogEvent {
+            timestamp: UnixTimestamp::from_millis(1),
+            event: StructuredLogEvent::FunctionExecution {
+                source: test_source(),
+                error: Some(JsError::from_message(message.to_string())),
+                execution_time: Duration::from_millis(1),
+                user_execution_time: Some(Duration::from_millis(1)),
+                usage_stats: AggregatedFunctionUsageStats::default(),
+                occ_info: None,
+                will_retry: false,
+                scheduler_info: None,
+                run_reason: FunctionRunReason::WebSocket,
+            },
+        }
+    }
+
+    fn exception_event(message: &str) -> LogEvent {
+        LogEvent {
+            timestamp: UnixTimestamp::from_millis(1),
+            event: StructuredLogEvent::Exception {
+                error: JsError::from_message(message.to_string()),
+                user_identifier: None,
+                source: test_source(),
+                udf_server_version: None,
+                request_metadata: RequestMetadata::system(),
+            },
+        }
+    }
+
+    #[test]
+    fn redacts_validation_values_from_function_execution_formats() -> anyhow::Result<()> {
+        let cases = [
+            (
+                "ArgumentValidationError: Object is missing a field.\n\nObject: {name: \
+                 \"sensitive-name\", phone: \"sensitive-phone\"}\nValidator: v.object({})",
+                REDACTED_ARGUMENT_VALIDATION_ERROR,
+            ),
+            (
+                "ReturnsValidationError: Value does not match validator.\n\nValue: \
+                 \"sensitive-return-value\"\nValidator: v.string()",
+                REDACTED_RETURNS_VALIDATION_ERROR,
+            ),
+        ];
+
+        for (message, expected) in cases {
+            for (format, error_field) in [
+                (LogEventFormatVersion::V1, "reason"),
+                (LogEventFormatVersion::V2, "error_message"),
+            ] {
+                let fields = function_execution_event(message).to_json_map(format)?;
+                assert_eq!(
+                    fields.get(error_field).and_then(JsonValue::as_str),
+                    Some(expected)
+                );
+                assert!(!JsonValue::Object(fields).to_string().contains("sensitive"));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn redacts_validation_values_from_exception_formats() -> anyhow::Result<()> {
+        let cases = [
+            (
+                "ArgumentValidationError: Object is missing a field.\n\nObject: {name: \
+                 \"sensitive-name\"}\nValidator: v.object({})",
+                REDACTED_ARGUMENT_VALIDATION_ERROR,
+            ),
+            (
+                "ReturnsValidationError: Value does not match validator.\n\nValue: \
+                 \"sensitive-return-value\"\nValidator: v.string()",
+                REDACTED_RETURNS_VALIDATION_ERROR,
+            ),
+        ];
+
+        for (message, expected) in cases {
+            for format in [LogEventFormatVersion::V1, LogEventFormatVersion::V2] {
+                let fields = exception_event(message).to_json_map(format)?;
+                assert_eq!(
+                    fields.get("message").and_then(JsonValue::as_str),
+                    Some(expected)
+                );
+                assert!(!JsonValue::Object(fields).to_string().contains("sensitive"));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_non_validation_error_format_for_each_log_event() -> anyhow::Result<()> {
+        let message = "Uncaught Error: operation failed";
+        let error = JsError::from_message(message.to_string());
+        let full_error = error.to_string();
+
+        assert_eq!(error_message_for_log_stream(&error), message);
+        assert_eq!(function_execution_error_for_log_stream(&error), full_error);
+
+        for (format, error_field) in [
+            (LogEventFormatVersion::V1, "reason"),
+            (LogEventFormatVersion::V2, "error_message"),
+        ] {
+            let fields = function_execution_event(message).to_json_map(format)?;
+            assert_eq!(
+                fields.get(error_field).and_then(JsonValue::as_str),
+                Some(full_error.as_str())
+            );
+        }
+
+        for format in [LogEventFormatVersion::V1, LogEventFormatVersion::V2] {
+            let fields = exception_event(message).to_json_map(format)?;
+            assert_eq!(
+                fields.get("message").and_then(JsonValue::as_str),
+                Some(message)
+            );
+        }
+
+        Ok(())
+    }
 }
