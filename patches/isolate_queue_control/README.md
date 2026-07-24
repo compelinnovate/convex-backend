@@ -441,10 +441,14 @@ strict configuration, and bounded metrics. Production verification uses an ordin
 traffic; a dedicated deployment stress fixture is not required.
 
 Rejected designs include treating deployment as a dependency, unconditional priority, a second
-queue or worker pool, immediate worker reservation, borrowing dependency reserve, globally longer
-ordinary deadlines, deployment-wide shedding switches, larger total queues, HTTP-path or module-name
-classification, and relying on retries alone. Each either weakens liveness/fairness, adds substantial
-state, or fails to classify the typed work the isolate scheduler actually executes.
+queue or worker pool, immediate deployment/control-plane worker reservation before normal
+selection, borrowing dependency reserve, globally longer ordinary deadlines, deployment-wide
+shedding switches, larger total queues, HTTP-path or module-name classification, and relying on
+retries alone. Each either weakens liveness/fairness, adds substantial state, or fails to classify
+the typed work the isolate scheduler actually executes. The separate
+[`scheduled-action admission patch`](../scheduled_action_admission/README.md) does not reserve idle
+capacity for a class: after a concrete scheduled action wins normal admission, it briefly holds
+that selected worker while committing the action's durable at-most-once claim.
 
 ## Resource cost and current evidence
 
@@ -491,10 +495,11 @@ reuse and lane control as separate opt-ins so a latency or memory regression
 has an unambiguous rollback. Context reuse can be disabled without changing
 queue state; queue control can be disabled without changing context semantics.
 
-`FUNRUN_ISOLATE_ACTIVE_THREADS` remains a CPU-execution gate below worker
-assignment. A request can retain a worker while not holding an active-thread
-permit. Queue delay control cannot create CPU capacity or reserve active-thread
-permits for dependencies.
+`FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate CPU-execution gate. An external request acquires
+its initial low-priority active-thread permit before worker assignment. Once execution begins, it
+can temporarily release that permit during an asynchronous wait while retaining the assigned
+worker, then use the existing high-priority reacquisition path. Queue delay control cannot create
+CPU capacity or reserve active-thread permits for dependencies.
 
 Query coalescing and application dependency gates run before the isolate queue.
 They must continue propagating dependency role so a child does not wait behind

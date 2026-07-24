@@ -119,6 +119,68 @@ use crate::{
     FunctionWrites,
 };
 
+/// Scheduler-side ownership of a function execution start barrier.
+///
+/// The paired [`FunctionExecutionStartGate`] is passed down with an action and
+/// signals after that action reaches its environment-specific admission
+/// boundary. Dropping this controller before `start` cancels the prepared
+/// execution.
+pub struct FunctionExecutionStartController {
+    ready_receiver: oneshot::Receiver<()>,
+    start_sender: oneshot::Sender<()>,
+}
+
+impl FunctionExecutionStartController {
+    pub async fn wait_until_ready(&mut self) -> anyhow::Result<()> {
+        (&mut self.ready_receiver)
+            .await
+            .context("Function execution ended before reaching its start barrier")
+    }
+
+    pub fn start(self) -> anyhow::Result<()> {
+        self.start_sender
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Function execution ended before its start was released"))
+    }
+}
+
+/// Runtime-side ownership of a function execution start barrier.
+pub struct FunctionExecutionStartGate {
+    ready_sender: oneshot::Sender<()>,
+    start_receiver: oneshot::Receiver<()>,
+}
+
+impl FunctionExecutionStartGate {
+    pub async fn wait(self) -> anyhow::Result<()> {
+        self.ready_sender.send(()).map_err(|_| {
+            anyhow::anyhow!("Function execution start controller was dropped before admission")
+        })?;
+        self.start_receiver
+            .await
+            .context("Function execution start controller was dropped before release")
+    }
+
+    fn into_channels(self) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
+        (self.ready_sender, self.start_receiver)
+    }
+}
+
+pub fn function_execution_start_barrier(
+) -> (FunctionExecutionStartController, FunctionExecutionStartGate) {
+    let (ready_sender, ready_receiver) = oneshot::channel();
+    let (start_sender, start_receiver) = oneshot::channel();
+    (
+        FunctionExecutionStartController {
+            ready_receiver,
+            start_sender,
+        },
+        FunctionExecutionStartGate {
+            ready_sender,
+            start_receiver,
+        },
+    )
+}
+
 pub struct RunRequestArgs {
     pub key_broker: FunctionRunnerKeyBroker,
     pub index_reader: Arc<dyn IndexReader>,
@@ -130,6 +192,7 @@ pub struct RunRequestArgs {
     pub fetch_client: Arc<dyn FetchClient>,
     pub log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
     pub function_started_sender: Option<oneshot::Sender<()>>,
+    pub function_execution_start: Option<FunctionExecutionStartGate>,
     pub udf_type: UdfType,
     pub identity: Identity,
     pub existing_writes: FunctionWrites,
@@ -308,6 +371,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             fetch_client,
             log_line_sender,
             function_started_sender,
+            function_execution_start,
             udf_type,
             identity,
             existing_writes,
@@ -366,6 +430,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
 
         match udf_type {
             UdfType::Query | UdfType::Mutation => {
+                anyhow::ensure!(
+                    function_execution_start.is_none(),
+                    "Database functions cannot have an action execution start barrier"
+                );
                 let FunctionMetadata {
                     path_and_args,
                     journal,
@@ -406,6 +474,8 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                     function_metadata.context("Missing function metadata for action")?;
                 let log_line_sender =
                     log_line_sender.context("Missing log line sender for action")?;
+                let function_execution_start =
+                    function_execution_start.map(FunctionExecutionStartGate::into_channels);
                 let outcome = self
                     .isolate_client
                     .execute_action(
@@ -418,6 +488,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                         environment_data,
                         deployment_name,
                         function_started_sender,
+                        function_execution_start,
                         scheduler_dependency,
                     )
                     .await?;
@@ -428,6 +499,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 ))
             },
             UdfType::HttpAction => {
+                anyhow::ensure!(
+                    function_execution_start.is_none(),
+                    "HTTP actions cannot have a scheduled action execution start barrier"
+                );
                 anyhow::ensure!(
                     scheduler_dependency == SchedulerDependencyClass::Independent,
                     "HTTP actions cannot be dependency-unblocking scheduler requests"
@@ -591,5 +666,53 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 deployment_name,
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod execution_start_tests {
+    use super::function_execution_start_barrier;
+
+    #[tokio::test]
+    async fn gate_waits_for_controller_release() {
+        let (mut controller, gate) = function_execution_start_barrier();
+        let gate_task = tokio::spawn(gate.wait());
+
+        controller.wait_until_ready().await.unwrap();
+        assert!(!gate_task.is_finished());
+        controller.start().unwrap();
+        gate_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_controller_cancels_gate() {
+        let (controller, gate) = function_execution_start_barrier();
+        drop(controller);
+
+        let error = gate.wait().await.unwrap_err();
+        assert!(error.to_string().contains("dropped before admission"));
+    }
+
+    #[tokio::test]
+    async fn dropping_controller_after_admission_cancels_gate() {
+        let (mut controller, gate) = function_execution_start_barrier();
+        let gate_task = tokio::spawn(gate.wait());
+
+        controller.wait_until_ready().await.unwrap();
+        drop(controller);
+
+        let error = gate_task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("dropped before release"));
+    }
+
+    #[tokio::test]
+    async fn dropping_gate_cancels_controller_wait() {
+        let (mut controller, gate) = function_execution_start_barrier();
+        drop(gate);
+
+        let error = controller.wait_until_ready().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("before reaching its start barrier"));
     }
 }

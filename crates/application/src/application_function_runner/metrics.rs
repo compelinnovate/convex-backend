@@ -8,6 +8,7 @@ use metrics::{
     log_distribution_with_labels,
     register_convex_counter,
     register_convex_histogram,
+    CancelableTimer,
     StaticMetricLabel,
     StatusTimer,
     STATUS_LABEL,
@@ -19,6 +20,47 @@ pub enum UdfExecutorResult {
     Success,
     UserError,
     SystemError(&'static str),
+}
+
+#[derive(Clone, Copy)]
+pub enum DurableActionSource {
+    Scheduled,
+    Cron,
+}
+
+impl DurableActionSource {
+    fn metric_label(self) -> StaticMetricLabel {
+        StaticMetricLabel::new(
+            "source",
+            match self {
+                Self::Scheduled => "scheduled",
+                Self::Cron => "cron",
+            },
+        )
+    }
+}
+
+register_convex_histogram!(
+    DURABLE_ACTION_ADMISSION_WAIT_SECONDS,
+    "Time a durable scheduled action waits to reach its execution admission boundary before its \
+     claim",
+    &[STATUS_LABEL[0], "source"]
+);
+pub fn durable_action_admission_timer(source: DurableActionSource) -> CancelableTimer {
+    let mut timer = CancelableTimer::new(&DURABLE_ACTION_ADMISSION_WAIT_SECONDS);
+    timer.add_label(source.metric_label());
+    timer
+}
+
+register_convex_histogram!(
+    DURABLE_ACTION_CLAIM_SECONDS,
+    "Time to verify and commit a durable scheduled action claim after execution admission",
+    &[STATUS_LABEL[0], "source"]
+);
+pub fn durable_action_claim_timer(source: DurableActionSource) -> CancelableTimer {
+    let mut timer = CancelableTimer::new(&DURABLE_ACTION_CLAIM_SECONDS);
+    timer.add_label(source.metric_label());
+    timer
 }
 
 register_convex_counter!(
