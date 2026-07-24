@@ -118,7 +118,10 @@ use value::{
 };
 
 use crate::{
-    application_function_runner::ApplicationFunctionRunner,
+    application_function_runner::{
+        ApplicationFunctionRunner,
+        DurableActionSource,
+    },
     function_log::FunctionExecutionLog,
 };
 
@@ -1011,15 +1014,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
         usage_tracker: FunctionUsageTracker,
     ) -> anyhow::Result<()> {
         let identity = tx.identity().clone();
-        let Some((mut tx, metadata)) = self
-            .new_transaction_for_job_state(job_id, &job, usage_tracker.clone())
-            .await?
-        else {
-            // Continue without updating since the job state has changed
-            return Ok(());
-        };
-        let namespace = tx.table_mapping().tablet_namespace(job_id.tablet_id)?;
-        match job.state {
+        drop(tx);
+        match &job.state {
             ScheduledJobState::Pending => {
                 // Create a new request & execution ID
                 let request_id = RequestId::new();
@@ -1029,24 +1025,38 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                 );
                 sentry::configure_scope(|scope| context.add_sentry_tags(scope));
 
-                // Set state to in progress
-                let mut updated_job = metadata.clone();
-                updated_job.state = ScheduledJobState::InProgress {
-                    request_id: context.request_id.clone(),
-                    execution_id: context.execution_id,
+                let expected_job = job.clone();
+                let claim_context = context.clone();
+                let claim = async {
+                    let Some((mut tx, metadata)) = self
+                        .new_transaction_for_job_state(job_id, &expected_job, usage_tracker.clone())
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    let namespace = tx.table_mapping().tablet_namespace(job_id.tablet_id)?;
+                    let mut updated_job = metadata;
+                    updated_job.state = ScheduledJobState::InProgress {
+                        request_id: claim_context.request_id.clone(),
+                        execution_id: claim_context.execution_id,
+                    };
+                    SchedulerModel::new(&mut tx, namespace)
+                        .replace(job_id, updated_job.clone())
+                        .await?;
+                    self.database
+                        .commit_with_write_source(tx, "scheduled_job_progress")
+                        .await?;
+                    Ok(Some(updated_job))
                 };
-                SchedulerModel::new(&mut tx, namespace)
-                    .replace(job_id, updated_job.clone())
-                    .await?;
-                self.database
-                    .commit_with_write_source(tx, "scheduled_job_progress")
-                    .await?;
 
-                // Execute the action
+                // The action holds its environment-specific admission while `claim`
+                // verifies Pending and commits InProgress. For V8 this includes an
+                // eligible worker and active execution permit. User code cannot start
+                // until that monotonic claim succeeds.
                 let path = job.path.clone();
-                let completion = self
+                let Some((completion, updated_job)) = self
                     .runner
-                    .run_action_no_udf_log(
+                    .run_action_no_udf_log_after_admission(
                         PublicFunctionPath::Component(path),
                         job.udf_args()?,
                         identity,
@@ -1055,8 +1065,15 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                         context.clone(),
                         true,
                         SchedulerDependencyClass::Independent,
+                        DurableActionSource::Scheduled,
+                        claim,
                     )
-                    .await?;
+                    .await?
+                else {
+                    // Cancellation or replacement changed the exact Pending job
+                    // while this execution waited for admission.
+                    return Ok(());
+                };
                 let state = match &completion.outcome.result {
                     Ok(_) => ScheduledJobState::Success,
                     Err(e) => ScheduledJobState::Failed(e.to_string()),
@@ -1081,9 +1098,17 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                     .await;
             },
             ScheduledJobState::InProgress {
-                ref request_id,
-                ref execution_id,
+                request_id,
+                execution_id,
             } => {
+                let Some((mut tx, _metadata)) = self
+                    .new_transaction_for_job_state(job_id, &job, usage_tracker.clone())
+                    .await?
+                else {
+                    // Continue without updating since the job state has changed.
+                    return Ok(());
+                };
+                let namespace = tx.table_mapping().tablet_namespace(job_id.tablet_id)?;
                 // This case can happen if there is a system error while executing
                 // the action or if backend exits after executing the action but
                 // before updating the state. Since we execute actions at most once,
@@ -1158,8 +1183,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
             .then_some((tx, metadata)))
     }
 
-    // Completes an action in separate transaction. Returns false if the action
-    // state has changed.
+    // Completes an action in a separate transaction. A changed state is treated
+    // as already handled by the winning operation.
     async fn complete_action(
         &self,
         job_id: ResolvedDocumentId,

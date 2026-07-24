@@ -245,6 +245,11 @@ can wait at later application and isolate stages while retaining its HTTP permit
 not the dependency definition or capacity arithmetic. The deployment control-plane lane remains
 inside shared base and can never consume dependency overflow.
 
+[`scheduled_action_admission/README.md`](../scheduled_action_admission/README.md) uses the
+application, queue, active-permit, and worker boundaries from this patch to reserve a concrete
+scheduled action before its durable at-most-once claim. Scheduled roots remain independent and
+never consume dependency overflow.
+
 Context reuse for HTTP actions, database UDFs, and ordinary actions can reduce service time, but
 none of those features changes dependency ownership. Degradable query admission can reduce
 independent demand, but a client declaration cannot grant dependency status.

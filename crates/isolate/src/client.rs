@@ -1184,6 +1184,7 @@ pub enum RequestType<RT: Runtime> {
         fetch_client: Arc<dyn FetchClient>,
         log_line_sender: mpsc::UnboundedSender<LogLine>,
         function_started_sender: Option<oneshot::Sender<()>>,
+        function_execution_start: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     },
     HttpAction {
         request: HttpActionRequest<RT>,
@@ -1732,6 +1733,7 @@ impl<RT: Runtime> IsolateClient<RT> {
         environment_data: EnvironmentData<RT>,
         instance_name: String,
         function_started_sender: Option<oneshot::Sender<()>>,
+        function_execution_start: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<ActionOutcome> {
         let (tx, rx) = oneshot::channel();
@@ -1752,6 +1754,7 @@ impl<RT: Runtime> IsolateClient<RT> {
             fetch_client,
             log_line_sender,
             function_started_sender,
+            function_execution_start,
         };
         self.send_request(Request::new_with_scheduler_dependency(
             instance_name,

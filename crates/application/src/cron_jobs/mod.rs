@@ -88,7 +88,10 @@ use value::{
 };
 
 use crate::{
-    application_function_runner::ApplicationFunctionRunner,
+    application_function_runner::{
+        ApplicationFunctionRunner,
+        DurableActionSource,
+    },
     function_log::FunctionExecutionLog,
 };
 
@@ -674,7 +677,8 @@ impl<RT: Runtime> CronJobContext<RT> {
         let identity = tx.identity().clone();
         let (_, component_path) = self.get_job_component(&mut tx, job.id).await?;
         let caller = FunctionCaller::Cron;
-        match job.state {
+        drop(tx);
+        match &job.state {
             CronJobState::Pending => {
                 // Create a new request & execution ID
                 let request_id = RequestId::new();
@@ -684,27 +688,37 @@ impl<RT: Runtime> CronJobContext<RT> {
                 );
                 sentry::configure_scope(|scope| context.add_sentry_tags(scope));
 
-                // Set state to in progress
-                let mut updated_job = job.clone();
-                updated_job.state = CronJobState::InProgress {
-                    request_id: context.request_id.clone(),
-                    execution_id: context.execution_id,
+                let expected_job = job.clone();
+                let claim_context = context.clone();
+                let claim = async {
+                    let Some(mut tx) = self
+                        .new_transaction_for_job_state(&expected_job, usage_tracker.clone())
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    let mut updated_job = expected_job.clone();
+                    updated_job.state = CronJobState::InProgress {
+                        request_id: claim_context.request_id.clone(),
+                        execution_id: claim_context.execution_id,
+                    };
+                    CronModel::new(&mut tx, component)
+                        .update_job_state(updated_job.cron_next_run())
+                        .await?;
+                    self.database
+                        .commit_with_write_source(tx, "cron_in_progress")
+                        .await?;
+                    Ok(Some(updated_job))
                 };
-                CronModel::new(&mut tx, component)
-                    .update_job_state(updated_job.cron_next_run())
-                    .await?;
-                self.database
-                    .commit_with_write_source(tx, "cron_in_progress")
-                    .await?;
 
-                // Execute the action
+                // Reserve the runtime before making the at-most-once claim visible.
                 let path = CanonicalizedComponentFunctionPath {
                     component: component_path,
                     udf_path: job.cron_spec.udf_path.clone(),
                 };
-                let completion = self
+                let Some((completion, updated_job)) = self
                     .runner
-                    .run_action_no_udf_log(
+                    .run_action_no_udf_log_after_admission(
                         PublicFunctionPath::Component(path),
                         job.cron_spec.udf_args.clone(),
                         identity.clone(),
@@ -713,8 +727,14 @@ impl<RT: Runtime> CronJobContext<RT> {
                         context.clone(),
                         true,
                         SchedulerDependencyClass::Independent,
+                        DurableActionSource::Cron,
+                        claim,
                     )
-                    .await?;
+                    .await?
+                else {
+                    // The registered cron definition changed while admission waited.
+                    return Ok(());
+                };
                 let execution_time_f64 = completion.execution_time.as_secs_f64();
                 let truncated_log_lines = self.truncate_log_lines(completion.log_lines.clone());
 
@@ -754,9 +774,16 @@ impl<RT: Runtime> CronJobContext<RT> {
                     .await;
             },
             CronJobState::InProgress {
-                ref request_id,
-                ref execution_id,
+                request_id,
+                execution_id,
             } => {
+                let Some(mut tx) = self
+                    .new_transaction_for_job_state(&job, usage_tracker.clone())
+                    .await?
+                else {
+                    // Continue without updating since the job state has changed.
+                    return Ok(());
+                };
                 // This case can happen if there is a system error while executing
                 // the action or if backend exits after executing the action but
                 // before updating the state. Since we execute actions at most once,
@@ -797,7 +824,7 @@ impl<RT: Runtime> CronJobContext<RT> {
 
                 let path = CanonicalizedComponentFunctionPath {
                     component: component_path,
-                    udf_path: job.cron_spec.udf_path,
+                    udf_path: job.cron_spec.udf_path.clone(),
                 };
                 let mut err = err.into();
                 self.function_log
