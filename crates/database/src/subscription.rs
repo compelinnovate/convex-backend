@@ -7,6 +7,7 @@ use std::{
         HashMap,
     },
     future::Future,
+    panic::AssertUnwindSafe,
     sync::{
         atomic::{
             AtomicI64,
@@ -27,7 +28,6 @@ use common::{
         DatabaseIndexWrite,
         TextIndexWrite,
     },
-    errors::report_error,
     knobs::{
         NUM_SUBSCRIPTION_MANAGERS,
         SUBSCRIPTIONS_WORKER_QUEUE_SIZE,
@@ -40,6 +40,7 @@ use common::{
         Runtime,
         SpawnHandle,
     },
+    shutdown::ShutdownSignal,
     types::{
         GenericIndexName,
         SubscriberId,
@@ -223,14 +224,22 @@ struct SubscriptionRequest {
 struct RetentionCoordinator {
     /// Stores the processed_ts for each manager, indexed by manager id.
     processed_timestamps: Arc<Mutex<Vec<Timestamp>>>,
-    log: Arc<Mutex<LogOwner>>,
+    log: Arc<Mutex<RetentionLog>>,
+}
+
+struct RetentionLog {
+    owner: LogOwner,
+    enforced_ts: Timestamp,
 }
 
 impl RetentionCoordinator {
     fn new(num_managers: usize, initial_ts: Timestamp, log: LogOwner) -> Self {
         Self {
             processed_timestamps: Arc::new(Mutex::new(vec![initial_ts; num_managers])),
-            log: Arc::new(Mutex::new(log)),
+            log: Arc::new(Mutex::new(RetentionLog {
+                owner: log,
+                enforced_ts: initial_ts,
+            })),
         }
     }
 
@@ -241,14 +250,24 @@ impl RetentionCoordinator {
     ) -> anyhow::Result<()> {
         let min_ts = {
             let mut timestamps = self.processed_timestamps.lock();
-            timestamps[manager_id] = processed_ts;
+            let manager_ts = timestamps
+                .get_mut(manager_id)
+                .context("known subscription manager")?;
+            anyhow::ensure!(
+                processed_ts >= *manager_ts,
+                "subscription manager processed timestamp regressed"
+            );
+            *manager_ts = processed_ts;
             *timestamps.iter().min().context("at least one manager")?
         };
 
-        // We only need to enforce retention when the passed in processed_ts is the
-        // minimum across all managers
-        if min_ts == processed_ts {
-            self.log.lock().enforce_retention_policy(min_ts);
+        let mut log = self.log.lock();
+        // Managers can observe different maximum timestamps and leapfrog each
+        // other. Enforce whenever the global minimum advances, even when the
+        // manager making this update has already advanced beyond that minimum.
+        if min_ts > log.enforced_ts {
+            log.owner.enforce_retention_policy(min_ts);
+            log.enforced_ts = min_ts;
         }
         Ok(())
     }
@@ -261,8 +280,13 @@ impl SubscriptionsWorker {
         log: LogOwner,
         runtime: RT,
         invalidation_callback: InvalidationMetricCallback,
+        shutdown: ShutdownSignal,
     ) -> SubscriptionsClient {
         let num_managers = *NUM_SUBSCRIPTION_MANAGERS;
+        assert!(
+            num_managers > 0,
+            "NUM_SUBSCRIPTION_MANAGERS must be greater than zero"
+        );
         let log_reader = log.reader();
         let initial_ts = log_reader.max_ts();
 
@@ -277,6 +301,7 @@ impl SubscriptionsWorker {
 
             let manager_log = log_reader.clone();
             let coordinator = retention_coordinator.clone();
+            let shutdown = shutdown.clone();
             let mut manager = SubscriptionManager::new(
                 manager_id,
                 manager_log,
@@ -285,7 +310,7 @@ impl SubscriptionsWorker {
                 invalidation_callback.clone(),
             );
             let handle = runtime.spawn("subscription_worker", async move {
-                manager.run_worker(rx).await
+                manager.run_worker(rx, shutdown).await
             });
             handles.push(handle);
             senders.push(tx);
@@ -318,38 +343,49 @@ impl CountingReceiver {
 }
 
 impl SubscriptionManager {
-    async fn run_worker(&mut self, mut rx: CountingReceiver) {
-        tracing::info!("Starting subscriptions worker");
-        loop {
-            let processed_ts = self.processed_ts();
-            futures::select_biased! {
-                // N.B.: `futures` select macro (not `tokio`) needed for `select_next_some`
-                key = self.closed_subscriptions.select_next_some() => {
-                    self.remove(key);
-                },
-                request = rx.recv().fuse() => {
-                    match request {
-                        Some(SubscriptionRequest { token, sender, is_system }) => {
-                            match self.subscribe(token, sender, is_system) {
-                                Ok(_) => (),
-                                Err(mut e) => {
-                                    report_error(&mut e).await;
-                                },
-                            }
-                        },
-                        None => {
-                            tracing::info!("All clients have gone away, shutting down subscriptions worker...");
-                            break;
-                        },
-                    }
-                },
-                next_ts = self.log.wait_for_higher_ts(processed_ts).fuse() => {
-                    if let Err(mut e) = self.advance_log(next_ts) {
-                        report_error(&mut e).await;
-                    }
-                },
+    async fn run_worker(&mut self, mut rx: CountingReceiver, shutdown: ShutdownSignal) {
+        let manager_id = self.manager_id;
+        let result = AssertUnwindSafe(async {
+            tracing::info!("Starting subscriptions worker");
+            loop {
+                let processed_ts = self.processed_ts();
+                // Use fair selection so sustained subscription churn cannot
+                // starve write-log advancement and retention.
+                futures::select! {
+                    // N.B.: `futures` select macro (not `tokio`) needed for `select_next_some`.
+                    key = self.closed_subscriptions.select_next_some() => {
+                        self.remove(key);
+                    },
+                    request = rx.recv().fuse() => {
+                        match request {
+                            Some(SubscriptionRequest { token, sender, is_system }) => {
+                                self.subscribe(token, sender, is_system)?;
+                            },
+                            None => {
+                                tracing::info!("All clients have gone away, shutting down subscriptions worker...");
+                                break;
+                            },
+                        }
+                    },
+                    next_ts = self.log.wait_for_higher_ts(processed_ts).fuse() => {
+                        self.advance_log(next_ts)?;
+                    },
+                }
             }
-        }
+            Ok::<(), anyhow::Error>(())
+        })
+        .catch_unwind()
+        .await;
+
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error,
+            Err(_) => anyhow::anyhow!("Subscription worker panicked"),
+        };
+        metrics::log_subscription_advance_failure();
+        shutdown.signal(error.context(format!(
+            "Subscription manager {manager_id} failed; write-log retention can no longer advance",
+        )));
     }
 }
 
@@ -918,5 +954,118 @@ impl SubscriptionMap {
         for (index, reads) in reads.iter_search() {
             self.search.remove(id, index, reads);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use common::{
+        shutdown::ShutdownSignal,
+        types::Timestamp,
+    };
+    use futures::FutureExt as _;
+    use tokio::sync::{
+        mpsc,
+        oneshot,
+    };
+
+    use super::{
+        CountingReceiver,
+        InvalidationMetricCallback,
+        RetentionCoordinator,
+        SubscriptionKey,
+        SubscriptionManager,
+    };
+    use crate::write_log::{
+        new_write_log,
+        IndexKeyWrites,
+    };
+
+    async fn assert_worker_signals_shutdown(mut manager: SubscriptionManager) {
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let shutdown = ShutdownSignal::new(shutdown_tx);
+
+        let worker = tokio::spawn(async move {
+            manager
+                .run_worker(CountingReceiver(request_rx), shutdown)
+                .await;
+        });
+        let error = tokio::time::timeout(Duration::from_secs(1), shutdown_rx)
+            .await
+            .expect("subscription worker did not signal shutdown")
+            .expect("subscription worker dropped the shutdown signal");
+        assert!(
+            error
+                .to_string()
+                .contains("write-log retention can no longer advance"),
+            "{error:#}"
+        );
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn advance_log_failure_signals_backend_shutdown() {
+        let log_ts = Timestamp::try_from(2_u64).unwrap();
+        let (log_owner, log_reader, _log_writer) = new_write_log(log_ts);
+        let coordinator = RetentionCoordinator::new(1, log_ts, log_owner);
+        let manager = SubscriptionManager::new(
+            0,
+            log_reader,
+            coordinator,
+            Timestamp::try_from(1_u64).unwrap(),
+            InvalidationMetricCallback::new(),
+        );
+        // Keep select_next_some pending while the already-newer log drives the
+        // advance branch.
+        manager
+            .closed_subscriptions
+            .push(std::future::pending::<SubscriptionKey>().boxed());
+        assert_worker_signals_shutdown(manager).await;
+    }
+
+    #[tokio::test]
+    async fn worker_panic_signals_backend_shutdown() {
+        let log_ts = Timestamp::try_from(1_u64).unwrap();
+        let (log_owner, log_reader, _log_writer) = new_write_log(log_ts);
+        let coordinator = RetentionCoordinator::new(1, log_ts, log_owner);
+        let manager = SubscriptionManager::new(
+            0,
+            log_reader,
+            coordinator,
+            log_ts,
+            InvalidationMetricCallback::new(),
+        );
+        manager.closed_subscriptions.push(
+            std::future::poll_fn(|_| -> std::task::Poll<SubscriptionKey> {
+                panic!("injected subscription worker panic")
+            })
+            .boxed(),
+        );
+
+        assert_worker_signals_shutdown(manager).await;
+    }
+
+    #[tokio::test]
+    async fn retention_advances_when_managers_leapfrog() {
+        let initial_ts = Timestamp::try_from(5_u64).unwrap();
+        let (log_owner, _log_reader, mut log_writer) = new_write_log(initial_ts);
+        let coordinator = RetentionCoordinator::new(2, initial_ts, log_owner);
+
+        let manager_0_ts = Timestamp::try_from(6_u64).unwrap();
+        log_writer.append(manager_0_ts, IndexKeyWrites::empty(), || {});
+        coordinator
+            .update_and_enforce_retention(0, manager_0_ts)
+            .unwrap();
+        assert_eq!(coordinator.log.lock().enforced_ts, initial_ts);
+
+        let manager_1_ts = Timestamp::try_from(7_u64).unwrap();
+        log_writer.append(manager_1_ts, IndexKeyWrites::empty(), || {});
+        coordinator
+            .update_and_enforce_retention(1, manager_1_ts)
+            .unwrap();
+        assert_eq!(coordinator.log.lock().enforced_ts, manager_0_ts);
     }
 }

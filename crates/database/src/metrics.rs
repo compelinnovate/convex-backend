@@ -1,4 +1,8 @@
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::LazyLock,
+    time::Duration,
+};
 
 use ::search::metrics::{
     SearchType,
@@ -16,6 +20,7 @@ use metrics::{
     log_counter_with_labels,
     log_distribution,
     log_distribution_with_labels,
+    log_gauge,
     register_convex_counter,
     register_convex_gauge,
     register_convex_histogram,
@@ -27,6 +32,7 @@ use metrics::{
     Timer,
     STATUS_LABEL,
 };
+use parking_lot::Mutex;
 use prometheus::{
     VMHistogram,
     VMHistogramVec,
@@ -449,6 +455,180 @@ register_convex_histogram!(
 );
 pub fn write_log_commit_bytes(bytes: usize) {
     log_distribution(&DATABASE_WRITE_LOG_COMMIT_BYTES, bytes as f64);
+}
+
+register_convex_gauge!(
+    DATABASE_WRITE_LOG_RETAINED_BYTES_INFO,
+    "HeapSize-weighted dynamic bytes in update elements referenced by live write-log owners; \
+     excludes collection overhead, inline fields, and point-in-time snapshots held by off-thread \
+     commit pre-validation"
+);
+register_convex_gauge!(
+    DATABASE_WRITE_LOG_RETAINED_ENTRIES_INFO,
+    "Database- and text-index (index, timestamp) update vectors referenced by live write-log \
+     owners; excludes point-in-time snapshots held by off-thread commit pre-validation"
+);
+register_convex_gauge!(
+    DATABASE_WRITE_LOG_RETENTION_SPAN_SECONDS_INFO,
+    "Timestamp span from the oldest retained write-log entry to the latest appended write"
+);
+register_convex_int_gauge!(
+    DATABASE_WRITE_LOG_OWNERS_INFO,
+    "Live in-memory write-log owners contributing to process-global write-log metrics"
+);
+register_convex_counter!(
+    DATABASE_WRITE_LOG_TRIMMED_BYTES_TOTAL,
+    "HeapSize-weighted dynamic bytes in update elements removed from the in-memory write log"
+);
+register_convex_counter!(
+    DATABASE_WRITE_LOG_TRIMMED_ENTRIES_TOTAL,
+    "Per-index timestamp update vectors removed from the in-memory write log"
+);
+register_convex_counter!(
+    DATABASE_WRITE_LOG_RETENTION_RUNS_TOTAL,
+    "Attempts to enforce the in-memory write-log retention policy"
+);
+register_convex_gauge!(
+    DATABASE_SUBSCRIPTION_RETENTION_PROGRESS_LAG_SECONDS_INFO,
+    "Timestamp lag between the write-log maximum and the slowest subscription manager"
+);
+register_convex_counter!(
+    DATABASE_SUBSCRIPTION_ADVANCE_FAILURES_TOTAL,
+    "Fatal subscription worker errors and caught unwind panics that prevent write-log advancement"
+);
+
+#[derive(Clone, Copy)]
+pub struct WriteLogMetricOwner(u64);
+
+#[derive(Clone, Copy, Default)]
+struct WriteLogMetricState {
+    retained_bytes: usize,
+    retained_entries: usize,
+    retention_span_seconds: f64,
+    retention_progress_lag_seconds: f64,
+    updated_at: u64,
+}
+
+#[derive(Default)]
+struct WriteLogMetricOwners {
+    next_owner_id: u64,
+    next_update: u64,
+    states: BTreeMap<u64, WriteLogMetricState>,
+}
+
+// Current-state metrics have no owner label. Serialize their producers and
+// retain each live owner's latest state so owners_info == 1 is exact even
+// after another in-process database is dropped.
+static WRITE_LOG_METRIC_OWNERS: LazyLock<Mutex<WriteLogMetricOwners>> =
+    LazyLock::new(|| Mutex::new(WriteLogMetricOwners::default()));
+
+fn publish_write_log_metric_state(state: WriteLogMetricState) {
+    log_gauge(
+        &DATABASE_WRITE_LOG_RETAINED_BYTES_INFO,
+        state.retained_bytes as f64,
+    );
+    log_gauge(
+        &DATABASE_WRITE_LOG_RETAINED_ENTRIES_INFO,
+        state.retained_entries as f64,
+    );
+    log_gauge(
+        &DATABASE_WRITE_LOG_RETENTION_SPAN_SECONDS_INFO,
+        state.retention_span_seconds,
+    );
+    log_gauge(
+        &DATABASE_SUBSCRIPTION_RETENTION_PROGRESS_LAG_SECONDS_INFO,
+        state.retention_progress_lag_seconds,
+    );
+}
+
+pub fn initialize_write_log_metrics() -> WriteLogMetricOwner {
+    log_counter(&DATABASE_WRITE_LOG_TRIMMED_BYTES_TOTAL, 0);
+    log_counter(&DATABASE_WRITE_LOG_TRIMMED_ENTRIES_TOTAL, 0);
+    log_counter(&DATABASE_WRITE_LOG_RETENTION_RUNS_TOTAL, 0);
+    log_counter(&DATABASE_SUBSCRIPTION_ADVANCE_FAILURES_TOTAL, 0);
+
+    let mut owners = WRITE_LOG_METRIC_OWNERS.lock();
+    let owner_id = owners.next_owner_id;
+    owners.next_owner_id = owners
+        .next_owner_id
+        .checked_add(1)
+        .expect("write log metric owner ID overflow");
+    let updated_at = owners.next_update;
+    owners.next_update = owners
+        .next_update
+        .checked_add(1)
+        .expect("write log metric update sequence overflow");
+    let state = WriteLogMetricState {
+        updated_at,
+        ..Default::default()
+    };
+    assert!(
+        owners.states.insert(owner_id, state).is_none(),
+        "write log metric owner ID reused"
+    );
+    DATABASE_WRITE_LOG_OWNERS_INFO
+        .set(i64::try_from(owners.states.len()).expect("write log metric owner count exceeds i64"));
+    publish_write_log_metric_state(state);
+    WriteLogMetricOwner(owner_id)
+}
+
+pub fn set_write_log_retained_state(
+    owner: WriteLogMetricOwner,
+    retained_bytes: usize,
+    retained_entries: usize,
+    retention_span_seconds: f64,
+    retention_progress_lag_seconds: f64,
+) {
+    let mut owners = WRITE_LOG_METRIC_OWNERS.lock();
+    let updated_at = owners.next_update;
+    owners.next_update = owners
+        .next_update
+        .checked_add(1)
+        .expect("write log metric update sequence overflow");
+    let state = WriteLogMetricState {
+        retained_bytes,
+        retained_entries,
+        retention_span_seconds,
+        retention_progress_lag_seconds,
+        updated_at,
+    };
+    *owners
+        .states
+        .get_mut(&owner.0)
+        .expect("unknown write log metric owner") = state;
+    publish_write_log_metric_state(state);
+}
+
+pub fn drop_write_log_metrics_owner(owner: WriteLogMetricOwner) {
+    let mut owners = WRITE_LOG_METRIC_OWNERS.lock();
+    assert!(
+        owners.states.remove(&owner.0).is_some(),
+        "unknown write log metric owner"
+    );
+    DATABASE_WRITE_LOG_OWNERS_INFO
+        .set(i64::try_from(owners.states.len()).expect("write log metric owner count exceeds i64"));
+    let state = owners
+        .states
+        .values()
+        .max_by_key(|state| state.updated_at)
+        .copied()
+        .unwrap_or_default();
+    // A departing last writer must not leave its state behind when another
+    // database remains alive in the same process.
+    publish_write_log_metric_state(state);
+}
+
+pub fn log_write_log_trimmed(bytes: usize, entries: usize) {
+    log_counter(&DATABASE_WRITE_LOG_TRIMMED_BYTES_TOTAL, bytes as u64);
+    log_counter(&DATABASE_WRITE_LOG_TRIMMED_ENTRIES_TOTAL, entries as u64);
+}
+
+pub fn log_write_log_retention_run() {
+    log_counter(&DATABASE_WRITE_LOG_RETENTION_RUNS_TOTAL, 1);
+}
+
+pub fn log_subscription_advance_failure() {
+    log_counter(&DATABASE_SUBSCRIPTION_ADVANCE_FAILURES_TOTAL, 1);
 }
 
 register_convex_counter!(DATABASE_COMMIT_ROWS, "Number of commits to database");

@@ -277,22 +277,27 @@ impl HeapSize for WriteSource {
 struct WriteLogManager {
     log: WriteLog,
     size: usize,
+    retained_entries: usize,
     /// Keeps track of the minimum timestamps in each index's log, used for fast
     /// purging. Each entry records which map (`IndexKind`) the index belongs to
     /// so we can remove from the right map.
     min_ts_to_index: BinaryHeap<Reverse<(Timestamp, TabletIndexName, IndexKind)>>,
     waiters: VecDeque<(Timestamp, oneshot::Sender<()>)>,
+    metrics_owner: metrics::WriteLogMetricOwner,
 }
 
 impl WriteLogManager {
     fn new(initial_timestamp: Timestamp) -> Self {
+        let metrics_owner = metrics::initialize_write_log_metrics();
         let log = WriteLog::new(initial_timestamp);
         let waiters = VecDeque::new();
         Self {
             log,
             size: 0,
+            retained_entries: 0,
             min_ts_to_index: BinaryHeap::new(),
             waiters,
+            metrics_owner,
         }
     }
 
@@ -324,6 +329,7 @@ impl WriteLogManager {
                 ArcWriteInIndex(updates),
                 IndexKind::Database,
                 &mut self.size,
+                &mut self.retained_entries,
                 &mut self.min_ts_to_index,
             );
         }
@@ -334,10 +340,12 @@ impl WriteLogManager {
                 ArcWriteInIndex(updates),
                 IndexKind::Text,
                 &mut self.size,
+                &mut self.retained_entries,
                 &mut self.min_ts_to_index,
             );
         }
         self.log.max_ts = ts;
+        self.report_retained_state();
 
         self.notify_waiters();
     }
@@ -364,6 +372,18 @@ impl WriteLogManager {
     }
 
     fn enforce_retention_policy(&mut self, current_ts: Timestamp) {
+        assert!(
+            current_ts <= self.log.max_ts,
+            "write log retention progress exceeds the maximum appended timestamp"
+        );
+        assert!(
+            current_ts >= self.log.retention_progress_ts,
+            "write log retention progress timestamp regressed"
+        );
+        self.log.retention_progress_ts = current_ts;
+        metrics::log_write_log_retention_run();
+        let initial_size = self.size;
+        let initial_entries = self.retained_entries;
         let hard_limit_ts = current_ts
             .sub(*WRITE_LOG_MIN_RETENTION_SECS)
             .unwrap_or(Timestamp::MIN);
@@ -392,6 +412,7 @@ impl WriteLogManager {
                         ts,
                         IndexKind::Database,
                         &mut self.size,
+                        &mut self.retained_entries,
                         &mut self.min_ts_to_index,
                     );
                 },
@@ -401,11 +422,55 @@ impl WriteLogManager {
                         ts,
                         IndexKind::Text,
                         &mut self.size,
+                        &mut self.retained_entries,
                         &mut self.min_ts_to_index,
                     );
                 },
             }
         }
+        let trimmed_bytes = initial_size
+            .checked_sub(self.size)
+            .expect("write log size increased while enforcing retention");
+        let trimmed_entries = initial_entries
+            .checked_sub(self.retained_entries)
+            .expect("write log entry count increased while enforcing retention");
+        if trimmed_bytes > 0 || trimmed_entries > 0 {
+            metrics::log_write_log_trimmed(trimmed_bytes, trimmed_entries);
+        }
+        self.report_retained_state();
+    }
+
+    fn report_retained_state(&self) {
+        let span_seconds = self
+            .min_ts_to_index
+            .peek()
+            .map(|Reverse((oldest_ts, ..))| {
+                assert!(
+                    *oldest_ts <= self.log.max_ts,
+                    "oldest write log timestamp exceeds the maximum appended timestamp"
+                );
+                self.log.max_ts.secs_since_f64(*oldest_ts)
+            })
+            .unwrap_or(0.0);
+        assert!(
+            self.log.retention_progress_ts <= self.log.max_ts,
+            "write log retention progress exceeds the maximum appended timestamp"
+        );
+        metrics::set_write_log_retained_state(
+            self.metrics_owner,
+            self.size,
+            self.retained_entries,
+            span_seconds,
+            self.log
+                .max_ts
+                .secs_since_f64(self.log.retention_progress_ts),
+        );
+    }
+}
+
+impl Drop for WriteLogManager {
+    fn drop(&mut self) {
+        metrics::drop_write_log_metrics_owner(self.metrics_owner);
     }
 }
 
@@ -484,11 +549,20 @@ impl<T: HeapSize> WritesByIndex<T> {
         update: ArcWriteInIndex<T>,
         kind: IndexKind,
         by_index_size: &mut usize,
+        retained_entries: &mut usize,
         min_ts_to_index: &mut BinaryHeap<Reverse<(Timestamp, TabletIndexName, IndexKind)>>,
     ) {
-        *by_index_size += update.heap_size();
+        *by_index_size = by_index_size
+            .checked_add(update.heap_size())
+            .expect("write log retained byte count overflow");
+        *retained_entries = retained_entries
+            .checked_add(1)
+            .expect("write log retained entry count overflow");
         if let Some(e) = self.0.get_mut(&index) {
-            e.insert(update);
+            assert!(
+                e.insert(update).is_none(),
+                "write log appended the same index and timestamp twice"
+            );
         } else {
             let ts = update.ts;
             self.0.insert(index.clone(), OrdSet::unit(update));
@@ -504,14 +578,22 @@ impl<T: HeapSize> WritesByIndex<T> {
         ts: Timestamp,
         kind: IndexKind,
         by_index_size: &mut usize,
+        retained_entries: &mut usize,
         min_ts_to_index: &mut BinaryHeap<Reverse<(Timestamp, TabletIndexName, IndexKind)>>,
     ) {
-        let Some(inner) = self.0.get_mut(&index) else {
-            return;
-        };
-        if let Some(update) = inner.remove(&ts) {
-            *by_index_size = by_index_size.saturating_sub(update.heap_size());
-        }
+        let inner = self
+            .0
+            .get_mut(&index)
+            .expect("write log retention referenced a missing index");
+        let update = inner
+            .remove(&ts)
+            .expect("write log retention referenced a missing timestamp");
+        *by_index_size = by_index_size
+            .checked_sub(update.heap_size())
+            .expect("write log retained byte count underflow");
+        *retained_entries = retained_entries
+            .checked_sub(1)
+            .expect("write log retained entry count underflow");
         if let Some(update) = inner.get_min() {
             let new_min_ts = update.0.ts;
             min_ts_to_index.push(Reverse((new_min_ts, index, kind)));
@@ -533,6 +615,8 @@ struct WriteLog {
     by_database_index: WritesByIndex<DatabaseIndexWrite>,
     by_text_index: WritesByIndex<TextIndexWrite>,
     max_ts: Timestamp,
+    /// Minimum timestamp processed by every subscription manager.
+    retention_progress_ts: Timestamp,
     purged_ts: Timestamp,
 }
 
@@ -560,6 +644,7 @@ impl WriteLog {
             by_database_index: WritesByIndex::new(),
             by_text_index: WritesByIndex::new(),
             max_ts: initial_timestamp,
+            retention_progress_ts: initial_timestamp,
             purged_ts: initial_timestamp,
         }
     }

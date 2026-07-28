@@ -1081,8 +1081,12 @@ impl<RT: Runtime> Database<RT> {
             Arc::new(log_reader.clone()),
         );
         let invalidation_callback = InvalidationMetricCallback::new();
-        let subscriptions =
-            SubscriptionsWorker::start(log_owner, runtime.clone(), invalidation_callback.clone());
+        let subscriptions = SubscriptionsWorker::start(
+            log_owner,
+            runtime.clone(),
+            invalidation_callback.clone(),
+            shutdown.clone(),
+        );
         let committer = Committer::start(
             log_writer,
             snapshot_writer,
