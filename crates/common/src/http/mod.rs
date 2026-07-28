@@ -12,6 +12,7 @@ use std::{
     },
     sync::{
         atomic::{
+            AtomicBool,
             AtomicU64,
             Ordering,
         },
@@ -150,8 +151,10 @@ mod metrics {
 
     use metrics::{
         add_to_gauge_with_labels,
+        log_counter_with_labels,
         log_distribution_with_labels,
         log_gauge_with_labels,
+        register_convex_counter,
         register_convex_gauge,
         register_convex_histogram,
         subtract_from_gauge_with_labels,
@@ -200,6 +203,12 @@ mod metrics {
         "Time HTTP requests spent waiting for service admission",
         &["service_name", "is_dependency"]
     );
+    register_convex_counter!(
+        HTTP_MEMORY_PRESSURE_SHED_TOTAL,
+        "External HTTP requests rejected before handling because backend cgroup memory headroom \
+         was low",
+        &["service_name"]
+    );
 
     fn http_admission_labels(
         service_name: &'static str,
@@ -219,6 +228,19 @@ mod metrics {
                 http_admission_labels(service_name, is_dependency),
             );
         }
+        log_counter_with_labels(
+            &HTTP_MEMORY_PRESSURE_SHED_TOTAL,
+            0,
+            vec![StaticMetricLabel::new("service_name", service_name)],
+        );
+    }
+
+    pub fn log_http_memory_pressure_shed(service_name: &'static str) {
+        log_counter_with_labels(
+            &HTTP_MEMORY_PRESSURE_SHED_TOTAL,
+            1,
+            vec![StaticMetricLabel::new("service_name", service_name)],
+        );
     }
 
     #[cfg(test)]
@@ -598,11 +620,52 @@ pub struct ConvexHttpService {
     _base_concurrency_gauge: Option<PullingGauge>,
 }
 
+/// Shared state used by a host-specific controller to shed new external HTTP
+/// work. The HTTP layer owns request classification; the controller owns only
+/// the current pressure state.
+#[derive(Clone)]
+pub struct ExternalRequestShedding {
+    active: Arc<AtomicBool>,
+}
+
+impl ExternalRequestShedding {
+    pub fn new(active: bool) -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(active)),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Returns the prior state so the controller can record transitions.
+    pub fn set_active(&self, active: bool) -> bool {
+        self.active.swap(active, Ordering::AcqRel)
+    }
+}
+
 #[derive(Clone)]
 struct HttpConcurrencyLimiter {
     gate: crate::dependency_overflow::DependencyOverflowGate,
     dependency_path_prefixes: &'static [&'static str],
+    external_request_shedding: Option<ExternalRequestShedding>,
     service_name: &'static str,
+}
+
+fn memory_pressure_response(service_name: &'static str) -> Response {
+    metrics::log_http_memory_pressure_shed(service_name);
+    let mut response = HttpError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "BackendMemoryPressure",
+        "The backend is temporarily limiting new work because memory headroom is low. Retry the \
+         request.",
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 async fn dependency_aware_concurrency_middleware(
@@ -620,12 +683,32 @@ async fn dependency_aware_concurrency_middleware(
         && request
             .headers()
             .contains_key(CONVEX_ACTIONS_CALLBACK_TOKEN);
+    if !is_dependency
+        && limiter
+            .external_request_shedding
+            .as_ref()
+            .is_some_and(ExternalRequestShedding::is_active)
+    {
+        return memory_pressure_response(limiter.service_name);
+    }
     let permit = limiter
         .gate
         .acquire_with_waiter(is_dependency, || {
             metrics::HttpAdmissionWaitGuard::new(limiter.service_name, is_dependency)
         })
         .await;
+    // A request can wait for a normal concurrency permit while memory pressure
+    // begins. Recheck before running the handler so queued external work does
+    // not bypass an active shedding interval.
+    if !is_dependency
+        && limiter
+            .external_request_shedding
+            .as_ref()
+            .is_some_and(ExternalRequestShedding::is_active)
+    {
+        drop(permit);
+        return memory_pressure_response(limiter.service_name);
+    }
     let response = next.run(request).await;
     drop(permit);
     response
@@ -647,6 +730,7 @@ impl ConvexHttpService {
             max_concurrency,
             0,
             &[],
+            None,
             request_timeout,
             route_metric_mapper,
         )
@@ -659,6 +743,7 @@ impl ConvexHttpService {
         max_concurrency: usize,
         dependency_reserve: usize,
         dependency_path_prefixes: &'static [&'static str],
+        external_request_shedding: Option<ExternalRequestShedding>,
         request_timeout: Duration,
         route_metric_mapper: RM,
     ) -> Self {
@@ -701,6 +786,7 @@ impl ConvexHttpService {
         let concurrency_limiter = HttpConcurrencyLimiter {
             gate: concurrency_gate,
             dependency_path_prefixes,
+            external_request_shedding,
             service_name,
         };
         let concurrency_gauge = PullingGauge::new(
@@ -1610,6 +1696,7 @@ mod tests {
             HttpAdmissionWaitGuard,
         },
         Body,
+        ExternalRequestShedding,
         HttpConcurrencyLimiter,
         StatusCode,
     };
@@ -1633,11 +1720,111 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn ok_handler() -> StatusCode {
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn memory_pressure_sheds_external_requests_but_preserves_dependencies() {
+        let shedding = ExternalRequestShedding::new(true);
+        let limiter = HttpConcurrencyLimiter {
+            gate: DependencyOverflowGate::new(1, 2),
+            dependency_path_prefixes: &["/api/actions/"],
+            external_request_shedding: Some(shedding.clone()),
+            service_name: "memory_pressure_test",
+        };
+        let app = Router::new()
+            .route("/ordinary", get(ok_handler))
+            .route("/api/actions/query", get(ok_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                limiter,
+                dependency_aware_concurrency_middleware,
+            ));
+
+        let ordinary = app
+            .clone()
+            .oneshot(Request::get("/ordinary").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ordinary.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let dependency = app
+            .clone()
+            .oneshot(
+                Request::get("/api/actions/query")
+                    .header("Convex-Action-Callback-Token", "token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dependency.status(), StatusCode::OK);
+
+        assert!(shedding.set_active(false));
+        let recovered = app
+            .oneshot(Request::get("/ordinary").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn queued_external_request_rechecks_memory_pressure_before_handling() {
+        let shedding = ExternalRequestShedding::new(false);
+        let limiter = HttpConcurrencyLimiter {
+            gate: DependencyOverflowGate::new(1, 1),
+            dependency_path_prefixes: &[],
+            external_request_shedding: Some(shedding.clone()),
+            service_name: "queued_memory_pressure_test",
+        };
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let app = Router::new()
+            .route("/ordinary", get(ordinary_handler))
+            .with_state(BlockingHandlerState {
+                started: started_tx,
+                release: release.clone(),
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                limiter,
+                dependency_aware_concurrency_middleware,
+            ));
+
+        let first = tokio::spawn(
+            app.clone()
+                .oneshot(Request::get("/ordinary").body(Body::empty()).unwrap()),
+        );
+        assert_eq!(started_rx.recv().await, Some("ordinary"));
+        let queued =
+            tokio::spawn(app.oneshot(Request::get("/ordinary").body(Body::empty()).unwrap()));
+        match tokio::time::timeout(Duration::from_millis(25), started_rx.recv()).await {
+            Ok(Some(request_kind)) => {
+                panic!("shed queued request reached the handler: {request_kind}")
+            },
+            Ok(None) | Err(_) => {},
+        }
+
+        assert!(!shedding.set_active(true));
+        release.add_permits(1);
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            queued.await.unwrap().unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        match tokio::time::timeout(Duration::from_millis(25), started_rx.recv()).await {
+            Ok(Some(request_kind)) => {
+                panic!("shed queued request reached the handler: {request_kind}")
+            },
+            Ok(None) | Err(_) => {},
+        }
+    }
+
     #[tokio::test]
     async fn dependencies_share_base_before_using_http_overflow() {
         let limiter = HttpConcurrencyLimiter {
             gate: DependencyOverflowGate::new(2, 3),
             dependency_path_prefixes: &["/api/actions/"],
+            external_request_shedding: None,
             service_name: "test",
         };
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
@@ -1725,6 +1912,7 @@ mod tests {
         let limiter = HttpConcurrencyLimiter {
             gate: DependencyOverflowGate::new(1, 1),
             dependency_path_prefixes: &["/api/actions/"],
+            external_request_shedding: None,
             service_name: "test",
         };
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();

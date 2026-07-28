@@ -286,6 +286,166 @@ pub static NODE_ACTION_USER_TIMEOUT: LazyLock<Duration> =
 pub static MAX_ACTION_USER_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| max(*V8_ACTION_USER_TIMEOUT, *NODE_ACTION_USER_TIMEOUT));
 
+/// V8 old-space allowance for the long-lived local Node executor child, in MiB.
+/// This does not include Buffers, native modules, executable code, or allocator
+/// retention, so the independent RSS retirement threshold must remain larger.
+pub static LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB: LazyLock<usize> = LazyLock::new(|| {
+    let value = env_config_usize_strict("LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB", 2048);
+    assert!(
+        value > 0,
+        "LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB must be greater than zero"
+    );
+    value
+});
+
+/// Sampled Linux direct-child resident-memory threshold that starts graceful
+/// retirement of the local Node executor generation. This is a planning
+/// allowance, not a hard maximum: the child can grow between samples and while
+/// active requests drain, and descendant processes are excluded. Failed samples
+/// skip this trigger observably while other retirement checks continue. The
+/// value must be greater than zero.
+pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let value =
+        env_config_usize_strict("LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES", 3 * 1024 * 1024 * 1024);
+    assert!(
+        value > 0,
+        "LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES must be greater than zero"
+    );
+    value
+});
+
+/// Maximum age of a local Node executor generation before graceful retirement.
+/// A finite age bounds retained ESM identities even when RSS remains low.
+pub static LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE: LazyLock<Duration> = LazyLock::new(|| {
+    let seconds =
+        env_config_usize_strict("LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS", 6 * 60 * 60);
+    assert!(
+        seconds > 0,
+        "LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS must be greater than zero"
+    );
+    Duration::from_secs(
+        seconds
+            .try_into()
+            .expect("LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS does not fit in u64"),
+    )
+});
+
+/// Maximum lifetime-unique imported source-package roots in one local Node
+/// executor generation before graceful retirement. Disk-cache eviction does
+/// not reduce this count because it cannot evict Node's ESM module graph.
+pub static LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES: LazyLock<usize> =
+    LazyLock::new(|| {
+        let value =
+            env_config_usize_strict("LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES", 1000);
+        assert!(
+            value > 0,
+            "LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES must be greater than zero"
+        );
+        value
+    });
+
+/// Startup memory reserved for backend allocations that do not have a separate
+/// configured cache or runtime ceiling, including Rust data structures,
+/// allocator retention, thread stacks, page tables, and cgroup kernel memory.
+pub static LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES: LazyLock<usize> =
+    LazyLock::new(|| {
+        let value = env_config_usize_strict(
+            "LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES",
+            2 * 1024 * 1024 * 1024,
+        );
+        assert!(
+            value > 0,
+            "LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES must be greater than zero"
+        );
+        value
+    });
+
+/// Reclaim optional backend memory before external admission reaches its
+/// shedding boundary. This requires a finite cgroup v2 memory limit.
+pub static LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config_bool_strict("LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED", false));
+
+/// Cgroup memory headroom at or below which internal reclamation starts.
+pub static LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES: LazyLock<usize> =
+    LazyLock::new(|| {
+        env_config_usize_strict(
+            "LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES",
+            6 * 1024 * 1024 * 1024,
+        )
+    });
+
+/// Cgroup memory headroom at or above which internal reclamation stops.
+pub static LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES: LazyLock<usize> =
+    LazyLock::new(|| {
+        env_config_usize_strict(
+            "LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES",
+            8 * 1024 * 1024 * 1024,
+        )
+    });
+
+/// Ask glibc to discard free arena pages while internal cgroup reclamation is
+/// active. Unsupported allocators report explicit telemetry and do nothing.
+pub static LOCAL_BACKEND_MALLOC_TRIM_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config_bool_strict("LOCAL_BACKEND_MALLOC_TRIM_ENABLED", false));
+
+/// Minimum logical free glibc arena space required before an explicit trim.
+pub static LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    env_config_usize_strict(
+        "LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES",
+        1024 * 1024 * 1024,
+    )
+});
+
+/// Minimum time between explicit glibc trim attempts during one or more
+/// pressure episodes.
+pub static LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config("LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS", 300))
+});
+
+/// Minimum sampled direct-child RSS for sustained cgroup pressure to retire a
+/// local Node executor generation before its ordinary RSS limit.
+pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES: LazyLock<usize> =
+    LazyLock::new(|| {
+        env_config_usize_strict(
+            "LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES",
+            2 * 1024 * 1024 * 1024,
+        )
+    });
+
+/// Time internal cgroup pressure must remain active before it may retire a
+/// material local Node executor generation.
+pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config(
+        "LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS",
+        60,
+    ))
+});
+
+/// Reject new external HTTP work when finite cgroup memory headroom is low.
+/// Internal Node action callbacks remain eligible so already-running work can
+/// make progress and release memory.
+pub static LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    env_config_bool_strict("LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED", false)
+});
+
+/// Cgroup memory headroom at or below which external HTTP admission is shed.
+pub static LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES: LazyLock<usize> =
+    LazyLock::new(|| {
+        env_config_usize_strict(
+            "LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES",
+            3 * 1024 * 1024 * 1024,
+        )
+    });
+
+/// Cgroup memory headroom at or above which external HTTP admission resumes.
+pub static LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES: LazyLock<usize> =
+    LazyLock::new(|| {
+        env_config_usize_strict(
+            "LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES",
+            5 * 1024 * 1024 * 1024,
+        )
+    });
+
 /// Ideally, we should have no timeout here but we are relying on defense in
 /// depth in case somehow the upstream get stuck. Use very high timeout here.
 ///
@@ -883,7 +1043,7 @@ pub static WRITE_LOG_MIN_RETENTION_SECS: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("WRITE_LOG_MIN_RETENTION_SECS", 30)));
 
 /// The maximum time to retain the WriteLog, note that the WriteLog might be
-/// trimmed sooner if it size exceeds WRITE_LOG_MAX_SIZE_BYTES.
+/// trimmed sooner if its size exceeds WRITE_LOG_SOFT_MAX_SIZE_BYTES.
 pub static WRITE_LOG_MAX_RETENTION_SECS: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("WRITE_LOG_MAX_RETENTION_SECS", 300)));
 
@@ -2039,8 +2199,8 @@ pub static SUBSCRIPTIONS_WORKER_QUEUE_SIZE: LazyLock<usize> =
     LazyLock::new(|| env_config("SUBSCRIPTIONS_WORKER_QUEUE_SIZE", 10000));
 
 /// The number of SubscriptionManager instances to run per SubscriptionsWorker.
-/// Incoming subscription requests are randomly sharded across these managers
-/// to distribute load and avoid overloading a single manager.
+/// Incoming subscription requests are assigned round-robin across these
+/// managers to distribute load and avoid overloading a single manager.
 pub static NUM_SUBSCRIPTION_MANAGERS: LazyLock<usize> =
     LazyLock::new(|| env_config("NUM_SUBSCRIPTION_MANAGERS", 1));
 

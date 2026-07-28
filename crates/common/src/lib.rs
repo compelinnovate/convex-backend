@@ -46,6 +46,7 @@ pub mod json_schemas;
 pub mod knobs;
 pub mod log_lines;
 pub mod log_streaming;
+pub mod memory_pressure;
 pub mod metrics;
 pub mod numeric;
 pub mod paths;

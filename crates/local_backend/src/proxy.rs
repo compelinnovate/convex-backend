@@ -13,6 +13,7 @@ use axum::{
 use common::{
     http::{
         ConvexHttpService,
+        ExternalRequestShedding,
         HttpResponseError,
         NoopRouteMapper,
     },
@@ -39,6 +40,7 @@ pub async fn dev_site_proxy(
     site_bind_addr: Option<([u8; 4], u16)>,
     site_forward_prefix: String,
     max_concurrent_requests: usize,
+    external_request_shedding: Option<ExternalRequestShedding>,
     mut shutdown_rx: async_broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
     let Some(addr) = site_bind_addr else {
@@ -75,11 +77,14 @@ pub async fn dev_site_proxy(
             client: Client::builder(TokioExecutor::new()).build_http(),
         });
 
-    let service = ConvexHttpService::new(
+    let service = ConvexHttpService::new_with_dependency_reserve(
         Router::new().fallback_service(router),
         "backend_http_proxy",
         "unknown".to_string(),
         max_concurrent_requests,
+        0,
+        &[],
+        external_request_shedding,
         *HTTP_SERVER_TIMEOUT_DURATION,
         NoopRouteMapper,
     );

@@ -985,6 +985,11 @@ async function processSourcePackageStream(
 
 export const availableSourcePackages = new Map<string, LocalSourcePackage>();
 export const availableExternalPackages = new Map<string, ExternalDepsPackage>();
+// Node's ESM cache retains module graphs by URL after the corresponding
+// disk-cache entry is retired. Package directories are unique publication
+// roots, so this lifetime count tracks that non-evictable generation growth
+// without exporting the paths.
+const importedSourcePackageRoots = new Set<string>();
 const sourcePackageRetirements = new Map<string, Promise<void>>();
 const externalPackageRetirements = new Map<string, Promise<void>>();
 type PackageDownload<T> = {
@@ -1061,6 +1066,10 @@ export async function acquireSourcePackage(
   };
 }
 
+export function recordSourcePackageImport(packageRoot: string) {
+  importedSourcePackageRoots.add(packageRoot);
+}
+
 export function getPackageCacheStats() {
   const sourcePackages = [...availableSourcePackages.values()].filter(
     (localPackage) => localPackage.dynamicallyDownloaded,
@@ -1069,6 +1078,7 @@ export function getPackageCacheStats() {
     (localPackage) => localPackage.dynamicallyDownloaded,
   );
   return {
+    importedSourcePackages: importedSourcePackageRoots.size,
     retainedSourcePackages: sourcePackages.length,
     retainedSourceBytes: sourcePackages.reduce(
       (total, localPackage) => total + localPackage.retainedBytes,
@@ -1135,6 +1145,7 @@ export function resetPackageCachesForTests() {
   }
   availableSourcePackages.clear();
   availableExternalPackages.clear();
+  importedSourcePackageRoots.clear();
   packageUseSequence = 0;
   for (const event of Object.keys(packageEvents) as Array<
     keyof typeof packageEvents
