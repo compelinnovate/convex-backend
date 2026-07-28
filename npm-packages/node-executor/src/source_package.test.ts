@@ -16,6 +16,7 @@ import {
   getPackageCacheStats,
   maybeDownloadAndLinkPackages,
   populatePrebuildPackages,
+  recordSourcePackageImport,
   resetPackageCachesForTests,
   SourcePackage,
 } from "./source_package";
@@ -286,6 +287,51 @@ test("local cache bounds preserve active source packages and retire released pac
       retainedSourcePackages: 8,
       activeSourceOwners: 0,
       sourceRetirements: 10,
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("imported source package count survives disk cache retirement", async () => {
+  const sourceZip = makeSourcePackageZip(null);
+  const routes = Object.fromEntries(
+    Array.from({ length: 9 }, (_, index) => [
+      `/source-${index}.zip`,
+      sourceZip,
+    ]),
+  );
+  const server = await startPackageServer(routes);
+
+  try {
+    const firstLease = await acquireSourcePackage(
+      makeSourceOnlyPackage(
+        `${server.baseUrl}/source-0.zip`,
+        sha256(sourceZip),
+        "source-package-0",
+      ),
+    );
+    expect(getPackageCacheStats().importedSourcePackages).toBe(0);
+    recordSourcePackageImport(firstLease.package.dir);
+    recordSourcePackageImport(firstLease.package.dir);
+    expect(getPackageCacheStats().importedSourcePackages).toBe(1);
+    await firstLease.release();
+
+    for (let index = 1; index < 9; index += 1) {
+      const lease = await acquireSourcePackage(
+        makeSourceOnlyPackage(
+          `${server.baseUrl}/source-${index}.zip`,
+          sha256(sourceZip),
+          `source-package-${index}`,
+        ),
+      );
+      recordSourcePackageImport(lease.package.dir);
+      await lease.release();
+    }
+
+    expect(getPackageCacheStats()).toMatchObject({
+      importedSourcePackages: 9,
+      retainedSourcePackages: 8,
     });
   } finally {
     await server.close();

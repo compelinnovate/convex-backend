@@ -268,6 +268,134 @@ pub fn set_local_node_generation_age(age: Duration) {
     );
 }
 
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES,
+    "Configured V8 old-space allowance for the local Node executor child"
+);
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_RSS_RETIREMENT_THRESHOLD_BYTES,
+    "Configured RSS threshold for graceful local Node executor generation retirement"
+);
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_RSS_THRESHOLD_BYTES,
+    "Configured direct-child RSS threshold for retirement during sustained cgroup memory pressure"
+);
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECONDS,
+    "Configured cgroup memory-pressure duration before local Node executor retirement"
+);
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_AGE_RETIREMENT_THRESHOLD_SECONDS,
+    "Configured age threshold for graceful local Node executor generation retirement"
+);
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
+    "Configured lifetime imported source-package threshold for graceful local Node executor \
+     generation retirement"
+);
+pub fn set_local_node_memory_configuration(
+    old_space_limit_bytes: u64,
+    rss_threshold_bytes: u64,
+    memory_pressure_rss_threshold_bytes: u64,
+    memory_pressure_grace: Duration,
+    age_threshold: Duration,
+    package_threshold: u64,
+) {
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES,
+        old_space_limit_bytes as f64,
+    );
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_RSS_RETIREMENT_THRESHOLD_BYTES,
+        rss_threshold_bytes as f64,
+    );
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_RSS_THRESHOLD_BYTES,
+        memory_pressure_rss_threshold_bytes as f64,
+    );
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECONDS,
+        memory_pressure_grace.as_secs_f64(),
+    );
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_AGE_RETIREMENT_THRESHOLD_SECONDS,
+        age_threshold.as_secs_f64(),
+    );
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
+        package_threshold as f64,
+    );
+}
+
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_ACTIVE_INFO,
+    "Whether the current local Node executor generation observes cgroup memory pressure"
+);
+pub fn set_local_node_memory_pressure_active(active: bool) {
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_ACTIVE_INFO,
+        if active { 1.0 } else { 0.0 },
+    );
+}
+
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_CHILD_RSS_BYTES,
+    "Resident memory of the current local Node executor child"
+);
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO,
+    "Whether the latest local Node executor child RSS sample succeeded"
+);
+pub fn set_local_node_child_rss(rss: Option<u64>) {
+    match rss {
+        Some(rss) => {
+            log_gauge(&LOCAL_NODE_EXECUTOR_CHILD_RSS_BYTES, rss as f64);
+            log_gauge(&LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO, 1.0);
+        },
+        None => log_gauge(&LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO, 0.0),
+    }
+}
+
+register_convex_counter!(
+    LOCAL_NODE_EXECUTOR_CHILD_RSS_SAMPLES_TOTAL,
+    "Local Node executor direct-child RSS sampling outcomes",
+    &["outcome"]
+);
+pub fn log_local_node_child_rss_sample(outcome: &'static str) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_CHILD_RSS_SAMPLES_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("outcome", outcome)],
+    );
+}
+
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_GENERATION_DRAINING_INFO,
+    "Whether the current local Node executor generation has stopped accepting new requests"
+);
+pub fn set_local_node_generation_draining(draining: bool) {
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_GENERATION_DRAINING_INFO,
+        if draining { 1.0 } else { 0.0 },
+    );
+}
+
+register_convex_counter!(
+    LOCAL_NODE_EXECUTOR_RETIREMENT_DECISIONS_TOTAL,
+    "Local Node executor generation retirement decisions",
+    &["reason", "decision"]
+);
+pub fn log_local_node_retirement_decision(reason: &'static str, decision: &'static str) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_RETIREMENT_DECISIONS_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("reason", reason),
+            StaticMetricLabel::new("decision", decision),
+        ],
+    );
+}
+
 register_convex_histogram!(
     LOCAL_NODE_EXECUTOR_HEALTH_CHECK_SECONDS,
     "Duration of local Node executor health checks",
@@ -345,6 +473,10 @@ register_convex_gauge!(
     "Retained dynamic source packages in the current local Node executor generation"
 );
 register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_IMPORTED_SOURCE_PACKAGES_INFO,
+    "Lifetime-unique imported source-package roots in the current local Node executor generation"
+);
+register_convex_gauge!(
     LOCAL_NODE_EXECUTOR_RETAINED_SOURCE_PACKAGE_BYTES,
     "Retained dynamic source-package bytes in the current local Node executor generation"
 );
@@ -365,6 +497,7 @@ register_convex_gauge!(
     "Registered source-package stack roots in the current local Node executor generation"
 );
 pub fn set_local_node_package_state(
+    imported_source_packages: u64,
     source_packages: u64,
     source_bytes: u64,
     active_source_owners: u64,
@@ -372,6 +505,10 @@ pub fn set_local_node_package_state(
     external_bytes: u64,
     stack_roots: u64,
 ) {
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_IMPORTED_SOURCE_PACKAGES_INFO,
+        imported_source_packages as f64,
+    );
     log_gauge(
         &LOCAL_NODE_EXECUTOR_RETAINED_SOURCE_PACKAGES_INFO,
         source_packages as f64,

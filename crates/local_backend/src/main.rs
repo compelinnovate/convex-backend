@@ -34,6 +34,8 @@ use keybroker::{
     DeploymentSecret,
     KeyBroker,
 };
+#[cfg(target_os = "linux")]
+use local_backend::memory_metrics;
 use local_backend::{
     config::{
         AdminKeyArgs,
@@ -165,9 +167,31 @@ async fn run_server_inner(
     max_concurrent_requests: usize,
     dependency_reserve: usize,
 ) -> anyhow::Result<()> {
-    // Used to receive fatal errors from the database or /preempt endpoint.
+    // Used to receive fatal errors from the database, memory pressure
+    // controller, or /preempt endpoint.
     let (preempt_tx, preempt_rx) = oneshot::channel();
     let preempt_signal = ShutdownSignal::new(preempt_tx);
+
+    #[cfg(target_os = "linux")]
+    let (external_request_shedding, memory_reclamation) = {
+        memory_metrics::validate_startup_budget()?;
+        let controller = memory_metrics::initialize_memory_pressure_controller()?;
+        let external_request_shedding = controller
+            .as_ref()
+            .and_then(memory_metrics::CgroupMemoryPressureController::external_request_shedding);
+        let memory_reclamation = controller
+            .as_ref()
+            .map(memory_metrics::CgroupMemoryPressureController::memory_reclamation)
+            .unwrap_or_default();
+        memory_metrics::start(runtime.clone(), controller, preempt_signal.clone());
+        (external_request_shedding, memory_reclamation)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (external_request_shedding, memory_reclamation) = (
+        None,
+        common::memory_pressure::MemoryPressureSignal::default(),
+    );
+
     // Use to signal to the http service to stop.
     let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
     let persistence = connect_persistence(
@@ -192,6 +216,7 @@ async fn run_server_inner(
         persistence,
         shutdown_rx.clone(),
         preempt_signal.clone(),
+        memory_reclamation,
     )
     .await?;
     let router = router(st.clone());
@@ -203,6 +228,7 @@ async fn run_server_inner(
         max_concurrent_requests,
         dependency_reserve,
         &["/api/actions/"],
+        external_request_shedding.clone(),
         *HTTP_SERVER_TIMEOUT_DURATION,
         HttpActionRouteMapper,
     );
@@ -213,6 +239,7 @@ async fn run_server_inner(
         config.site_bind_address(),
         config.site_forward_prefix(),
         max_concurrent_requests,
+        external_request_shedding,
         shutdown_rx,
     );
 

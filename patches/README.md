@@ -56,6 +56,23 @@ protocol and adoption essay but is not another commit in this backend chain.
 - Rollback: restore the backend before the dashboard; no data or configuration rollback is
   required, but the previous backend restores the original contention risk.
 
+## Backend memory resilience
+
+### [Backend memory resilience](backend_memory_resilience/README.md)
+
+- Purpose: account for configured and observed backend memory, reclaim optional allocator and local
+  Node state before external HTTP shedding, export a shared pressure signal for owner-specific
+  patches, and preserve finite cgroup limits as the hard boundary.
+- Prerequisites: local Node executor resilience for pressure-triggered generation retirement and
+  shared-base HTTP admission for dependency-preserving external shedding. Pressure control also
+  requires Linux cgroup v2 with a finite readable memory limit; explicit allocator trim and arena
+  counting require glibc.
+- Activation: all pressure switches default to disabled. Internal reclamation, allocator trim, and
+  external shedding have strict independent settings and ordered headroom thresholds documented in
+  the patch essay.
+- Rollback: restore the previous backend image and remove settings it does not understand; no schema
+  or data change is required.
+
 ## Build and runtime packaging
 
 ### [Backend build improvements](backend_build_improvements/README.md)
@@ -88,11 +105,15 @@ protocol and adoption essay but is not another commit in this backend chain.
   a process-declared exit, repeated event-loop health failure, or backend shutdown; bound startup
   probes and local response streaming; prevent child stdio from bypassing function-log handling;
   terminate and reap only that direct child; and expose bounded lifecycle and health metrics.
+  Proactive RSS, imported-package, and age thresholds close admission and drain a healthy
+  generation before replacement. Backend memory resilience extends the same mechanism with
+  cgroup-pressure retirement.
   Detached descendant process groups, including `build_deps` npm installs, require separate
   ownership. The atomic-package patch adds best-effort npm process-group containment, but Rust does
   not wait for descendant exit before removing a generation tempdir.
-- Prerequisites: none for generation recovery; the atomic package patch adds package and stack
-  aggregate metrics to the same health protocol.
+- Prerequisites: none for generation recovery or RSS/package/age retirement. The atomic-package
+  patch adds package and stack aggregate metrics to the same health protocol; backend memory
+  resilience adds cgroup-pressure retirement.
 - Activation: automatic in the local Node executor.
 - Rollback: restore the previous backend image if healthy generations are retired unexpectedly.
 

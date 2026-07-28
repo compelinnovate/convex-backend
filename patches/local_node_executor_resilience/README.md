@@ -1,10 +1,14 @@
 # Local Node Executor Resilience
 
-This patch restores local Node-action liveness when the shared Node process
-stops responding. The upstream local executor uses one Node process for the
-complete deployment. A synchronous loop or event-loop stall in one action can
-therefore stop every unrelated Node action while queries, mutations, V8 actions,
-MySQL, and the backend health endpoint remain available.
+This implementation restores local Node-action liveness when the shared Node
+process stops responding and bounds healthy-generation lifetime when memory or
+non-evictable module identity grows. The upstream local executor uses one Node
+process for the complete deployment. A synchronous loop or event-loop stall in
+one action can therefore stop every unrelated Node action while queries,
+mutations, V8 actions, MySQL, and the backend health endpoint remain available.
+Repeated deployment analysis and execution can also retain ESM module graphs
+for the life of that process even after the corresponding disk-cache entry is
+deleted.
 
 ## Failure mode
 
@@ -38,7 +42,18 @@ number. A request retains the exact generation that accepted it. Request
 timeout, response-stream timeout, request transport failure, a response with
 `exitingProcess=true`, or watchdog failure can retire that generation. Backend
 shutdown retires the current generation with `explicit_shutdown` and rejects
-later invocations.
+later invocations. A healthy generation also begins graceful retirement when
+its sampled Linux direct-child RSS, age, or lifetime-unique imported
+source-package count reaches the configured threshold.
+
+Healthy retirement first closes admission while holding the generation-state
+mutex, then waits for active Rust requests to drain before using the same
+identity-fenced retirement and child-reaping path. The current child remains
+the only child until it has been reaped; a waiting request cannot start a
+replacement while the old child is still resident. The RSS threshold is a
+sampled graceful-retirement trigger and planning allowance, not a hard maximum.
+The child can grow between samples and while active requests drain, and the
+direct-child sample excludes descendants.
 
 Retirement uses `Arc::ptr_eq` while holding the generation slot. A late timeout
 or connection error from an old request cannot remove a replacement. Several
@@ -113,6 +128,7 @@ process exit remain the fallbacks if runtime shutdown cancels the task.
 Each active generation has one backend-owned watchdog task. The watchdog:
 
 - waits one second between checks;
+- reads Linux direct-child RSS concurrently with `GET /health`;
 - gives `GET /health` one second to complete and accepts at most 64 KiB of
   response data;
 - clears the miss count after a valid `status="ok"` response;
@@ -136,6 +152,15 @@ The startup health check remains separate. Startup performs up to 50 checks at
 100 ms intervals and uses the same one-second per-check timeout before
 publishing a generation.
 
+After every watchdog observation, proactive trigger precedence in the base patch is direct-child
+RSS, lifetime imported source-package count, then generation age. When the
+[`backend_memory_resilience`](../backend_memory_resilience/README.md) patch is also carried,
+sustained cgroup pressure with a material direct-child RSS sample follows the ordinary RSS check
+and precedes the package and age checks. These checks run even when the health endpoint is failing;
+the consecutive-health-miss decision follows them. A failed Linux RSS read records `failure` and
+skips only the RSS trigger for that iteration. Non-Linux builds record `unsupported` and do not
+enforce an RSS trigger. A successful sample records `success`.
+
 ## Metrics and logs
 
 The patch exports bounded backend metrics:
@@ -155,22 +180,39 @@ The patch exports bounded backend metrics:
 - `local_node_executor_waiting_requests`;
 - `local_node_executor_request_starts_total`;
 - `local_node_executor_request_completions_total{outcome}`;
-- `local_node_executor_active_requests`.
+- `local_node_executor_active_requests`;
+- `local_node_executor_old_space_limit_bytes`;
+- `local_node_executor_rss_retirement_threshold_bytes`;
+- `local_node_executor_memory_pressure_rss_threshold_bytes`;
+- `local_node_executor_memory_pressure_grace_seconds`;
+- `local_node_executor_memory_pressure_active_info`;
+- `local_node_executor_age_retirement_threshold_seconds`;
+- `local_node_executor_package_retirement_threshold_info`;
+- `local_node_executor_child_rss_bytes`;
+- `local_node_executor_child_rss_telemetry_info`;
+- `local_node_executor_child_rss_samples_total{outcome}`;
+- `local_node_executor_generation_draining_info`;
+- `local_node_executor_retirement_decisions_total{reason,decision}`;
+- `local_node_executor_imported_source_packages_info`.
 
-The retirement reason is one of `request_timeout`, `response_stream_timeout`,
-`connection_error`, `process_exiting`, `health_check_failed`, or
-`explicit_shutdown`. Child exit class is one of `success`, `failure`, or
-`signal`. Request outcome is one of `success`, `user_error`, `invalid_response`,
-`request_timeout`, `response_stream_timeout`, `connection_error`,
-`transport_error`, `response_stream_error`, `http_error`, `args_too_large`, or
-`internal_error`. Neither label contains function names, module paths, package
-keys, request IDs, raw errors, or deployment-specific values. Labelled counters
-are absent until the corresponding outcome occurs and can be evicted after
-inactivity. Operator queries treat an absent bounded label as zero only when the
-compatibility gauge or that metric family has an opening sample at the report
-start. A contract first observed inside the window has partial coverage, so its
-missing labels remain unknown. A completely absent family on an older backend
-remains `not emitted`, not zero.
+The base retirement reason is one of `request_timeout`, `response_stream_timeout`,
+`connection_error`, `process_exiting`, `health_check_failed`, `rss_limit`, `package_limit`,
+`age_limit`, or `explicit_shutdown`. Backend memory resilience additionally adds
+`cgroup_pressure`. Child exit
+class is one of `success`, `failure`, or `signal`. RSS sampling outcome is one
+of `success`, `failure`, or `unsupported`. A proactive retirement decision is
+`not_current`, `already_draining`, or `drain_started`. Request outcome is one of
+`success`, `user_error`, `invalid_response`, `request_timeout`,
+`response_stream_timeout`, `connection_error`, `transport_error`,
+`response_stream_error`, `http_error`, `args_too_large`, or `internal_error`.
+Neither label contains function names, module paths, package keys, request IDs,
+raw errors, or deployment-specific values. Labelled counters are absent until
+the corresponding outcome occurs and can be evicted after inactivity. Operator
+queries treat an absent bounded label as zero only when the compatibility gauge
+or that metric family has an opening sample at the report start. A contract
+first observed inside the window has partial coverage, so its missing labels
+remain unknown. A completely absent family on an older backend remains `not
+emitted`, not zero.
 
 `connection_error` is the bounded generation-retirement reason for local
 request submission and response-body transport failures. Request outcomes keep
@@ -179,14 +221,22 @@ direct connect failures separate from other pre-header transport failures.
 Retirement diagnostics identify request kind as `execute`, `analyze`, or
 `build_deps`; watchdog and shutdown use `not_applicable`. Phase is one of
 `before_response_headers`, `response_body`, `response_payload`, `health_check`,
-or `shutdown`. Transport category is one of `timeout`, `connection_refused`,
-`connection_reset`, `connection_aborted`, `not_connected`, `broken_pipe`,
-`unexpected_eof`, `other_io`, `connect`, `body`, `request`, `other`, or
-`not_applicable`. Child state is `running`, `already_exited`, or `probe_failed`;
-the supervisor-kill label is boolean and final exit class retains the existing
-`success`, `failure`, or `signal` contract. Replacement outcome is `ready`,
-`startup_failed`, or `aborted_shutdown`. None of these metrics use generation as
-a label.
+`watchdog`, or `shutdown`. Transport category is one of `timeout`,
+`connection_refused`, `connection_reset`, `connection_aborted`,
+`not_connected`, `broken_pipe`, `unexpected_eof`, `other_io`, `connect`,
+`body`, `request`, `other`, or `not_applicable`. Child state is `running`,
+`already_exited`, or `probe_failed`; the supervisor-kill label is boolean and
+final exit class retains the existing `success`, `failure`, or `signal`
+contract. Replacement outcome is `ready`, `startup_failed`, or
+`aborted_shutdown`. None of these metrics use generation as a label.
+
+Interpret `local_node_executor_child_rss_bytes` only while
+`local_node_executor_child_rss_telemetry_info` is one. A failed or unsupported
+sample changes freshness to zero but retains the last byte value. Configuration
+gauges are process configuration. Current generation age, RSS freshness,
+draining state, imported package count, and package/cache state reset when the
+generation is removed or replaced. Counters are process-local and require
+reset-aware deltas.
 
 The waiting gauge covers requests waiting for generation selection or child
 startup. The active gauge covers assigned requests across the current and
@@ -205,6 +255,9 @@ gauges and converts process-local event totals into backend counter deltas:
   `local_node_executor_retained_external_package_bytes`;
 - `local_node_executor_active_source_package_owners_info` and
   `local_node_executor_registered_stack_roots_info`;
+- `local_node_executor_imported_source_packages_info`, a monotonic
+  generation-lifetime count of source-package roots submitted to Node's dynamic
+  importer;
 - source/external hit, publish, retire, and failed-publication events in
   `local_node_executor_package_events_total{package_kind,operation}`;
 - `local_node_executor_stack_format_invocations_total`,
@@ -274,7 +327,16 @@ Focused Rust tests cover:
   retaining them until the stream ends;
 - rejecting negative timing values and inconsistent syscall counts in executor
   responses instead of coercing them into valid metrics;
-- shutdown retirement and child reaping.
+- shutdown retirement and child reaping;
+- inclusive and ordered RSS/package/age retirement decisions, with cgroup-pressure ordering in the
+  backend memory-resilience composition;
+- strict old-space/RSS configuration validation and Linux RSS parsing;
+- graceful admission closure and drain before proactive retirement;
+- continuing drain and child ownership after the initiating caller is
+  canceled;
+- fencing replacement startup until the retiring direct child is reaped;
+- lifetime imported-package counting that begins only at an actual dynamic
+  import attempt and survives disk-cache retirement.
 
 The package patch owns the Node-side health aggregate, package-lifetime, and
 stack-root tests. The production rollout verifies watchdog health responses,
@@ -283,16 +345,35 @@ ordinary workload rather than a provider fixture.
 
 ## Adoption and rollback
 
-The liveness behavior is automatic after a backend image containing the patch
-starts. It adds no deployment-specific configuration and does not require a
-process pool. The atomic source-package patch is optional for timeout/watchdog
-recovery and required only for package and stack metrics.
+Timeout and unhealthy-watchdog recovery are automatic after a backend image
+containing the lifecycle implementation starts. Healthy proactive retirement
+uses these startup knobs:
 
-Rollback restores the previous backend image. If the watchdog retires healthy
-processes, rollback removes the complete resilience patch; there is no runtime
-switch in the first adoption. Timeout recycling and watchdog retirement share
-the same generation guard and child-termination contract, so carrying only an
-unreviewed subset is not supported.
+- `LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB`;
+- `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`;
+- `LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS`;
+- `LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES`.
+
+The backend memory-resilience composition additionally uses:
+
+- `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`;
+- `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS`.
+
+The backend validates positive values and requires the V8 old-space allowance to remain strictly
+below the ordinary RSS retirement threshold. The memory-resilience composition also requires the
+pressure RSS threshold to remain strictly below that ordinary threshold. It passes old space to
+Node with `--max-old-space-size` before the script path. V8 old space excludes
+Buffers, native modules, executable code, allocator retention, and descendant
+processes. No process pool is required.
+
+Rollback restores the previous backend image and its complete tracked capacity environment. When
+the previous image already contains timeout and unhealthy generation retirement, rolling back the
+local Node resilience patch removes only the newer healthy RSS/package/age controls and their
+telemetry; it does not rewrite earlier deployed lifecycle history. Rolling back the separate
+backend memory-resilience patch removes its cgroup-pressure input without changing the base Node
+retirement mechanisms. Timeout recycling, unhealthy-watchdog retirement, and healthy proactive
+retirement share the same generation guard and child-termination contract, so carrying an
+unreviewed partial image is not supported.
 
 The patch does not remove the one-process throughput ceiling or isolate
 synchronous Node work across processes. A process pool remains a separate

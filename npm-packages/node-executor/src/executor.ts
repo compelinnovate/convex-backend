@@ -27,7 +27,11 @@ import {
 } from "./errors";
 import { findLineNumbers } from "./analyze";
 import { Syscalls, SyscallsImpl } from "./syscalls";
-import { SourcePackage, acquireSourcePackage } from "./source_package";
+import {
+  SourcePackage,
+  acquireSourcePackage,
+  recordSourcePackageImport,
+} from "./source_package";
 import { buildDeps, BuildDepsRequest } from "./build_deps";
 import { ConvexError, JSONValue } from "convex/values";
 import { log, logDebug, logDurationMs } from "./log";
@@ -443,6 +447,7 @@ export async function executeInner(
       setupGlobals(modulePath);
       const moduleUrl = pathToFileURL(modulePath);
       moduleUrl.searchParams.set("envHash", envHash);
+      recordSourcePackageImport(dir);
       const module = await import(moduleUrl.href);
       const importTimeMs = logDurationMs("importTimeMs", start);
 
@@ -578,7 +583,11 @@ export async function analyze(
         for (const modulePath of local.modules) {
           try {
             const filePath = path.join(modulesDir, modulePath);
-            modules[modulePath] = await analyzeModule(filePath, envHash);
+            modules[modulePath] = await analyzeModule(
+              local.dir,
+              filePath,
+              envHash,
+            );
           } catch (e: unknown) {
             return {
               type: "error",
@@ -610,6 +619,7 @@ export type AnalyzedFunctions = Array<{
 }>;
 
 async function analyzeModule(
+  packageRoot: string,
   filePath: string,
   envHash: string,
 ): Promise<AnalyzedFunctions> {
@@ -619,6 +629,7 @@ async function analyzeModule(
   // Analysis evaluates user initialization code. Keep its entry-module instance
   // separate from execute while still invalidating it when the environment changes.
   fileUrl.searchParams.set("phase", "analyze");
+  recordSourcePackageImport(packageRoot);
   const module = await import(fileUrl.href);
 
   const functions: Map<

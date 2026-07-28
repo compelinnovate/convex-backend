@@ -8,6 +8,135 @@ environment variables by adding them to your `docker-compose.yml` file. Commonly
 overriden knobs are listed in the `env` section of the
 [`docker-compose.yml`](../docker/docker-compose.yml)
 
+## Backend memory feasibility and local Node lifetime
+
+On Linux, startup checks a finite cgroup v2 `memory.max` before constructing the
+database caches, isolate pool, or local Node executor. The configured budget is
+the checked sum of:
+
+- `(ISOLATE_MAX_USER_HEAP_SIZE + ISOLATE_MAX_HEAP_EXTRA_SIZE) *
+  MAX_ISOLATE_WORKERS`;
+- `ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE * MAX_ISOLATE_WORKERS`;
+- `UDF_CACHE_MAX_SIZE` and `INDEX_CACHE_SIZE`;
+- `SOURCE_MAP_CACHE_MAX_SIZE_BYTES`, `FUNRUN_INDEX_CACHE_SIZE`,
+  `FUNRUN_MODULE_CACHE_SIZE`, and `FUNRUN_CODE_CACHE_SIZE`;
+- `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`; and
+- `LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES`, which defaults to 2 GiB.
+
+The reserve covers allocations without a separate configured ceiling,
+including Rust data structures, allocator retention, thread stacks, page
+tables, and cgroup kernel memory. The backend rejects startup when this total
+exceeds a finite cgroup limit. It skips the feasibility failure when the cgroup
+memory controller is absent or unlimited. A malformed present controller file
+is a startup error.
+
+This calculation checks configuration feasibility; it is not current
+allocation and does not prove that every cache's weight exactly matches RSS.
+The Node budget entry is a planning allowance equal to a sampled Linux
+direct-child graceful-retirement trigger, not a hard maximum. The child can
+grow between samples and while active requests drain. Short-lived descendant
+processes created while building dependencies are not sampled and remain part
+of the native and kernel reserve.
+The backend publishes each bounded component, the configured total, finite
+limit availability, and finite-limit headroom as startup memory-budget metrics.
+The periodic process, allocator, and cgroup metrics remain the source for
+actual use.
+
+The local Node executor also has independent lifetime controls:
+
+- `LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB`, default `2048`;
+- `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`, default `3221225472` (3 GiB);
+- `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`, default `2147483648` (2 GiB);
+- `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS`, default `60`;
+- `LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS`, default `21600` (6 hours);
+- `LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES`, default `1000`.
+
+V8 old space excludes Buffers, native modules, executable code, and allocator
+retention, so the RSS threshold must remain larger and is validated
+independently. The age and lifetime-unique imported source-package thresholds
+bound growth that disk-cache eviction cannot reclaim from Node's ESM module
+graph. When any threshold is reached, the generation stops accepting new
+requests, waits for in-flight requests to finish, terminates and reaps the
+child, and lets the next request start a replacement generation.
+
+The watchdog normally observes direct-child RSS roughly every one to two
+seconds. An active invocation can delay retirement until its remaining Rust
+deadline expires, up to 605 seconds with the default Node action timeout, and
+termination/reaping can take longer. Non-Linux builds report RSS sampling as
+unsupported and do not use the RSS trigger. A failed Linux sample marks RSS
+telemetry unavailable and skips only that trigger for the iteration; age,
+package, and unhealthy-generation checks continue. The RSS byte gauge retains
+its last value while unavailable, so pair it with the RSS telemetry-availability
+gauge.
+
+The stock Compose file passes these controls through without setting
+different defaults. Changing one requires a backend restart.
+
+## Cgroup memory-pressure reclamation and admission
+
+`LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED` defaults to `false`. When enabled on Linux, the backend
+requires a readable finite cgroup v2 memory limit and enters internal reclamation when headroom
+reaches `LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES`, which defaults to 6 GiB. It clears
+the pressure signal only after headroom reaches
+`LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES`, which defaults to 8 GiB.
+
+On entry, the controller first evaluates an optional glibc trim and resamples cgroup headroom. If
+pressure remains, it publishes one shared signal. The local Node watchdog gracefully retires its
+generation only after the signal has remained active for
+`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS` and a successful direct-child RSS sample reaches
+`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`. The ordinary Node RSS limit remains the
+higher-priority retirement reason.
+
+`LOCAL_BACKEND_MALLOC_TRIM_ENABLED` also defaults to `false` and requires internal reclamation to
+be enabled. On glibc builds, an eligible pressure sample calls `malloc_trim(0)` in bounded blocking
+work only when `mallinfo2` reports at least `LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES` of logical
+arena free space, default 1 GiB. Evaluation is limited by
+`LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS`, default 300 seconds. Logical free space and the Boolean
+trim result do not prove resident bytes were released, so the backend records immediate signed
+changes in process RSS, anonymous RSS, cgroup usage, cgroup anonymous memory, and allocator free
+space, plus duration and page faults. Unsupported allocators report that trim is unavailable.
+
+The reclamation exit threshold must exceed its entry threshold and remain below the cgroup limit.
+When reclamation and external shedding are both enabled, both reclamation thresholds must preserve
+more headroom than the corresponding shedding thresholds. This makes optional-memory reclamation
+start before admission control.
+
+`LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED` defaults to `false`. When
+enabled on Linux, the backend requires a readable finite cgroup v2 memory limit
+and samples current usage once per second. It rejects new non-dependency HTTP
+requests with `503 BackendMemoryPressure` when headroom reaches
+`LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES`, which defaults to 3 GiB.
+Admission resumes only after headroom reaches
+`LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES`, which defaults to 5 GiB.
+The exit threshold must exceed the enter threshold and remain below the cgroup
+limit.
+
+The check runs before request-body handling and is repeated after the ordinary
+HTTP concurrency wait. `/version` and `/metrics` remain available. Node action
+callback paths carrying the callback-token header remain eligible for
+downstream authentication so already-running actions can complete their
+internal queries and mutations. Path and header presence are classified before
+the token is authenticated, so this exemption is not a denial-of-service
+boundary. The callback middleware still authenticates the token before handler
+body extraction.
+
+Only new HTTP requests pass through this gate. A new WebSocket handshake is
+eligible for rejection, but frames on an established sync WebSocket,
+already-admitted handlers, and scheduled, database, or other backend background
+work continue. The site proxy uses the same state and rejects before forwarding
+to the main listener.
+
+An enabled reclamation or shedding controller is a safety dependency. Losing its cgroup source or a
+runtime cgroup change that makes the thresholds invalid triggers controlled
+backend shutdown instead of silently disabling shedding. The active state,
+headroom, thresholds, transitions, failures, and rejected-request counts are
+published as bounded metrics.
+
+The stock Compose file passes the reclamation, trim, Node pressure, and shedding variables through
+without enabling either controller. Changing one requires a backend restart. See
+[`patches/backend_memory_resilience/README.md`](../../patches/backend_memory_resilience/README.md)
+for the complete metric and failure contract.
+
 ## `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`
 
 This limits concurrent application requests admitted by the backend HTTP

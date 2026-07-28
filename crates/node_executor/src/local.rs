@@ -26,7 +26,18 @@ use std::{
 
 use anyhow::Context;
 use async_trait::async_trait;
-use common::log_lines::LogLine;
+use common::{
+    knobs::{
+        LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE,
+        LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
+        LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
+        LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
+        LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE,
+        LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES,
+    },
+    log_lines::LogLine,
+    memory_pressure::MemoryPressureSignal,
+};
 use errors::ErrorMetadata;
 use futures_async_stream::try_stream;
 use isolate::bundled_js::node_executor_file;
@@ -44,6 +55,7 @@ use tokio::{
     sync::{
         mpsc,
         Mutex,
+        Notify,
     },
 };
 
@@ -66,8 +78,10 @@ const MAX_INVOKE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_NODE_VERSION_OUTPUT_BYTES: usize = 1024;
 const MAX_HEALTH_CHECK_ATTEMPTS: u32 = 50;
 const NODE_VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_RSS_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 const WATCHDOG_FAILURE_THRESHOLD: u32 = 5;
+const MIB_BYTES: u64 = 1024 * 1024;
 
 pub struct LocalNodeExecutor {
     state: Arc<Mutex<LocalNodeExecutorState>>,
@@ -79,6 +93,7 @@ pub struct LocalNodeExecutor {
 #[derive(Default)]
 struct LocalNodeExecutorState {
     inner: Option<Arc<InnerLocalNodeExecutor>>,
+    retiring: Option<Arc<InnerLocalNodeExecutor>>,
     replacement_for_generation: Option<u64>,
     next_generation: u64,
 }
@@ -94,6 +109,13 @@ struct LocalNodeExecutorConfig {
     health_check_timeout: Duration,
     watchdog_interval: Duration,
     watchdog_failure_threshold: u32,
+    max_old_space_size_mib: usize,
+    max_rss_bytes: u64,
+    memory_pressure: MemoryPressureSignal,
+    memory_pressure_min_rss_bytes: u64,
+    memory_pressure_grace: Duration,
+    max_generation_age: Duration,
+    max_imported_source_packages: u64,
 }
 
 struct ManagedChild {
@@ -111,11 +133,18 @@ struct ReapingTempDir {
 
 struct InnerLocalNodeExecutor {
     generation: u64,
+    pid: u32,
     started_at: Instant,
     runtime_stats_supported: bool,
     active_requests: AtomicUsize,
+    retirement_requested: AtomicBool,
+    idle: Notify,
+    retired: AtomicBool,
+    retirement_failed: AtomicBool,
+    retired_notify: Notify,
     retained_source_packages: AtomicU64,
     retained_external_packages: AtomicU64,
+    imported_source_packages: AtomicU64,
     registered_stack_roots: AtomicU64,
     // Initiate kill and reaping before removing the tempdir if explicit
     // termination cannot complete or startup is canceled.
@@ -144,6 +173,7 @@ where
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NodePackageCacheStats {
+    imported_source_packages: u64,
     retained_source_packages: u64,
     retained_source_bytes: u64,
     active_source_owners: u64,
@@ -168,13 +198,17 @@ struct NodeStackTraceStats {
     duration_ms: f64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationRetirementReason {
     RequestTimeout,
     ResponseStreamTimeout,
     ConnectionError,
     ProcessExiting,
     HealthCheckFailed,
+    RssLimit,
+    CgroupPressure,
+    AgeLimit,
+    PackageLimit,
     ExplicitShutdown,
 }
 
@@ -186,6 +220,10 @@ impl GenerationRetirementReason {
             Self::ConnectionError => "connection_error",
             Self::ProcessExiting => "process_exiting",
             Self::HealthCheckFailed => "health_check_failed",
+            Self::RssLimit => "rss_limit",
+            Self::CgroupPressure => "cgroup_pressure",
+            Self::AgeLimit => "age_limit",
+            Self::PackageLimit => "package_limit",
             Self::ExplicitShutdown => "explicit_shutdown",
         }
     }
@@ -228,6 +266,22 @@ impl GenerationRetirementDiagnostics {
             reason: GenerationRetirementReason::ExplicitShutdown,
             request_kind: "not_applicable",
             phase: "shutdown",
+            transport_error_kind: "not_applicable",
+        }
+    }
+
+    fn proactive(reason: GenerationRetirementReason) -> Self {
+        assert!(matches!(
+            reason,
+            GenerationRetirementReason::RssLimit
+                | GenerationRetirementReason::CgroupPressure
+                | GenerationRetirementReason::AgeLimit
+                | GenerationRetirementReason::PackageLimit
+        ));
+        Self {
+            reason,
+            request_kind: "not_applicable",
+            phase: "watchdog",
             transport_error_kind: "not_applicable",
         }
     }
@@ -283,6 +337,74 @@ fn classify_io_error_kind(error_kind: std::io::ErrorKind) -> &'static str {
     }
 }
 
+fn proactive_retirement_reason(
+    config: &LocalNodeExecutorConfig,
+    age: Duration,
+    rss_bytes: Option<u64>,
+    imported_source_packages: u64,
+    memory_pressure_active_for: Option<Duration>,
+) -> Option<GenerationRetirementReason> {
+    if rss_bytes.is_some_and(|rss| rss >= config.max_rss_bytes) {
+        Some(GenerationRetirementReason::RssLimit)
+    } else if memory_pressure_active_for.is_some_and(|active_for| {
+        active_for >= config.memory_pressure_grace
+            && rss_bytes.is_some_and(|rss| rss >= config.memory_pressure_min_rss_bytes)
+    }) {
+        Some(GenerationRetirementReason::CgroupPressure)
+    } else if imported_source_packages >= config.max_imported_source_packages {
+        Some(GenerationRetirementReason::PackageLimit)
+    } else if age >= config.max_generation_age {
+        Some(GenerationRetirementReason::AgeLimit)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_rss(status: &str) -> anyhow::Result<u64> {
+    let mut rss = None;
+    for line in status.lines() {
+        let Some(value) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        anyhow::ensure!(
+            rss.is_none(),
+            "Node process status contains duplicate VmRSS"
+        );
+        let mut fields = value.split_whitespace();
+        let kib: u64 = fields
+            .next()
+            .context("Node process VmRSS is missing a value")?
+            .parse()
+            .context("Node process VmRSS is invalid")?;
+        anyhow::ensure!(
+            fields.next() == Some("kB") && fields.next().is_none(),
+            "Node process VmRSS has an invalid unit"
+        );
+        rss = Some(
+            kib.checked_mul(1024)
+                .context("Node process RSS byte count overflow")?,
+        );
+    }
+    rss.context("Node process status is missing VmRSS")
+}
+
+#[cfg(target_os = "linux")]
+async fn read_process_rss(pid: u32) -> anyhow::Result<Option<u64>> {
+    let status = tokio::time::timeout(
+        PROCESS_RSS_READ_TIMEOUT,
+        tokio::fs::read_to_string(format!("/proc/{pid}/status")),
+    )
+    .await
+    .context("Timed out reading local Node process status")??;
+    Ok(Some(parse_process_rss(&status)?))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn read_process_rss(_pid: u32) -> anyhow::Result<Option<u64>> {
+    Ok(None)
+}
+
 struct ActiveRequestGuard {
     inner: Arc<InnerLocalNodeExecutor>,
     outcome: &'static str,
@@ -290,6 +412,15 @@ struct ActiveRequestGuard {
 
 struct WaitingRequestGuard {
     waiting: bool,
+}
+
+enum InnerAcquisition {
+    Ready {
+        inner: Arc<InnerLocalNodeExecutor>,
+        guard: ActiveRequestGuard,
+    },
+    Draining(Arc<InnerLocalNodeExecutor>),
+    Missing,
 }
 
 impl ReapingTempDir {
@@ -484,7 +615,8 @@ impl NodeExecutorHealth {
             .stack_trace
             .as_ref()
             .expect("Validated Node health response is missing stack stats");
-        package.source_hits >= previous_package.source_hits
+        package.imported_source_packages >= previous_package.imported_source_packages
+            && package.source_hits >= previous_package.source_hits
             && package.source_publishes >= previous_package.source_publishes
             && package.source_retirements >= previous_package.source_retirements
             && package.source_failed_publications >= previous_package.source_failed_publications
@@ -551,11 +683,106 @@ impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         let generation_previous = self.inner.active_requests.fetch_sub(1, Ordering::Relaxed);
         assert!(generation_previous > 0);
+        if generation_previous == 1 {
+            self.inner.idle.notify_waiters();
+        }
         crate::metrics::log_local_node_request_completion(self.outcome);
     }
 }
 
+impl LocalNodeExecutorConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.node_process_timeout > Duration::ZERO,
+            "Local Node executor process timeout must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.health_check_timeout > Duration::ZERO,
+            "Local Node executor health-check timeout must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.watchdog_interval > Duration::ZERO,
+            "Local Node executor watchdog interval must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.watchdog_failure_threshold > 0,
+            "Local Node executor watchdog failure threshold must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.max_old_space_size_mib > 0,
+            "Local Node executor old-space allowance must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.max_rss_bytes > 0,
+            "Local Node executor RSS threshold must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.memory_pressure_min_rss_bytes > 0,
+            "Local Node executor cgroup-pressure RSS threshold must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.memory_pressure_min_rss_bytes < self.max_rss_bytes,
+            "Local Node executor cgroup-pressure RSS threshold must be below the ordinary RSS \
+             threshold"
+        );
+        anyhow::ensure!(
+            self.memory_pressure_grace > Duration::ZERO,
+            "Local Node executor cgroup-pressure grace must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.max_generation_age > Duration::ZERO,
+            "Local Node executor generation age threshold must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.max_imported_source_packages > 0,
+            "Local Node executor package threshold must be greater than zero"
+        );
+        let old_space_bytes = u64::try_from(self.max_old_space_size_mib)?
+            .checked_mul(MIB_BYTES)
+            .context("Local Node executor old-space allowance overflow")?;
+        anyhow::ensure!(
+            old_space_bytes < self.max_rss_bytes,
+            "Local Node executor RSS threshold must exceed its V8 old-space allowance"
+        );
+        Ok(())
+    }
+
+    fn old_space_bytes(&self) -> u64 {
+        u64::try_from(self.max_old_space_size_mib)
+            .expect("validated local Node old-space allowance does not fit u64")
+            .checked_mul(MIB_BYTES)
+            .expect("validated local Node old-space allowance overflow")
+    }
+}
+
 impl InnerLocalNodeExecutor {
+    async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active_requests.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_until_retired(&self) -> anyhow::Result<()> {
+        loop {
+            let notified = self.retired_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.retired.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if self.retirement_failed.load(Ordering::Acquire) {
+                anyhow::bail!("Local Node executor generation retirement failed");
+            }
+            notified.await;
+        }
+    }
+
     async fn new(generation: u64, config: &LocalNodeExecutorConfig) -> anyhow::Result<Self> {
         tracing::info!("Initializing inner local node executor");
         // Create a single temp directory for both source files and Node.js temp files
@@ -594,6 +821,9 @@ impl InnerLocalNodeExecutor {
         let client = client_builder.build()?;
         let server_handle =
             Self::start_node_with_listener(config, &source_path, &source_dir, &socket_path).await?;
+        let pid = server_handle
+            .id()
+            .context("Local Node executor child has no process id")?;
         let mut server_handle = ManagedChild::new(generation, server_handle, source_dir);
         crate::metrics::log_local_node_child_start();
 
@@ -634,11 +864,18 @@ impl InnerLocalNodeExecutor {
             if let Some(runtime_stats_supported) = runtime_stats_supported {
                 return Ok(Self {
                     generation,
+                    pid,
                     started_at: Instant::now(),
                     runtime_stats_supported,
                     active_requests: AtomicUsize::new(0),
+                    retirement_requested: AtomicBool::new(false),
+                    idle: Notify::new(),
+                    retired: AtomicBool::new(false),
+                    retirement_failed: AtomicBool::new(false),
+                    retired_notify: Notify::new(),
                     retained_source_packages: AtomicU64::new(0),
                     retained_external_packages: AtomicU64::new(0),
+                    imported_source_packages: AtomicU64::new(0),
                     registered_stack_roots: AtomicU64::new(0),
                     server_handle: Mutex::new(server_handle),
                     client,
@@ -850,7 +1087,11 @@ impl InnerLocalNodeExecutor {
         Self::check_node_version(&node_path).await?;
 
         let mut cmd = TokioCommand::new(node_path);
-        cmd.arg(source_path)
+        cmd.arg(format!(
+            "--max-old-space-size={}",
+            config.max_old_space_size_mib
+        ))
+            .arg(source_path)
             .arg("--ipc-path")
             .arg(socket_path)
             .arg("--tempdir")
@@ -876,24 +1117,58 @@ impl InnerLocalNodeExecutor {
 
 impl LocalNodeExecutor {
     pub async fn new(node_process_timeout: Duration) -> anyhow::Result<Self> {
+        Self::new_with_memory_pressure(node_process_timeout, MemoryPressureSignal::default()).await
+    }
+
+    pub async fn new_with_memory_pressure(
+        node_process_timeout: Duration,
+        memory_pressure: MemoryPressureSignal,
+    ) -> anyhow::Result<Self> {
+        let config = LocalNodeExecutorConfig {
+            node_process_timeout,
+            callback_initial_backoff: None,
+            health_check_timeout: HEALTH_CHECK_TIMEOUT,
+            watchdog_interval: WATCHDOG_INTERVAL,
+            watchdog_failure_threshold: WATCHDOG_FAILURE_THRESHOLD,
+            max_old_space_size_mib: *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
+            max_rss_bytes: u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES)
+                .context("Local Node executor RSS threshold does not fit u64")?,
+            memory_pressure,
+            memory_pressure_min_rss_bytes: u64::try_from(
+                *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES,
+            )
+            .context("Local Node executor cgroup-pressure RSS threshold does not fit u64")?,
+            memory_pressure_grace: *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE,
+            max_generation_age: *LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE,
+            max_imported_source_packages: u64::try_from(
+                *LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
+            )
+            .context("Local Node executor package threshold does not fit u64")?,
+        };
+        config.validate()?;
         let executor = Self {
             state: Arc::new(Mutex::new(LocalNodeExecutorState::default())),
             startup_lock: Mutex::new(()),
             shutting_down: AtomicBool::new(false),
-            config: LocalNodeExecutorConfig {
-                node_process_timeout,
-                callback_initial_backoff: None,
-                health_check_timeout: HEALTH_CHECK_TIMEOUT,
-                watchdog_interval: WATCHDOG_INTERVAL,
-                watchdog_failure_threshold: WATCHDOG_FAILURE_THRESHOLD,
-            },
+            config,
         };
 
         crate::metrics::set_local_node_generation_present(false);
         crate::metrics::set_local_node_generation_age(Duration::ZERO);
+        crate::metrics::set_local_node_generation_draining(false);
+        crate::metrics::set_local_node_child_rss(None);
         crate::metrics::set_local_node_waiting_requests(0);
         crate::metrics::set_local_node_active_requests(0);
         crate::metrics::set_local_node_consecutive_health_misses(0);
+        crate::metrics::set_local_node_memory_pressure_active(false);
+        crate::metrics::set_local_node_memory_configuration(
+            executor.config.old_space_bytes(),
+            executor.config.max_rss_bytes,
+            executor.config.memory_pressure_min_rss_bytes,
+            executor.config.memory_pressure_grace,
+            executor.config.max_generation_age,
+            executor.config.max_imported_source_packages,
+        );
 
         Ok(executor)
     }
@@ -901,16 +1176,13 @@ impl LocalNodeExecutor {
     async fn acquire_inner(
         &self,
     ) -> anyhow::Result<(Arc<InnerLocalNodeExecutor>, ActiveRequestGuard, bool)> {
-        {
-            let state = self.state.lock().await;
-            anyhow::ensure!(
-                !self.shutting_down.load(Ordering::Acquire),
-                "Local Node executor is shutting down"
-            );
-            if let Some(inner) = &state.inner {
-                let inner = inner.clone();
-                let request_guard = ActiveRequestGuard::new(inner.clone());
-                return Ok((inner, request_guard, false));
+        loop {
+            match self.acquire_existing_inner().await? {
+                InnerAcquisition::Ready { inner, guard } => {
+                    return Ok((inner, guard, false));
+                },
+                InnerAcquisition::Draining(inner) => inner.wait_until_retired().await?,
+                InnerAcquisition::Missing => break,
             }
         }
 
@@ -918,17 +1190,23 @@ impl LocalNodeExecutor {
         // work separately so late failures from the retired generation can
         // still inspect the generation slot without waiting for its replacement.
         let _startup_guard = self.startup_lock.lock().await;
+        loop {
+            match self.acquire_existing_inner().await? {
+                InnerAcquisition::Ready { inner, guard } => {
+                    return Ok((inner, guard, false));
+                },
+                InnerAcquisition::Draining(inner) => inner.wait_until_retired().await?,
+                InnerAcquisition::Missing => break,
+            }
+        }
         let (generation, replaces_generation) = {
             let mut state = self.state.lock().await;
             anyhow::ensure!(
                 !self.shutting_down.load(Ordering::Acquire),
                 "Local Node executor is shutting down"
             );
-            if let Some(inner) = &state.inner {
-                let inner = inner.clone();
-                let request_guard = ActiveRequestGuard::new(inner.clone());
-                return Ok((inner, request_guard, false));
-            }
+            assert!(state.inner.is_none());
+            assert!(state.retiring.is_none());
             state.next_generation = state
                 .next_generation
                 .checked_add(1)
@@ -979,14 +1257,20 @@ impl LocalNodeExecutor {
             anyhow::bail!("Local Node executor is shutting down");
         }
         assert!(state.inner.is_none());
+        assert!(state.retiring.is_none());
         assert_eq!(state.replacement_for_generation, replaces_generation);
         state.inner = Some(replacement.clone());
         state.replacement_for_generation = None;
         crate::metrics::set_local_node_generation_present(true);
+        crate::metrics::set_local_node_memory_pressure_active(
+            self.config.memory_pressure.is_active(),
+        );
         crate::metrics::set_local_node_generation_age(Duration::ZERO);
+        crate::metrics::set_local_node_generation_draining(false);
+        crate::metrics::set_local_node_child_rss(None);
         crate::metrics::set_local_node_consecutive_health_misses(0);
         if replacement.runtime_stats_supported {
-            crate::metrics::set_local_node_package_state(0, 0, 0, 0, 0, 0);
+            crate::metrics::set_local_node_package_state(0, 0, 0, 0, 0, 0, 0);
         }
         crate::metrics::log_local_node_generation_start();
         let startup_elapsed = replacement_started.elapsed();
@@ -1004,6 +1288,29 @@ impl LocalNodeExecutor {
         );
         let request_guard = ActiveRequestGuard::new(replacement.clone());
         Ok((replacement, request_guard, true))
+    }
+
+    async fn acquire_existing_inner(&self) -> anyhow::Result<InnerAcquisition> {
+        let state = self.state.lock().await;
+        anyhow::ensure!(
+            !self.shutting_down.load(Ordering::Acquire),
+            "Local Node executor is shutting down"
+        );
+        if let Some(inner) = &state.inner {
+            let inner = inner.clone();
+            if inner.retirement_requested.load(Ordering::Acquire) {
+                return Ok(InnerAcquisition::Draining(inner));
+            }
+            // Selection and the active increment happen under the generation
+            // slot lock, so proactive retirement cannot observe zero and close
+            // admission between these operations.
+            let guard = ActiveRequestGuard::new(inner.clone());
+            return Ok(InnerAcquisition::Ready { inner, guard });
+        }
+        if let Some(retiring) = &state.retiring {
+            return Ok(InnerAcquisition::Draining(retiring.clone()));
+        }
+        Ok(InnerAcquisition::Missing)
     }
 
     #[try_stream(ok = NodeExecutorStreamPart, error = anyhow::Error)]
@@ -1068,14 +1375,19 @@ impl LocalNodeExecutor {
             {
                 // A late result from an old generation cannot retire its replacement.
                 state.inner.take();
+                assert!(state.retiring.is_none());
+                state.retiring = Some(expected.clone());
                 state.replacement_for_generation =
                     (!matches!(reason, GenerationRetirementReason::ExplicitShutdown))
                         .then_some(expected.generation);
                 crate::metrics::set_local_node_generation_present(false);
+                crate::metrics::set_local_node_memory_pressure_active(false);
                 crate::metrics::set_local_node_generation_age(Duration::ZERO);
+                crate::metrics::set_local_node_generation_draining(false);
+                crate::metrics::set_local_node_child_rss(None);
                 crate::metrics::set_local_node_consecutive_health_misses(0);
                 if expected.runtime_stats_supported {
-                    crate::metrics::set_local_node_package_state(0, 0, 0, 0, 0, 0);
+                    crate::metrics::set_local_node_package_state(0, 0, 0, 0, 0, 0, 0);
                 }
                 crate::metrics::log_local_node_generation_retirement(reason.as_str());
                 crate::metrics::log_local_node_retirement_diagnostics(
@@ -1099,6 +1411,8 @@ impl LocalNodeExecutor {
                             expected.retained_source_packages.load(Ordering::Relaxed),
                         last_observed_retained_external_packages =
                             expected.retained_external_packages.load(Ordering::Relaxed),
+                        last_observed_imported_source_packages =
+                            expected.imported_source_packages.load(Ordering::Relaxed),
                         last_observed_registered_stack_roots =
                             expected.registered_stack_roots.load(Ordering::Relaxed),
                         "Retiring local Node executor generation"
@@ -1118,6 +1432,8 @@ impl LocalNodeExecutor {
                             expected.retained_source_packages.load(Ordering::Relaxed),
                         last_observed_retained_external_packages =
                             expected.retained_external_packages.load(Ordering::Relaxed),
+                        last_observed_imported_source_packages =
+                            expected.imported_source_packages.load(Ordering::Relaxed),
                         last_observed_registered_stack_roots =
                             expected.registered_stack_roots.load(Ordering::Relaxed),
                         "Retiring local Node executor generation"
@@ -1136,6 +1452,7 @@ impl LocalNodeExecutor {
         // so a blocked event loop does not continue consuming a core until each
         // old request reaches its ten-minute timeout. The spawned task remains
         // the child owner if the request that initiated retirement is canceled.
+        let state = state.clone();
         let expected = expected.clone();
         let generation = expected.generation;
         let termination = tokio::spawn(async move {
@@ -1165,6 +1482,22 @@ impl LocalNodeExecutor {
                     );
                 },
             }
+            if result.is_ok() {
+                let mut state = state.lock().await;
+                let retiring = state
+                    .retiring
+                    .take()
+                    .expect("retiring local Node generation is missing");
+                assert!(Arc::ptr_eq(&retiring, &expected));
+                // A waiter must not start the replacement while the old child
+                // is still resident. A short process overlap is unsafe when
+                // RSS retirement is preserving cgroup memory headroom.
+                expected.retired.store(true, Ordering::Release);
+                expected.retired_notify.notify_waiters();
+            } else {
+                expected.retirement_failed.store(true, Ordering::Release);
+                expected.retired_notify.notify_waiters();
+            }
             result
         })
         .await;
@@ -1181,6 +1514,58 @@ impl LocalNodeExecutor {
             Err(_) => anyhow::bail!("Local Node executor child termination task failed"),
         }
         Ok(true)
+    }
+
+    async fn drain_and_retire_inner_state(
+        state: &Arc<Mutex<LocalNodeExecutorState>>,
+        expected: &Arc<InnerLocalNodeExecutor>,
+        diagnostics: GenerationRetirementDiagnostics,
+    ) -> anyhow::Result<bool> {
+        let reason = diagnostics.reason;
+        let started_draining = {
+            let state = state.lock().await;
+            if !state
+                .inner
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                crate::metrics::log_local_node_retirement_decision(reason.as_str(), "not_current");
+                return Ok(false);
+            }
+            let started_draining = !expected.retirement_requested.swap(true, Ordering::AcqRel);
+            if started_draining {
+                // Retirement and request admission share this lock. Publish the
+                // corresponding gauge transition here too, so an immediate
+                // request-triggered retirement cannot reset it before this write.
+                crate::metrics::set_local_node_generation_draining(true);
+            }
+            started_draining
+        };
+        if !started_draining {
+            crate::metrics::log_local_node_retirement_decision(reason.as_str(), "already_draining");
+            return Ok(false);
+        }
+
+        // Admission and the active-request increment share the state lock with
+        // this transition. Once draining is visible, the count can only fall.
+        crate::metrics::log_local_node_retirement_decision(reason.as_str(), "drain_started");
+        let state = state.clone();
+        let expected = expected.clone();
+        let retirement = tokio::spawn(async move {
+            expected.wait_until_idle().await;
+            Self::retire_inner_state(&state, &expected, diagnostics).await
+        })
+        .await;
+        match retirement {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => {
+                anyhow::bail!("Local Node executor drain task was canceled")
+            },
+            Err(error) if error.is_panic() => {
+                anyhow::bail!("Local Node executor drain task panicked")
+            },
+            Err(_) => anyhow::bail!("Local Node executor drain task failed"),
+        }
     }
 
     fn spawn_watchdog(&self, inner: &Arc<InnerLocalNodeExecutor>) {
@@ -1200,6 +1585,7 @@ impl LocalNodeExecutor {
         let mut consecutive_misses = 0;
         let mut previous_package_stats = NodePackageCacheStats::default();
         let mut previous_stack_stats = NodeStackTraceStats::default();
+        let mut memory_pressure_started_at = None;
         loop {
             tokio::time::sleep(config.watchdog_interval).await;
             let Some(state) = state.upgrade() else {
@@ -1219,11 +1605,21 @@ impl LocalNodeExecutor {
             }
 
             let health_check_started = Instant::now();
-            let health = InnerLocalNodeExecutor::check_server_health(
-                &expected.client,
-                config.health_check_timeout,
-            )
-            .await;
+            let (health, rss) = tokio::join!(
+                InnerLocalNodeExecutor::check_server_health(
+                    &expected.client,
+                    config.health_check_timeout,
+                ),
+                read_process_rss(expected.pid),
+            );
+            // RSS enforcement is Linux-only. A failed or unsupported sample
+            // skips only the RSS trigger for this iteration; age, package, and
+            // unhealthy-generation checks remain active.
+            let (rss_bytes, rss_sample_outcome) = match rss {
+                Ok(Some(rss_bytes)) => (Some(rss_bytes), "success"),
+                Ok(None) => (None, "unsupported"),
+                Err(_) => (None, "failure"),
+            };
             let success = health.as_ref().is_some_and(|health| {
                 health.status == "ok"
                     && health
@@ -1244,9 +1640,21 @@ impl LocalNodeExecutor {
                 return;
             }
             crate::metrics::log_local_node_health_check(health_check_elapsed, "watchdog", success);
-            crate::metrics::set_local_node_generation_age(expected.started_at.elapsed());
+            crate::metrics::log_local_node_child_rss_sample(rss_sample_outcome);
+            crate::metrics::set_local_node_child_rss(rss_bytes);
+            let generation_age = expected.started_at.elapsed();
+            crate::metrics::set_local_node_generation_age(generation_age);
+            let memory_pressure_active = config.memory_pressure.is_active();
+            crate::metrics::set_local_node_memory_pressure_active(memory_pressure_active);
+            let memory_pressure_active_for = if memory_pressure_active {
+                let started_at = memory_pressure_started_at.get_or_insert_with(Instant::now);
+                Some(started_at.elapsed())
+            } else {
+                memory_pressure_started_at = None;
+                None
+            };
 
-            if let Some(health) = health.filter(|_| success) {
+            let should_retire_unhealthy = if let Some(health) = health.filter(|_| success) {
                 consecutive_misses = 0;
                 crate::metrics::set_local_node_consecutive_health_misses(0);
                 if expected.runtime_stats_supported {
@@ -1257,14 +1665,42 @@ impl LocalNodeExecutor {
                         &mut previous_stack_stats,
                     );
                 }
-                continue;
-            }
+                false
+            } else {
+                consecutive_misses += 1;
+                crate::metrics::set_local_node_consecutive_health_misses(consecutive_misses);
+                consecutive_misses >= config.watchdog_failure_threshold
+            };
 
-            consecutive_misses += 1;
-            crate::metrics::set_local_node_consecutive_health_misses(consecutive_misses);
-            let should_retire = consecutive_misses >= config.watchdog_failure_threshold;
+            // Memory and lifetime bounds remain effective while the health
+            // endpoint is unhealthy. In particular, memory pressure must not
+            // disable the RSS safety threshold.
+            let retirement_reason = proactive_retirement_reason(
+                &config,
+                generation_age,
+                rss_bytes,
+                expected.imported_source_packages.load(Ordering::Relaxed),
+                memory_pressure_active_for,
+            );
             drop(current_state);
-            if should_retire {
+            if let Some(reason) = retirement_reason {
+                if Self::drain_and_retire_inner_state(
+                    &state,
+                    &expected,
+                    GenerationRetirementDiagnostics::proactive(reason),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::error!(
+                        generation = expected.generation,
+                        reason = reason.as_str(),
+                        "Failed to drain and retire local Node executor generation"
+                    );
+                }
+                return;
+            }
+            if should_retire_unhealthy {
                 if Self::retire_inner_state(
                     &state,
                     &expected,
@@ -1306,9 +1742,13 @@ impl LocalNodeExecutor {
             .retained_external_packages
             .store(package.retained_external_packages, Ordering::Relaxed);
         inner
+            .imported_source_packages
+            .store(package.imported_source_packages, Ordering::Relaxed);
+        inner
             .registered_stack_roots
             .store(stack.registered_roots, Ordering::Relaxed);
         crate::metrics::set_local_node_package_state(
+            package.imported_source_packages,
             package.retained_source_packages,
             package.retained_source_bytes,
             package.active_source_owners,
@@ -1660,6 +2100,13 @@ mod tests {
             health_check_timeout: Duration::from_millis(10),
             watchdog_interval: Duration::from_millis(10),
             watchdog_failure_threshold: 2,
+            max_old_space_size_mib: 128,
+            max_rss_bytes: 256 * MIB_BYTES,
+            memory_pressure: MemoryPressureSignal::default(),
+            memory_pressure_min_rss_bytes: 192 * MIB_BYTES,
+            memory_pressure_grace: Duration::from_secs(5),
+            max_generation_age: Duration::from_secs(60),
+            max_imported_source_packages: 100,
         }
     }
 
@@ -1724,6 +2171,152 @@ mod tests {
             }))
             .is_err()
         );
+
+        let imported_package_regression = NodeExecutorHealth {
+            status: "ok".to_string(),
+            package_cache: Some(NodePackageCacheStats {
+                imported_source_packages: 1,
+                ..NodePackageCacheStats::default()
+            }),
+            stack_trace: Some(NodeStackTraceStats::default()),
+        };
+        assert_eq!(
+            imported_package_regression.valid_runtime_stats_support(
+                &NodePackageCacheStats {
+                    imported_source_packages: 2,
+                    ..NodePackageCacheStats::default()
+                },
+                &NodeStackTraceStats::default(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn config_rejects_rss_threshold_at_or_below_old_space_allowance() {
+        let config = test_config();
+        config.validate().unwrap();
+
+        let mut equal = config.clone();
+        equal.max_rss_bytes = equal.old_space_bytes();
+        assert!(equal.validate().is_err());
+
+        let mut below = config;
+        below.max_rss_bytes = below.old_space_bytes() - 1;
+        assert!(below.validate().is_err());
+    }
+
+    #[test]
+    fn proactive_retirement_thresholds_are_inclusive_and_prioritized() {
+        let config = test_config();
+        assert_eq!(
+            proactive_retirement_reason(
+                &config,
+                config.max_generation_age - Duration::from_nanos(1),
+                Some(config.max_rss_bytes - 1),
+                config.max_imported_source_packages - 1,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            proactive_retirement_reason(
+                &config,
+                config.max_generation_age,
+                Some(config.max_rss_bytes - 1),
+                config.max_imported_source_packages - 1,
+                None,
+            ),
+            Some(GenerationRetirementReason::AgeLimit)
+        );
+        assert_eq!(
+            proactive_retirement_reason(
+                &config,
+                config.max_generation_age,
+                Some(config.max_rss_bytes - 1),
+                config.max_imported_source_packages,
+                None,
+            ),
+            Some(GenerationRetirementReason::PackageLimit)
+        );
+        assert_eq!(
+            proactive_retirement_reason(
+                &config,
+                config.max_generation_age,
+                Some(config.max_rss_bytes),
+                config.max_imported_source_packages,
+                None,
+            ),
+            Some(GenerationRetirementReason::RssLimit)
+        );
+    }
+
+    #[test]
+    fn cgroup_pressure_retirement_requires_grace_and_material_rss() {
+        let config = test_config();
+        let below_hard_limit = config.max_rss_bytes - 1;
+        assert_eq!(
+            proactive_retirement_reason(
+                &config,
+                Duration::ZERO,
+                Some(below_hard_limit),
+                0,
+                Some(config.memory_pressure_grace - Duration::from_nanos(1)),
+            ),
+            None
+        );
+        assert_eq!(
+            proactive_retirement_reason(
+                &config,
+                Duration::ZERO,
+                Some(config.memory_pressure_min_rss_bytes - 1),
+                0,
+                Some(config.memory_pressure_grace),
+            ),
+            None
+        );
+        assert_eq!(
+            proactive_retirement_reason(
+                &config,
+                Duration::ZERO,
+                None,
+                0,
+                Some(config.memory_pressure_grace),
+            ),
+            None
+        );
+        assert_eq!(
+            proactive_retirement_reason(
+                &config,
+                Duration::ZERO,
+                Some(config.memory_pressure_min_rss_bytes),
+                0,
+                Some(config.memory_pressure_grace),
+            ),
+            Some(GenerationRetirementReason::CgroupPressure)
+        );
+        assert_eq!(
+            proactive_retirement_reason(
+                &config,
+                Duration::ZERO,
+                Some(config.max_rss_bytes),
+                0,
+                Some(config.memory_pressure_grace),
+            ),
+            Some(GenerationRetirementReason::RssLimit)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_rss_parser_requires_one_kib_value() {
+        assert_eq!(
+            parse_process_rss("Name:\tnode\nVmRSS:\t12345 kB\nVmSize:\t99999 kB\n").unwrap(),
+            12_641_280
+        );
+        assert!(parse_process_rss("Name:\tnode\n").is_err());
+        assert!(parse_process_rss("VmRSS:\t12345 MB\n").is_err());
+        assert!(parse_process_rss("VmRSS:\t1 kB\nVmRSS:\t2 kB\n").is_err());
     }
 
     #[tokio::test]
@@ -1767,13 +2360,23 @@ done
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let pid = server_handle
+            .id()
+            .expect("Test local Node executor child has no process id");
         Arc::new(InnerLocalNodeExecutor {
             generation,
+            pid,
             started_at: Instant::now(),
             runtime_stats_supported: false,
             active_requests: AtomicUsize::new(0),
+            retirement_requested: AtomicBool::new(false),
+            idle: Notify::new(),
+            retired: AtomicBool::new(false),
+            retirement_failed: AtomicBool::new(false),
+            retired_notify: Notify::new(),
             retained_source_packages: AtomicU64::new(0),
             retained_external_packages: AtomicU64::new(0),
+            imported_source_packages: AtomicU64::new(0),
             registered_stack_roots: AtomicU64::new(0),
             server_handle: Mutex::new(ManagedChild::new(generation, server_handle, source_dir)),
             client,
@@ -1926,6 +2529,7 @@ done
         let state = Arc::new(Mutex::new(LocalNodeExecutorState {
             next_generation: inner.generation,
             inner: Some(inner),
+            retiring: None,
             replacement_for_generation: None,
         }));
         let executor = LocalNodeExecutor {
@@ -1938,11 +2542,116 @@ done
     }
 
     #[tokio::test]
+    async fn graceful_retirement_stops_admission_and_waits_for_active_request() {
+        let generation = test_inner(1).await;
+        let (executor, state) = test_executor(generation.clone(), test_config());
+        let active_guard = match executor.acquire_existing_inner().await.unwrap() {
+            InnerAcquisition::Ready { inner, guard } => {
+                assert!(Arc::ptr_eq(&inner, &generation));
+                guard
+            },
+            InnerAcquisition::Draining(_) | InnerAcquisition::Missing => {
+                panic!("Test generation was not available")
+            },
+        };
+        assert_eq!(generation.active_requests.load(Ordering::Acquire), 1);
+
+        let retirement_state = state.clone();
+        let retirement_generation = generation.clone();
+        let retirement = tokio::spawn(async move {
+            LocalNodeExecutor::drain_and_retire_inner_state(
+                &retirement_state,
+                &retirement_generation,
+                GenerationRetirementDiagnostics::proactive(
+                    GenerationRetirementReason::PackageLimit,
+                ),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !generation.retirement_requested.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        match executor.acquire_existing_inner().await.unwrap() {
+            InnerAcquisition::Draining(inner) => assert!(Arc::ptr_eq(&inner, &generation)),
+            InnerAcquisition::Ready { .. } | InnerAcquisition::Missing => {
+                panic!("Draining generation admitted a new request")
+            },
+        }
+        assert_eq!(generation.active_requests.load(Ordering::Acquire), 1);
+        assert!(state.lock().await.inner.is_some());
+
+        drop(active_guard);
+        assert!(tokio::time::timeout(Duration::from_secs(1), retirement)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap());
+        assert!(state.lock().await.inner.is_none());
+        assert!(generation.retired.load(Ordering::Acquire));
+        assert!(generation.server_handle.lock().await.child.is_none());
+    }
+
+    #[tokio::test]
+    async fn canceled_drain_caller_does_not_wedge_generation_retirement() {
+        let generation = test_inner(1).await;
+        let (executor, state) = test_executor(generation.clone(), test_config());
+        let active_guard = match executor.acquire_existing_inner().await.unwrap() {
+            InnerAcquisition::Ready { guard, .. } => guard,
+            InnerAcquisition::Draining(_) | InnerAcquisition::Missing => {
+                panic!("Test generation was not available")
+            },
+        };
+
+        let retirement_state = state.clone();
+        let retirement_generation = generation.clone();
+        let retirement = tokio::spawn(async move {
+            LocalNodeExecutor::drain_and_retire_inner_state(
+                &retirement_state,
+                &retirement_generation,
+                GenerationRetirementDiagnostics::proactive(
+                    GenerationRetirementReason::PackageLimit,
+                ),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !generation.retirement_requested.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        retirement.abort();
+        assert!(retirement.await.unwrap_err().is_cancelled());
+        drop(active_guard);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            generation.wait_until_retired().await.unwrap();
+            loop {
+                if generation.server_handle.lock().await.child.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.lock().await.inner.is_none());
+    }
+
+    #[tokio::test]
     async fn late_old_generation_retirement_preserves_replacement() {
         let old = test_inner(1).await;
         let replacement = test_inner(2).await;
         let state = Arc::new(Mutex::new(LocalNodeExecutorState {
             inner: Some(old.clone()),
+            retiring: None,
             replacement_for_generation: None,
             next_generation: 2,
         }));
@@ -1996,6 +2705,7 @@ done
         let generation = test_inner(1).await;
         let state = Arc::new(Mutex::new(LocalNodeExecutorState {
             inner: Some(generation.clone()),
+            retiring: None,
             replacement_for_generation: None,
             next_generation: 1,
         }));
@@ -2028,11 +2738,7 @@ done
     #[tokio::test]
     async fn retirement_reaps_child_after_retiring_caller_is_canceled() {
         let generation = test_inner(1).await;
-        let state = Arc::new(Mutex::new(LocalNodeExecutorState {
-            inner: Some(generation.clone()),
-            replacement_for_generation: None,
-            next_generation: 1,
-        }));
+        let (executor, state) = test_executor(generation.clone(), test_config());
 
         // Hold the child lock so the detached termination owner cannot finish
         // before the task that initiated retirement is canceled.
@@ -2054,11 +2760,18 @@ done
         })
         .await
         .unwrap();
+        match executor.acquire_existing_inner().await.unwrap() {
+            InnerAcquisition::Draining(inner) => assert!(Arc::ptr_eq(&inner, &generation)),
+            InnerAcquisition::Ready { .. } | InnerAcquisition::Missing => {
+                panic!("Unreaped generation did not fence replacement startup")
+            },
+        }
         retirement_task.abort();
         assert!(retirement_task.await.unwrap_err().is_cancelled());
         drop(child_guard);
 
         tokio::time::timeout(Duration::from_secs(1), async {
+            generation.wait_until_retired().await.unwrap();
             loop {
                 if generation.server_handle.lock().await.child.is_none() {
                     break;
@@ -2068,6 +2781,7 @@ done
         })
         .await
         .unwrap();
+        assert!(state.lock().await.retiring.is_none());
     }
 
     #[tokio::test]
@@ -2108,6 +2822,7 @@ done
         let generation = test_inner_with_client(1, client).await;
         let state = Arc::new(Mutex::new(LocalNodeExecutorState {
             inner: Some(generation.clone()),
+            retiring: None,
             replacement_for_generation: None,
             next_generation: 1,
         }));

@@ -72,6 +72,7 @@ http_client = { workspace = true }
 hyper-util = { workspace = true }
 indexing = { workspace = true }
 keybroker = { workspace = true }
+libc = { workspace = true }
 maplit = { workspace = true }
 metrics = { workspace = true }
 model = { workspace = true }
