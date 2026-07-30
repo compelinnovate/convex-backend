@@ -5,7 +5,9 @@ import { log, setDebugLogging } from "./log";
 import os from "node:os";
 import http from "node:http";
 import express, { Request, Response } from "express";
+import { lockDiagnosticReportConfiguration } from "./diagnostic_report";
 import { extractErrorMessage, getPrepareStackTraceStats } from "./errors";
+import { startMainThreadProfiler } from "./main_thread_profiler";
 import { getPackageCacheStats } from "./source_package";
 import { prepareSourcePackage } from "./prepare";
 
@@ -15,8 +17,33 @@ async function startServer(
   listenTarget: number | { path: string },
   debug: boolean,
   tempdir: string,
+  diagnosticControlPath: string | undefined,
+  diagnosticProfilePath: string | undefined,
+  diagnosticProfileDurationMs: number,
 ) {
   setDebugLogging(debug);
+  if (
+    (diagnosticControlPath === undefined) !==
+    (diagnosticProfilePath === undefined)
+  ) {
+    throw new Error(
+      "Diagnostic control and profile paths must be configured together",
+    );
+  }
+  if (
+    diagnosticControlPath !== undefined &&
+    diagnosticProfilePath !== undefined
+  ) {
+    lockDiagnosticReportConfiguration();
+    void startMainThreadProfiler(
+      diagnosticControlPath,
+      diagnosticProfilePath,
+      diagnosticProfileDurationMs,
+    ).catch(() => {
+      // Profiling is best-effort evidence. A failed diagnostic worker must not
+      // delay or prevent the supervisor from starting a replacement executor.
+    });
+  }
   const app = express();
   app.use(express.json({ limit: "6MB" })); // 5 MiB for args (https://docs.convex.dev/production/state/limits#functions) + extra space
 
@@ -112,12 +139,32 @@ program
     "temporary directory to use for downloading code and dependencies",
     "",
   )
+  .option(
+    "--diagnostic-control-path <path>",
+    "private IPC path used to trigger a bounded main-thread CPU profile",
+  )
+  .option(
+    "--diagnostic-profile-path <path>",
+    "exclusive output path for the bounded main-thread CPU profile",
+  )
+  .option(
+    "--diagnostic-profile-duration-ms <number>",
+    "bounded main-thread CPU profile duration in milliseconds",
+    "4000",
+  )
   .action(async (options) => {
     const listenTarget =
       options.ipcPath !== undefined
         ? { path: options.ipcPath }
         : parseInt(options.port, 10);
-    await startServer(listenTarget, options.debug, options.tempdir);
+    await startServer(
+      listenTarget,
+      options.debug,
+      options.tempdir,
+      options.diagnosticControlPath,
+      options.diagnosticProfilePath,
+      Number(options.diagnosticProfileDurationMs),
+    );
   });
 
 program.parseAsync(process.argv);

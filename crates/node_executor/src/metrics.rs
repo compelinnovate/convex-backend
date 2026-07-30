@@ -199,6 +199,88 @@ pub fn log_local_node_retirement_diagnostics(
 }
 
 register_convex_counter!(
+    LOCAL_NODE_EXECUTOR_FIRST_MISS_DIAGNOSTICS_TOTAL,
+    "Outcomes of first-watchdog-miss local Node executor diagnostics",
+    &["operation", "outcome"],
+    Duration::MAX,
+);
+
+macro_rules! first_miss_diagnostic_outcomes {
+    ($($variant:ident => ($operation:literal, $outcome:literal)),+ $(,)?) => {
+        #[derive(Clone, Copy)]
+        pub(crate) enum FirstMissDiagnosticOutcome {
+            $($variant),+
+        }
+
+        impl FirstMissDiagnosticOutcome {
+            const ALL: &'static [Self] = &[
+                $(Self::$variant),+
+            ];
+
+            fn labels(self) -> (&'static str, &'static str) {
+                match self {
+                    $(Self::$variant => ($operation, $outcome)),+
+                }
+            }
+        }
+    };
+}
+
+first_miss_diagnostic_outcomes! {
+    DiagnosticDirectorySuccess => ("diagnostic_directory", "success"),
+    DiagnosticDirectoryFailure => ("diagnostic_directory", "failure"),
+    RetentionSuccess => ("retention", "success"),
+    RetentionFailure => ("retention", "failure"),
+    DiagnosticReportRequested => ("diagnostic_report", "requested"),
+    DiagnosticReportCompleted => ("diagnostic_report", "completed"),
+    DiagnosticReportRequestFailed => ("diagnostic_report", "request_failed"),
+    DiagnosticReportWriteFailed => ("diagnostic_report", "write_failed"),
+    DiagnosticReportInvalidPid => ("diagnostic_report", "invalid_pid"),
+    DiagnosticReportUnsupported => ("diagnostic_report", "unsupported"),
+    ProcSnapshotCompleted => ("proc_snapshot", "completed"),
+    ProcSnapshotWriteFailed => ("proc_snapshot", "write_failed"),
+    ProcSnapshotSerializationFailed => ("proc_snapshot", "serialization_failed"),
+    ProcSnapshotClockFailure => ("proc_snapshot", "clock_failure"),
+    CpuProfileCompleted => ("cpu_profile", "completed"),
+    CpuProfileAlreadyStarted => ("cpu_profile", "already_started"),
+    CpuProfileEnableFailed => ("cpu_profile", "enable_failed"),
+    CpuProfileStartFailed => ("cpu_profile", "start_failed"),
+    CpuProfileStopFailed => ("cpu_profile", "stop_failed"),
+    CpuProfileTooLarge => ("cpu_profile", "profile_too_large"),
+    CpuProfileWriteFailed => ("cpu_profile", "write_failed"),
+    CpuProfileTimeout => ("cpu_profile", "timeout"),
+    CpuProfileTransportFailed => ("cpu_profile", "transport_failed"),
+    CpuProfileResponseTooLarge => ("cpu_profile", "response_too_large"),
+    CpuProfileInvalidResponse => ("cpu_profile", "invalid_response"),
+    CpuProfileUnsupported => ("cpu_profile", "unsupported"),
+}
+
+fn log_local_node_first_miss_diagnostic_counter(
+    outcome: FirstMissDiagnosticOutcome,
+    increment: u64,
+) {
+    let (operation, outcome) = outcome.labels();
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_FIRST_MISS_DIAGNOSTICS_TOTAL,
+        increment,
+        vec![
+            StaticMetricLabel::new("operation", operation),
+            StaticMetricLabel::new("outcome", outcome),
+        ],
+    );
+}
+
+pub(crate) fn initialize_local_node_first_miss_diagnostic_counters() {
+    for &outcome in FirstMissDiagnosticOutcome::ALL {
+        log_local_node_first_miss_diagnostic_counter(outcome, 0);
+    }
+}
+
+pub(crate) fn log_local_node_first_miss_diagnostic(outcome: FirstMissDiagnosticOutcome) {
+    log_local_node_first_miss_diagnostic_counter(outcome, 1);
+}
+
+register_convex_counter!(
     LOCAL_NODE_EXECUTOR_CHILD_TERMINATIONS_TOTAL,
     "Completed supervisor termination of retired local Node executor children",
     &[
