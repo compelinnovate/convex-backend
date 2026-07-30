@@ -10,6 +10,77 @@ Repeated deployment analysis and execution can also retain ESM module graphs
 for the life of that process even after the corresponding disk-cache entry is
 deleted.
 
+## Operator view
+
+This is one adoption unit. It includes the Node.js 24 runtime move, generation
+retirement and replacement, proactive healthy-generation limits, and
+first-watchdog-miss evidence. It does not add a Node process pool.
+
+The repository and self-hosted images pin Node.js 24.18.1. The local executor
+accepts another `v24.*` binary from `PATH` when the exact NVM-managed binary is
+unavailable and rejects other major versions. Build the backend and dashboard
+from the same source revision and verify that both release images report
+`v24.18.1`.
+
+When a Node event loop stops responding:
+
+1. The first failed one-second watchdog check starts one detached evidence
+   attempt.
+2. Rust records bounded active-request and process evidence without waiting for
+   the Node event loop.
+3. Rust requests one Node diagnostic report and one four-second main-thread CPU
+   profile.
+4. Watchdog checks continue. Five consecutive misses retire and reap the direct
+   Node child.
+5. The next Node action lazily starts a clean generation.
+
+Retirement replaces only the local Node child, not the backend process. Queries,
+mutations, V8 actions, and backend health remain available unless another
+failure affects them. Evidence collection is best effort and cannot delay the
+watchdog or replacement.
+
+On Unix, first-miss evidence is automatic. Linux additionally records `/proc`
+process and thread state. Set `LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR` to an
+absolute mounted path when artifacts must survive container replacement.
+Without the setting, artifacts use a private temporary path and normally
+disappear with the container. The executor requires an owned directory,
+restricts it to `0700`, and writes published artifacts as `0600`.
+
+One attempt can publish:
+
+| Name | Contents | Primary use |
+| --- | --- | --- |
+| `node-first-miss-*.json` | Generation, active request identities and ages, RSS, thresholds, and bounded process/thread state | Identify concurrent work and whether the child was running, sleeping, or consuming CPU |
+| `node-report-*.json` | Sanitized Node diagnostic report with stacks and runtime state | Inspect Node and native runtime state |
+| `node-profile-*.cpuprofile` | Four-second Inspector profile of the main thread | Identify JavaScript or native-call stacks consuming the event loop |
+
+The files remain sensitive. Reports contain host, command, path, and stack data;
+profiles and snapshots contain function or module names. Keep them local or
+move them through an explicitly secured operator channel. Do not ship them to
+normal application or infrastructure logs.
+
+For an incident:
+
+1. Confirm a `health_check_failed` generation retirement or consecutive
+   watchdog misses.
+2. Read
+   `local_node_executor_first_miss_diagnostics_total{operation,outcome}` to see
+   which evidence operations completed.
+3. Match files in the diagnostic directory by generation and timestamp.
+4. Start with `node-first-miss-*.json`, then inspect the CPU profile and Node
+   report.
+5. Correlate the bounded module/function identities with function executions.
+   Concurrent work is not proof that one action caused the wedge.
+
+`diagnostic_report=requested` means only that the signal was sent. `completed`
+means Rust validated, sanitized, and atomically published the report. A
+filesystem `write_failed` means publication was not confirmed before the
+bounded wait; non-cancelable kernel work may still finish later.
+
+A single missed check can be transient. Artifact creation proves that the
+watchdog missed a health response; it does not prove a persistent wedge or
+identify the responsible action.
+
 ## Failure mode
 
 The Rust client enforces the Node action timeout independently of the Node event
@@ -47,13 +118,14 @@ its sampled Linux direct-child RSS, age, or lifetime-unique imported
 source-package count reaches the configured threshold.
 
 Healthy retirement first closes admission while holding the generation-state
-mutex, then waits for active Rust requests to drain before using the same
-identity-fenced retirement and child-reaping path. The current child remains
-the only child until it has been reaped; a waiting request cannot start a
-replacement while the old child is still resident. The RSS threshold is a
-sampled graceful-retirement trigger and planning allowance, not a hard maximum.
-The child can grow between samples and while active requests drain, and the
-direct-child sample excludes descendants.
+mutex, then starts detached drain completion. The watchdog continues health
+checks while active Rust requests drain, and unhealthy retirement can preempt a
+stuck proactive drain. The current child remains the only child until it has
+been reaped; a waiting request cannot start a replacement while the old child
+is still resident. The RSS threshold is a sampled graceful-retirement trigger
+and planning allowance, not a hard maximum. The child can grow between samples
+and while active requests drain, and the direct-child sample excludes
+descendants.
 
 Retirement uses `Arc::ptr_eq` while holding the generation slot. A late timeout
 or connection error from an old request cannot remove a replacement. Several
@@ -156,10 +228,49 @@ After every watchdog observation, proactive trigger precedence in the base patch
 RSS, lifetime imported source-package count, then generation age. When the
 [`backend_memory_resilience`](../backend_memory_resilience/README.md) patch is also carried,
 sustained cgroup pressure with a material direct-child RSS sample follows the ordinary RSS check
-and precedes the package and age checks. These checks run even when the health endpoint is failing;
-the consecutive-health-miss decision follows them. A failed Linux RSS read records `failure` and
-skips only the RSS trigger for that iteration. Non-Linux builds record `unsupported` and do not
-enforce an RSS trigger. A successful sample records `success`.
+and precedes the package and age checks. These checks remain active while the health endpoint is
+failing. Reaching a proactive
+threshold closes admission and starts detached drain completion without
+stopping the watchdog loop. On the terminal watchdog miss, unhealthy retirement
+runs before any new proactive drain and can preempt an existing drain that is
+waiting on a stuck request. A failed Linux RSS read records `failure` and skips
+only the RSS trigger for that iteration. Non-Linux builds record `unsupported`
+and do not enforce an RSS trigger. A successful sample records `success`.
+
+## First-miss diagnostics
+
+The first failed watchdog check in each generation claims one detached attempt.
+The snapshot records the active Rust request count, up to 64 bounded request
+identities, direct-child RSS and configured retirement thresholds, and the
+imported-source-package count from the preceding successful health observation.
+Linux also records up to 256 `/proc` thread entries and rechecks process start
+time to reject PID reuse. Request evidence contains request kind, module and
+function identity, and elapsed time. It contains no arguments or payloads, and
+each module/function field is limited to 512 UTF-8 bytes.
+
+The same claim sends one Node diagnostic-report signal and requests one
+four-second main-thread CPU profile from a dedicated Inspector worker. Report
+and profile source files remain generation-local. Rust accepts only owned,
+single-link `0600` regular files with stable identity, mode, size, and contents.
+A report also requires complete JSON. Persistent publication uses a private
+same-directory temporary file, file sync, and atomic no-clobber publication.
+
+Before report publication, Rust removes environment variables,
+network-interface details, and `localEndpoint` and `remoteEndpoint` fields,
+including endpoint fields in `libuv` entries. Report and profile publication
+accepts at most 32 MiB per artifact. That limit does not bound the transient
+Inspector profile object in Node memory.
+
+A detached retention pass starts when a generation starts. It removes
+recognized artifacts older than seven days and applies 96-file and 256-MiB
+directory limits. Files younger than 30 seconds count toward the limits but are
+not removed while a bounded writer can still be publishing. Tasks from a
+retired generation can finish after a replacement generation's pass, so rapid
+replacement can temporarily exceed the limits until a later generation starts.
+
+File, inode, mode, immutable-report-setting, sanitization, and no-clobber checks
+protect against accidental drift and other OS users. They are not a security
+boundary against action code running in the same process and effective UID.
 
 ## Metrics and logs
 
@@ -171,6 +282,7 @@ The patch exports bounded backend metrics:
 - `local_node_executor_child_exits_total{class}`;
 - `local_node_executor_generation_retirements_total{reason}`;
 - `local_node_executor_retirement_diagnostics_total{reason,request_kind,phase,transport_error_kind}`;
+- `local_node_executor_first_miss_diagnostics_total{operation,outcome}`;
 - `local_node_executor_child_terminations_total{reason,state_before,supervisor_kill_requested,exit_class}`;
 - `local_node_executor_replacement_outcomes_total{outcome}`;
 - `local_node_executor_replacement_seconds`;
@@ -213,6 +325,11 @@ or that metric family has an opening sample at the report start. A contract
 first observed inside the window has partial coverage, so its missing labels
 remain unknown. A completely absent family on an older backend remains `not
 emitted`, not zero.
+
+The first-miss family uses the fixed operations `diagnostic_directory`,
+`retention`, `diagnostic_report`, `proc_snapshot`, and `cpu_profile` with
+closed outcome sets. Every approved series is initialized to zero from the same
+typed outcome list used for emission, and the family does not expire.
 
 `connection_error` is the bounded generation-retirement reason for local
 request submission and response-body transport failures. Request outcomes keep
@@ -332,22 +449,68 @@ Focused Rust tests cover:
   backend memory-resilience composition;
 - strict old-space/RSS configuration validation and Linux RSS parsing;
 - graceful admission closure and drain before proactive retirement;
+- unhealthy watchdog retirement preempting a proactive drain blocked by a
+  stuck request;
 - continuing drain and child ownership after the initiating caller is
   canceled;
 - fencing replacement startup until the retiring direct child is reaped;
 - lifetime imported-package counting that begins only at an actual dynamic
-  import attempt and survives disk-cache retirement.
+  import attempt and survives disk-cache retirement;
+- bounded active-request evidence and one first-miss claim per enabled
+  generation;
+- private diagnostic-directory setup, retention, complete report/profile
+  validation, report sanitization, and atomic no-clobber publication;
+- bounded retry of the profiler control connection during worker startup.
+
+Focused Node executor tests cover immutable report settings, fragmented and
+concurrent profiler commands, Inspector attachment while the main thread is
+blocked, one-shot outcomes, and private profile mode under a changed process
+umask.
 
 The package patch owns the Node-side health aggregate, package-lifetime, and
 stack-root tests. The production rollout verifies watchdog health responses,
 generated metrics, child replacement, and successful Node completions with
 ordinary workload rather than a provider fixture.
 
+Run the focused checks:
+
+```sh
+cd npm-packages
+mise exec node -- node check-versions.mjs
+cd node-executor
+npm run test -- src/diagnostic_report.test.ts src/main_thread_profiler.test.ts
+npm run build
+
+cd ../..
+rustfmt --edition 2024 --config skip_children=true --check \
+  crates/node_executor/src/local.rs crates/node_executor/src/metrics.rs
+scripts/run_cargo.sh test -p node_executor
+scripts/run_cargo.sh check -p node_executor --all-targets
+scripts/run_cargo.sh clippy -p node_executor --all-targets -- -D warnings
+```
+
 ## Adoption and rollback
 
 Timeout and unhealthy-watchdog recovery are automatic after a backend image
-containing the lifecycle implementation starts. Healthy proactive retirement
-uses these startup knobs:
+containing the lifecycle implementation starts. Build the backend and dashboard
+from the same source revision. Both self-hosted images read `.nvmrc` and install
+the exact Node.js 24.18.1 NodeSource package. Before replacement:
+
+```sh
+docker run --rm <backend-image> node --version
+docker run --rm <dashboard-image> node --version
+```
+
+Both commands must print `v24.18.1`. The generated mise lock lists unofficial
+24.18.1 musl URLs without checksums because those archives were unavailable
+when the lock was generated. Do not use those musl entries until upstream
+publishes the archives and the lock is regenerated with checksums.
+
+On Unix, first-miss diagnostics are automatic. The optional
+`LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR` selects an absolute persistent artifact
+directory. Without it, the executor uses a private temporary path.
+
+Healthy proactive retirement uses these startup knobs:
 
 - `LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB`;
 - `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`;
@@ -366,13 +529,21 @@ Node with `--max-old-space-size` before the script path. V8 old space excludes
 Buffers, native modules, executable code, allocator retention, and descendant
 processes. No process pool is required.
 
-Rollback restores the previous backend image and its complete tracked capacity environment. When
-the previous image already contains timeout and unhealthy generation retirement, rolling back the
-local Node resilience patch removes only the newer healthy RSS/package/age controls and their
-telemetry; it does not rewrite earlier deployed lifecycle history. Rolling back the separate
-backend memory-resilience patch removes its cgroup-pressure input without changing the base Node
-retirement mechanisms. Timeout recycling, unhealthy-watchdog retirement, and healthy proactive
-retirement share the same generation guard and child-termination contract, so carrying an
+Before production rollout, exercise a blocked main thread in a disposable
+self-hosted environment. Verify one first-miss attempt, continued watchdog
+checks through five misses, direct-child termination and reaping, a healthy
+replacement, private file modes, valid JSON/profile output, and report
+redaction.
+
+Rollback restores the previous backend and dashboard images and the backend's
+complete tracked capacity environment. Existing artifacts on a persistent
+volume remain operator-owned and are not deleted by rollback. When the previous
+backend already contains timeout and unhealthy generation retirement, rollback
+removes only the newer healthy RSS/package/age controls, first-miss evidence, and their telemetry;
+it does not rewrite earlier lifecycle history. Rolling back the separate backend memory-resilience
+patch removes its cgroup-pressure input without changing the base Node retirement mechanisms. Timeout
+recycling, unhealthy-watchdog retirement, and healthy proactive retirement
+share the same generation guard and child-termination contract, so carrying an
 unreviewed partial image is not supported.
 
 The patch does not remove the one-process throughput ceiling or isolate

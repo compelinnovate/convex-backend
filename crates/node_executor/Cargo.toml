@@ -33,6 +33,7 @@ futures-async-stream = { workspace = true }
 home = { workspace = true }
 isolate = { workspace = true }
 keybroker = { workspace = true }
+libc = { workspace = true }
 maplit = { workspace = true }
 memchr = { workspace = true }
 metrics = { workspace = true }

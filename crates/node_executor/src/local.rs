@@ -1,5 +1,18 @@
+#[cfg(unix)]
+use std::env;
+#[cfg(unix)]
+use std::io::Read as _;
+#[cfg(unix)]
+use std::os::unix::fs::{
+    DirBuilderExt,
+    MetadataExt,
+    OpenOptionsExt,
+    PermissionsExt,
+};
 use std::{
+    collections::BTreeMap,
     fs,
+    io::Write as _,
     path::{
         Path,
         PathBuf,
@@ -16,11 +29,14 @@ use std::{
             Ordering,
         },
         Arc,
+        Mutex as StdMutex,
         Weak,
     },
     time::{
         Duration,
         Instant,
+        SystemTime,
+        UNIX_EPOCH,
     },
 };
 
@@ -43,11 +59,22 @@ use futures_async_stream::try_stream;
 use isolate::bundled_js::node_executor_file;
 use rand::Rng;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use serde_json::Value as JsonValue;
-use tempfile::TempDir;
+use tempfile::{
+    Builder as TempFileBuilder,
+    TempDir,
+};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::{
-    io::AsyncReadExt,
+    io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+    },
     process::{
         Child,
         Command as TokioCommand,
@@ -59,15 +86,18 @@ use tokio::{
     },
 };
 
-use crate::executor::{
-    handle_node_executor_stream,
-    ExecutorRequest,
-    InvokeCompletion,
-    InvokeResponse,
-    NodeExecutor,
-    NodeExecutorStreamPart,
-    ARGS_TOO_LARGE_RESPONSE_MESSAGE,
-    EXECUTE_TIMEOUT_RESPONSE_JSON,
+use crate::{
+    executor::{
+        handle_node_executor_stream,
+        ExecutorRequest,
+        InvokeCompletion,
+        InvokeResponse,
+        NodeExecutor,
+        NodeExecutorStreamPart,
+        ARGS_TOO_LARGE_RESPONSE_MESSAGE,
+        EXECUTE_TIMEOUT_RESPONSE_JSON,
+    },
+    metrics::FirstMissDiagnosticOutcome,
 };
 
 const NVMRC_VERSION: &str = include_str!("../../../.nvmrc");
@@ -78,9 +108,33 @@ const MAX_INVOKE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_NODE_VERSION_OUTPUT_BYTES: usize = 1024;
 const MAX_HEALTH_CHECK_ATTEMPTS: u32 = 50;
 const NODE_VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-const PROCESS_RSS_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const PROCESS_PROCFS_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 const WATCHDOG_FAILURE_THRESHOLD: u32 = 5;
+const DIAGNOSTIC_PROFILE_DURATION_MS: u64 = 4_000;
+const DIAGNOSTIC_FILESYSTEM_TIMEOUT: Duration = Duration::from_secs(2);
+const DIAGNOSTIC_PROCESS_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+const DIAGNOSTIC_REPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const DIAGNOSTIC_TRIGGER_TIMEOUT: Duration = Duration::from_secs(7);
+const DIAGNOSTIC_ARTIFACT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(unix)]
+const DIAGNOSTIC_PROFILE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(unix)]
+const DIAGNOSTIC_PROFILE_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(unix)]
+const MAX_DIAGNOSTIC_CONTROL_RESPONSE_BYTES: u64 = 64;
+#[cfg(unix)]
+const MAX_DIAGNOSTIC_PROFILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_DIAGNOSTIC_REPORT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_DIAGNOSTIC_ACTIVE_REQUESTS: usize = 64;
+const MAX_DIAGNOSTIC_REQUEST_IDENTITY_BYTES: usize = 512;
+const MAX_DIAGNOSTIC_THREADS: usize = 256;
+const MAX_DIAGNOSTIC_ARTIFACTS: usize = 96;
+const MAX_DIAGNOSTIC_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_DIAGNOSTIC_ARTIFACT_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MIN_DIAGNOSTIC_ARTIFACT_PRUNE_AGE: Duration = Duration::from_secs(30);
+const MAX_DIAGNOSTIC_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
+const LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR_ENV: &str = "LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR";
 const MIB_BYTES: u64 = 1024 * 1024;
 
 pub struct LocalNodeExecutor {
@@ -116,6 +170,8 @@ struct LocalNodeExecutorConfig {
     memory_pressure_grace: Duration,
     max_generation_age: Duration,
     max_imported_source_packages: u64,
+    diagnostics_dir: Option<PathBuf>,
+    diagnostic_pruning_in_progress: Arc<AtomicBool>,
 }
 
 struct ManagedChild {
@@ -146,10 +202,143 @@ struct InnerLocalNodeExecutor {
     retained_external_packages: AtomicU64,
     imported_source_packages: AtomicU64,
     registered_stack_roots: AtomicU64,
+    first_miss_diagnostics_started: AtomicBool,
+    next_active_request_id: AtomicU64,
+    active_request_diagnostics: StdMutex<BTreeMap<u64, ActiveRequestDiagnostic>>,
+    diagnostic_paths: Option<NodeDiagnosticPaths>,
     // Initiate kill and reaping before removing the tempdir if explicit
     // termination cannot complete or startup is canceled.
     server_handle: Mutex<ManagedChild>,
     client: reqwest::Client,
+}
+
+#[derive(Clone)]
+struct NodeDiagnosticPaths {
+    control_path: PathBuf,
+    first_miss_path: PathBuf,
+    profile_source_path: PathBuf,
+    profile_path: PathBuf,
+    report: NodeDiagnosticReportPaths,
+}
+
+#[derive(Clone)]
+struct NodeDiagnosticReportPaths {
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    filename: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiagnosticFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedDiagnosticSource {
+    AnyPrivateRegularFile,
+    Exact(DiagnosticFileIdentity),
+}
+
+struct DiagnosticArtifactPruningClaim {
+    in_progress: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct RequestDiagnosticMetadata {
+    request_kind: &'static str,
+    module_path: Option<String>,
+    function_name: Option<String>,
+}
+
+struct ActiveRequestDiagnostic {
+    metadata: RequestDiagnosticMetadata,
+    started_at: Instant,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveRequestDiagnosticSnapshot {
+    request_kind: &'static str,
+    module_path: Option<String>,
+    function_name: Option<String>,
+    elapsed_ms: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessStatSnapshot {
+    state: char,
+    user_ticks: u64,
+    system_ticks: u64,
+    thread_count: u64,
+    start_time_ticks: u64,
+}
+
+#[derive(Clone)]
+struct ProcessStatBaseline {
+    sequence: u64,
+    sampled_at: Instant,
+    process: Option<ProcessStatSnapshot>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessCpuDelta {
+    user_ticks: u64,
+    system_ticks: u64,
+    interval_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadStatSnapshot {
+    tid: u32,
+    state: char,
+    user_ticks: u64,
+    system_ticks: u64,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticSnapshotOutcome {
+    Success,
+    Unsupported,
+    Failure,
+    Timeout,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FirstMissDiagnosticArtifact {
+    schema_version: u32,
+    captured_at_unix_ms: u128,
+    generation: u64,
+    pid: u32,
+    generation_age_ms: u64,
+    active_request_count: usize,
+    active_requests_truncated: bool,
+    active_requests: Vec<ActiveRequestDiagnosticSnapshot>,
+    rss_bytes: Option<u64>,
+    old_space_limit_bytes: u64,
+    rss_retirement_threshold_bytes: u64,
+    generation_age_retirement_threshold_ms: u64,
+    imported_source_packages: u64,
+    imported_source_package_retirement_threshold: u64,
+    process_stat_outcome: DiagnosticSnapshotOutcome,
+    process: Option<ProcessStatSnapshot>,
+    process_cpu_delta: Option<ProcessCpuDelta>,
+    thread_stat_outcome: DiagnosticSnapshotOutcome,
+    threads_truncated: bool,
+    threads: Vec<ThreadStatSnapshot>,
+}
+
+impl Drop for DiagnosticArtifactPruningClaim {
+    fn drop(&mut self) {
+        self.in_progress.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Deserialize)]
@@ -360,6 +549,37 @@ fn proactive_retirement_reason(
     }
 }
 
+fn bounded_request_identity(value: &str) -> String {
+    let mut end = value.len().min(MAX_DIAGNOSTIC_REQUEST_IDENTITY_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn request_diagnostic_metadata(request: &ExecutorRequest) -> RequestDiagnosticMetadata {
+    match request {
+        ExecutorRequest::Execute { request, .. } => {
+            let path = request.path_and_args.path();
+            RequestDiagnosticMetadata {
+                request_kind: "execute",
+                module_path: Some(bounded_request_identity(path.udf_path.module().as_str())),
+                function_name: Some(bounded_request_identity(path.udf_path.function_name())),
+            }
+        },
+        ExecutorRequest::Analyze(_) => RequestDiagnosticMetadata {
+            request_kind: "analyze",
+            module_path: None,
+            function_name: None,
+        },
+        ExecutorRequest::BuildDeps(_) => RequestDiagnosticMetadata {
+            request_kind: "build_deps",
+            module_path: None,
+            function_name: None,
+        },
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn parse_process_rss(status: &str) -> anyhow::Result<u64> {
     let mut rss = None;
@@ -392,7 +612,7 @@ fn parse_process_rss(status: &str) -> anyhow::Result<u64> {
 #[cfg(target_os = "linux")]
 async fn read_process_rss(pid: u32) -> anyhow::Result<Option<u64>> {
     let status = tokio::time::timeout(
-        PROCESS_RSS_READ_TIMEOUT,
+        PROCESS_PROCFS_READ_TIMEOUT,
         tokio::fs::read_to_string(format!("/proc/{pid}/status")),
     )
     .await
@@ -405,8 +625,785 @@ async fn read_process_rss(_pid: u32) -> anyhow::Result<Option<u64>> {
     Ok(None)
 }
 
+#[cfg(unix)]
+fn create_private_diagnostic_directory(path: &Path) -> anyhow::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder
+        .create(path)
+        .context("Failed to create local Node diagnostic directory")?;
+
+    // Open before changing permissions so a concurrent path replacement cannot
+    // redirect chmod to a different filesystem object.
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .context("Failed to open local Node diagnostic directory")?;
+    let metadata = directory
+        .metadata()
+        .context("Failed to inspect opened local Node diagnostic directory")?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "Local Node diagnostic path is not a directory"
+    );
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "Local Node diagnostic directory has an unexpected owner"
+    );
+    if metadata.mode() & 0o7777 != 0o700 {
+        // Do not turn an accidentally configured shared or system directory
+        // into a private executor directory. Artifact-like names do not prove
+        // that this lifecycle created the contents.
+        anyhow::ensure!(
+            fs::read_dir(path)
+                .context("Failed to inspect local Node diagnostic directory")?
+                .next()
+                .transpose()
+                .context("Failed to inspect local Node diagnostic directory entry")?
+                .is_none(),
+            "Refusing to restrict a nonempty local Node diagnostic directory"
+        );
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .context("Failed to restrict local Node diagnostic directory permissions")?;
+    }
+    let opened_metadata = directory
+        .metadata()
+        .context("Failed to recheck opened local Node diagnostic directory")?;
+    let path_metadata =
+        fs::symlink_metadata(path).context("Failed to recheck local Node diagnostic directory")?;
+    anyhow::ensure!(
+        path_metadata.file_type().is_dir()
+            && path_metadata.dev() == opened_metadata.dev()
+            && path_metadata.ino() == opened_metadata.ino(),
+        "Local Node diagnostic directory changed during setup"
+    );
+    anyhow::ensure!(
+        opened_metadata.mode() & 0o7777 == 0o700,
+        "Local Node diagnostic directory permissions are not private"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn diagnostic_directory() -> anyhow::Result<PathBuf> {
+    let path = match env::var_os(LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR_ENV) {
+        Some(path) => {
+            anyhow::ensure!(
+                !path.is_empty(),
+                "{LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR_ENV} must not be empty"
+            );
+            PathBuf::from(path)
+        },
+        None => env::temp_dir().join("convex-node-executor-diagnostics"),
+    };
+    anyhow::ensure!(
+        path.is_absolute(),
+        "{LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR_ENV} must be an absolute path"
+    );
+    create_private_diagnostic_directory(&path)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+async fn prepare_diagnostic_directory() -> Option<PathBuf> {
+    let result = tokio::time::timeout(
+        DIAGNOSTIC_FILESYSTEM_TIMEOUT,
+        tokio::task::spawn_blocking(diagnostic_directory),
+    )
+    .await;
+    match result {
+        Ok(Ok(Ok(path))) => {
+            crate::metrics::log_local_node_first_miss_diagnostic(
+                FirstMissDiagnosticOutcome::DiagnosticDirectorySuccess,
+            );
+            Some(path)
+        },
+        Err(_) | Ok(Err(_)) | Ok(Ok(Err(_))) => {
+            crate::metrics::log_local_node_first_miss_diagnostic(
+                FirstMissDiagnosticOutcome::DiagnosticDirectoryFailure,
+            );
+            tracing::warn!(
+                "Disabled first-miss local Node diagnostics because private artifact directory \
+                 setup failed"
+            );
+            None
+        },
+    }
+}
+
+#[cfg(not(unix))]
+async fn prepare_diagnostic_directory() -> Option<PathBuf> {
+    None
+}
+
+fn is_local_node_diagnostic_artifact(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    (name.starts_with("node-first-miss-") && name.ends_with(".json"))
+        || (name.starts_with("node-profile-") && name.ends_with(".cpuprofile"))
+        || (name.starts_with("node-report-") && name.ends_with(".json"))
+}
+
+fn is_partial_local_node_diagnostic_artifact(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            (name.starts_with("node-diagnostic-partial-") && name.ends_with(".partial"))
+                || (name.starts_with("node-first-miss-partial-") && name.ends_with(".json.partial"))
+        })
+}
+
+fn prune_diagnostic_artifacts(diagnostics_dir: &Path) -> anyhow::Result<()> {
+    let now = SystemTime::now();
+    let mut old_artifacts = BTreeMap::new();
+    let mut retained_count = 0usize;
+    let mut total_bytes = 0u64;
+    for entry in
+        fs::read_dir(diagnostics_dir).context("Failed to read local Node diagnostic directory")?
+    {
+        let entry = entry.context("Failed to read local Node diagnostic directory entry")?;
+        let path = entry.path();
+        let is_artifact = is_local_node_diagnostic_artifact(&path);
+        let is_partial_artifact = is_partial_local_node_diagnostic_artifact(&path);
+        if !entry
+            .file_type()
+            .context("Failed to inspect local Node diagnostic artifact type")?
+            .is_file()
+            || (!is_artifact && !is_partial_artifact)
+        {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .context("Failed to inspect local Node diagnostic artifact")?;
+        let modified = metadata
+            .modified()
+            .context("Local Node diagnostic artifact has no modification time")?;
+        let age = match now.duration_since(modified) {
+            Ok(age) => age,
+            Err(error) if error.duration() > MAX_DIAGNOSTIC_CLOCK_SKEW => {
+                if is_partial_artifact {
+                    // A non-cancelable writer can outlive the async filesystem
+                    // timeout. A wall-clock rollback must not unlink its path.
+                    Duration::ZERO
+                } else {
+                    fs::remove_file(&path)
+                        .context("Failed to remove future-dated local Node diagnostic artifact")?;
+                    continue;
+                }
+            },
+            Err(_) => Duration::ZERO,
+        };
+        if is_partial_artifact {
+            if age >= MIN_DIAGNOSTIC_ARTIFACT_PRUNE_AGE {
+                fs::remove_file(&path)
+                    .context("Failed to remove partial local Node diagnostic artifact")?;
+            }
+            continue;
+        }
+        assert!(is_artifact);
+        if age > MAX_DIAGNOSTIC_ARTIFACT_AGE {
+            fs::remove_file(&path)
+                .context("Failed to remove expired local Node diagnostic artifact")?;
+            continue;
+        }
+        retained_count = retained_count
+            .checked_add(1)
+            .context("Local Node diagnostic artifact count overflow")?;
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .context("Local Node diagnostic artifact size overflow")?;
+        if age >= MIN_DIAGNOSTIC_ARTIFACT_PRUNE_AGE {
+            let replaced = old_artifacts.insert(
+                (if modified > now { now } else { modified }, path),
+                metadata.len(),
+            );
+            assert!(replaced.is_none());
+        }
+
+        while retained_count > MAX_DIAGNOSTIC_ARTIFACTS
+            || total_bytes > MAX_DIAGNOSTIC_ARTIFACT_BYTES
+        {
+            // Startup pruning is detached and can overlap artifact creation.
+            // Count recent files toward both limits, but leave a later
+            // generation to prune them after all bounded writers should have
+            // finished. Keeping only removable paths also bounds memory if the
+            // private directory already contains many artifacts.
+            let Some(((_, oldest_path), oldest_bytes)) = old_artifacts.pop_first() else {
+                break;
+            };
+            fs::remove_file(oldest_path)
+                .context("Failed to remove excess local Node diagnostic artifact")?;
+            retained_count -= 1;
+            total_bytes -= oldest_bytes;
+        }
+    }
+    Ok(())
+}
+
+fn spawn_diagnostic_artifact_pruning(diagnostics_dir: PathBuf, in_progress: Arc<AtomicBool>) {
+    if in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let claim = DiagnosticArtifactPruningClaim { in_progress };
+    tokio::spawn(async move {
+        let result = tokio::time::timeout(
+            DIAGNOSTIC_FILESYSTEM_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                // A timed-out blocking filesystem call continues in the
+                // background. Keep the claim there so later generations do not
+                // start overlapping retention passes against the same files.
+                let _claim = claim;
+                prune_diagnostic_artifacts(&diagnostics_dir)
+            }),
+        )
+        .await;
+        let outcome = match result {
+            Ok(Ok(Ok(()))) => FirstMissDiagnosticOutcome::RetentionSuccess,
+            Err(_) | Ok(Err(_)) | Ok(Ok(Err(_))) => {
+                tracing::warn!("Failed to prune local Node diagnostic artifacts");
+                FirstMissDiagnosticOutcome::RetentionFailure
+            },
+        };
+        crate::metrics::log_local_node_first_miss_diagnostic(outcome);
+    });
+}
+
+impl NodeDiagnosticPaths {
+    fn new(source_dir: &TempDir, diagnostics_dir: &Path, generation: u64) -> Self {
+        let nonce = rand::rng().random::<u64>();
+        let artifact_id = format!("g{generation}-{nonce:016x}");
+        let report_filename = format!("node-report-{artifact_id}.json");
+        let report_source_path = source_dir.path().join(&report_filename);
+        let report = NodeDiagnosticReportPaths {
+            source_path: report_source_path,
+            destination_path: diagnostics_dir.join(&report_filename),
+            filename: report_filename,
+        };
+        Self {
+            control_path: source_dir.path().join(".diagnostic-profiler.sock"),
+            first_miss_path: diagnostics_dir.join(format!("node-first-miss-{artifact_id}.json")),
+            profile_source_path: source_dir
+                .path()
+                .join(format!("node-profile-{artifact_id}.cpuprofile")),
+            profile_path: diagnostics_dir.join(format!("node-profile-{artifact_id}.cpuprofile")),
+            report,
+        }
+    }
+}
+
+fn parse_process_stat(stat: &str) -> anyhow::Result<ProcessStatSnapshot> {
+    let comm_end = stat
+        .rfind(')')
+        .context("Node process stat is missing command terminator")?;
+    let fields: Vec<_> = stat
+        .get(comm_end + 1..)
+        .context("Node process stat command terminator is invalid")?
+        .split_whitespace()
+        .collect();
+    anyhow::ensure!(fields.len() > 19, "Node process stat is truncated");
+    let mut state_chars = fields[0].chars();
+    let state = state_chars
+        .next()
+        .context("Node process stat is missing process state")?;
+    anyhow::ensure!(
+        state.is_ascii_alphabetic() && state_chars.next().is_none(),
+        "Node process stat has an invalid process state"
+    );
+    Ok(ProcessStatSnapshot {
+        state,
+        user_ticks: fields[11]
+            .parse()
+            .context("Node process stat has invalid user CPU ticks")?,
+        system_ticks: fields[12]
+            .parse()
+            .context("Node process stat has invalid system CPU ticks")?,
+        thread_count: fields[17]
+            .parse()
+            .context("Node process stat has invalid thread count")?,
+        start_time_ticks: fields[19]
+            .parse()
+            .context("Node process stat has invalid start time")?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn read_process_stat(pid: u32) -> anyhow::Result<Option<ProcessStatSnapshot>> {
+    let stat = tokio::time::timeout(
+        PROCESS_PROCFS_READ_TIMEOUT,
+        tokio::fs::read_to_string(format!("/proc/{pid}/stat")),
+    )
+    .await
+    .context("Timed out reading local Node process stat")??;
+    Ok(Some(parse_process_stat(&stat)?))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn read_process_stat(_pid: u32) -> anyhow::Result<Option<ProcessStatSnapshot>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+async fn read_thread_stats(
+    pid: u32,
+    expected_start_time_ticks: u64,
+) -> anyhow::Result<Option<(Vec<ThreadStatSnapshot>, bool)>> {
+    let mut directory = tokio::fs::read_dir(format!("/proc/{pid}/task"))
+        .await
+        .context("Failed to read local Node thread directory")?;
+    let mut tids = vec![pid];
+    let mut truncated = false;
+    while let Some(entry) = directory
+        .next_entry()
+        .await
+        .context("Failed to read local Node thread directory entry")?
+    {
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if tid == pid {
+            continue;
+        }
+        if tids.len() == MAX_DIAGNOSTIC_THREADS {
+            truncated = true;
+            break;
+        }
+        tids.push(tid);
+    }
+    tids.sort_unstable();
+    let mut threads = Vec::with_capacity(tids.len());
+    for tid in tids {
+        let stat = match tokio::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).await {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("Failed to read local Node thread stat"),
+        };
+        let process = parse_process_stat(&stat)?;
+        threads.push(ThreadStatSnapshot {
+            tid,
+            state: process.state,
+            user_ticks: process.user_ticks,
+            system_ticks: process.system_ticks,
+        });
+    }
+    let process = read_process_stat(pid)
+        .await?
+        .context("Local Node process disappeared during thread sampling")?;
+    anyhow::ensure!(
+        process.start_time_ticks == expected_start_time_ticks,
+        "Local Node process identity changed during thread sampling"
+    );
+    Ok(Some((threads, truncated)))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn read_thread_stats(
+    _pid: u32,
+    _expected_start_time_ticks: u64,
+) -> anyhow::Result<Option<(Vec<ThreadStatSnapshot>, bool)>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn private_diagnostic_file_identity(
+    metadata: &fs::Metadata,
+) -> anyhow::Result<DiagnosticFileIdentity> {
+    anyhow::ensure!(
+        metadata.file_type().is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o7777 == 0o600
+            && metadata.nlink() == 1,
+        "Local Node diagnostic file is not a private regular file"
+    );
+    Ok(DiagnosticFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn write_private_diagnostic_artifact(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .context("Local Node diagnostic artifact has no parent directory")?;
+    let mut file = TempFileBuilder::new()
+        .prefix("node-diagnostic-partial-")
+        .suffix(".partial")
+        .tempfile_in(parent)
+        .context("Failed to create partial local Node diagnostic artifact")?;
+    #[cfg(unix)]
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .context("Failed to restrict local Node diagnostic artifact permissions")?;
+    file.write_all(contents)
+        .and_then(|()| file.as_file().sync_all())
+        .context("Failed to write local Node diagnostic artifact")?;
+    #[cfg(unix)]
+    let source_identity = private_diagnostic_file_identity(
+        &file
+            .as_file()
+            .metadata()
+            .context("Failed to inspect partial local Node diagnostic artifact")?,
+    )?;
+    let persisted_file = file
+        .persist_noclobber(path)
+        .map_err(std::io::Error::from)
+        .context("Failed to publish local Node diagnostic artifact")?;
+    #[cfg(unix)]
+    {
+        let persisted_identity = private_diagnostic_file_identity(
+            &persisted_file
+                .metadata()
+                .context("Failed to inspect published local Node diagnostic artifact")?,
+        )?;
+        let destination = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .context("Failed to open published local Node diagnostic artifact")?;
+        let destination_identity = private_diagnostic_file_identity(
+            &destination
+                .metadata()
+                .context("Failed to recheck published local Node diagnostic artifact")?,
+        )?;
+        anyhow::ensure!(
+            persisted_identity == source_identity && destination_identity == source_identity,
+            "Local Node diagnostic artifact identity changed during publication"
+        );
+    }
+    drop(persisted_file);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_private_diagnostic_file(path: &Path) -> anyhow::Result<DiagnosticFileIdentity> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .context("Failed to open private local Node diagnostic file")?;
+    let original = file
+        .metadata()
+        .context("Failed to inspect private local Node diagnostic file")?;
+    // A report written before the watchdog may already occupy this path. Check
+    // the open inode before changing it so a hard link cannot turn report
+    // preparation into truncation of another same-UID file.
+    anyhow::ensure!(
+        original.file_type().is_file()
+            && original.uid() == unsafe { libc::geteuid() }
+            && original.nlink() == 1,
+        "Local Node diagnostic file is not an owned single-link regular file"
+    );
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .context("Failed to restrict local Node diagnostic file permissions")?;
+    file.set_len(0)
+        .context("Failed to truncate local Node diagnostic file")?;
+    let prepared = file
+        .metadata()
+        .context("Failed to recheck private local Node diagnostic file")?;
+    let identity = private_diagnostic_file_identity(&prepared)?;
+    anyhow::ensure!(
+        identity.device == original.dev() && identity.inode == original.ino(),
+        "Local Node diagnostic file identity changed during preparation"
+    );
+    Ok(identity)
+}
+
+#[cfg(not(unix))]
+fn prepare_private_diagnostic_file(_path: &Path) -> anyhow::Result<DiagnosticFileIdentity> {
+    anyhow::bail!("Private local Node diagnostic files are unsupported")
+}
+
+#[cfg(unix)]
+fn read_private_diagnostic_artifact(
+    path: &Path,
+    max_bytes: u64,
+    expected_source: ExpectedDiagnosticSource,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Failed to open local Node diagnostic source"),
+    };
+    let before = file
+        .metadata()
+        .context("Failed to inspect local Node diagnostic source")?;
+    let before_identity = private_diagnostic_file_identity(&before)?;
+    if let ExpectedDiagnosticSource::Exact(expected_identity) = expected_source {
+        anyhow::ensure!(
+            before_identity == expected_identity,
+            "Local Node diagnostic source identity changed before publication"
+        );
+    }
+    if before.len() == 0 {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        before.len() <= max_bytes,
+        "Local Node diagnostic source exceeded its size limit"
+    );
+    let mut contents = Vec::with_capacity(usize::try_from(before.len())?);
+    std::io::Read::by_ref(&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut contents)
+        .context("Failed to read local Node diagnostic source")?;
+    anyhow::ensure!(
+        contents.len() as u64 <= max_bytes,
+        "Local Node diagnostic source exceeded its size limit"
+    );
+    let after = file
+        .metadata()
+        .context("Failed to recheck local Node diagnostic source")?;
+    let after_identity = private_diagnostic_file_identity(&after)?;
+    if before.len() != contents.len() as u64
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+    {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        before_identity == after_identity,
+        "Local Node diagnostic source changed while being read"
+    );
+    Ok(Some(contents))
+}
+
+#[cfg(not(unix))]
+fn read_private_diagnostic_artifact(
+    _path: &Path,
+    _max_bytes: u64,
+    _expected_source: ExpectedDiagnosticSource,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    anyhow::bail!("Private local Node diagnostic artifacts are unsupported")
+}
+
+fn copy_private_diagnostic_artifact(
+    source_path: &Path,
+    destination_path: &Path,
+    max_bytes: u64,
+) -> anyhow::Result<()> {
+    let contents = read_private_diagnostic_artifact(
+        source_path,
+        max_bytes,
+        ExpectedDiagnosticSource::AnyPrivateRegularFile,
+    )?
+    .context("Local Node diagnostic source is incomplete")?;
+    write_private_diagnostic_artifact(destination_path, &contents)
+}
+
+fn remove_sensitive_node_diagnostic_report_fields(value: &mut JsonValue) {
+    match value {
+        JsonValue::Object(fields) => {
+            for field in [
+                "environmentVariables",
+                "networkInterfaces",
+                "localEndpoint",
+                "remoteEndpoint",
+            ] {
+                fields.remove(field);
+            }
+            for value in fields.values_mut() {
+                remove_sensitive_node_diagnostic_report_fields(value);
+            }
+        },
+        JsonValue::Array(values) => {
+            for value in values {
+                remove_sensitive_node_diagnostic_report_fields(value);
+            }
+        },
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {},
+    }
+}
+
+fn try_publish_node_diagnostic_report(
+    paths: &NodeDiagnosticReportPaths,
+    source_identity: DiagnosticFileIdentity,
+) -> anyhow::Result<bool> {
+    let Some(contents) = read_private_diagnostic_artifact(
+        &paths.source_path,
+        MAX_DIAGNOSTIC_REPORT_BYTES,
+        ExpectedDiagnosticSource::Exact(source_identity),
+    )?
+    else {
+        return Ok(false);
+    };
+    let mut report = match serde_json::from_slice::<JsonValue>(&contents) {
+        Ok(report) => report,
+        Err(_) => return Ok(false),
+    };
+    remove_sensitive_node_diagnostic_report_fields(&mut report);
+    let report = serde_json::to_vec(&report)
+        .context("Failed to serialize sanitized local Node diagnostic report")?;
+    anyhow::ensure!(
+        report.len() as u64 <= MAX_DIAGNOSTIC_REPORT_BYTES,
+        "Sanitized local Node diagnostic report exceeded its size limit"
+    );
+    write_private_diagnostic_artifact(&paths.destination_path, &report)?;
+    Ok(true)
+}
+
+async fn publish_node_diagnostic_report(
+    paths: NodeDiagnosticReportPaths,
+    source_identity: DiagnosticFileIdentity,
+    source_owner: Arc<InnerLocalNodeExecutor>,
+) -> bool {
+    tokio::time::timeout(DIAGNOSTIC_TRIGGER_TIMEOUT, async {
+        loop {
+            let attempt_paths = paths.clone();
+            let attempt_source_owner = source_owner.clone();
+            // A timed-out blocking read can outlive this async task. Keep its
+            // generation tempdir alive until the read actually returns.
+            let result = tokio::task::spawn_blocking(move || {
+                let result = try_publish_node_diagnostic_report(&attempt_paths, source_identity);
+                drop(attempt_source_owner);
+                result
+            })
+            .await;
+            match result {
+                Ok(Ok(true)) => return true,
+                Ok(Ok(false)) => tokio::time::sleep(DIAGNOSTIC_ARTIFACT_POLL_INTERVAL).await,
+                Ok(Err(_)) | Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn trigger_node_diagnostic_report(pid: u32) -> FirstMissDiagnosticOutcome {
+    if pid == 0 {
+        return FirstMissDiagnosticOutcome::DiagnosticReportInvalidPid;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return FirstMissDiagnosticOutcome::DiagnosticReportInvalidPid;
+    };
+    // The child is launched with SIGUSR2 diagnostic-report handling enabled.
+    let result = unsafe { libc::kill(pid, libc::SIGUSR2) };
+    if result == 0 {
+        FirstMissDiagnosticOutcome::DiagnosticReportRequested
+    } else {
+        FirstMissDiagnosticOutcome::DiagnosticReportRequestFailed
+    }
+}
+
+#[cfg(not(unix))]
+fn trigger_node_diagnostic_report(_pid: u32) -> FirstMissDiagnosticOutcome {
+    FirstMissDiagnosticOutcome::DiagnosticReportUnsupported
+}
+
+#[cfg(unix)]
+async fn connect_main_thread_profiler(path: &Path) -> std::io::Result<UnixStream> {
+    let started_at = Instant::now();
+    loop {
+        match UnixStream::connect(path).await {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) && started_at.elapsed() < DIAGNOSTIC_PROFILE_CONNECT_TIMEOUT =>
+            {
+                let remaining =
+                    DIAGNOSTIC_PROFILE_CONNECT_TIMEOUT.saturating_sub(started_at.elapsed());
+                tokio::time::sleep(remaining.min(DIAGNOSTIC_PROFILE_CONNECT_RETRY_INTERVAL)).await;
+            },
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn trigger_main_thread_profile(
+    diagnostic_paths: &NodeDiagnosticPaths,
+    source_owner: Arc<InnerLocalNodeExecutor>,
+) -> FirstMissDiagnosticOutcome {
+    let result = tokio::time::timeout(DIAGNOSTIC_TRIGGER_TIMEOUT, async {
+        let mut stream = connect_main_thread_profiler(&diagnostic_paths.control_path).await?;
+        stream.write_all(b"profile\n").await?;
+        // The Worker validates the complete command at EOF. Half-close the
+        // request side while keeping the response side open.
+        stream.shutdown().await?;
+        let mut response = Vec::new();
+        stream
+            .take(MAX_DIAGNOSTIC_CONTROL_RESPONSE_BYTES + 1)
+            .read_to_end(&mut response)
+            .await?;
+        Ok::<_, std::io::Error>(response)
+    })
+    .await;
+    let response = match result {
+        Err(_) => return FirstMissDiagnosticOutcome::CpuProfileTimeout,
+        Ok(Err(_)) => return FirstMissDiagnosticOutcome::CpuProfileTransportFailed,
+        Ok(Ok(response)) => response,
+    };
+    if response.len() as u64 > MAX_DIAGNOSTIC_CONTROL_RESPONSE_BYTES {
+        return FirstMissDiagnosticOutcome::CpuProfileResponseTooLarge;
+    }
+    match response.as_slice() {
+        b"completed\n" => {
+            let source_path = diagnostic_paths.profile_source_path.clone();
+            let destination_path = diagnostic_paths.profile_path.clone();
+            let copy_source_owner = source_owner.clone();
+            match tokio::time::timeout(
+                DIAGNOSTIC_FILESYSTEM_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    // `spawn_blocking` continues after an async timeout, so it
+                    // must retain the generation-local source directory.
+                    let result = copy_private_diagnostic_artifact(
+                        &source_path,
+                        &destination_path,
+                        MAX_DIAGNOSTIC_PROFILE_BYTES,
+                    );
+                    drop(copy_source_owner);
+                    result
+                }),
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => FirstMissDiagnosticOutcome::CpuProfileCompleted,
+                Err(_) | Ok(Err(_)) | Ok(Ok(Err(_))) => {
+                    FirstMissDiagnosticOutcome::CpuProfileWriteFailed
+                },
+            }
+        },
+        b"already_started\n" => FirstMissDiagnosticOutcome::CpuProfileAlreadyStarted,
+        b"enable_failed\n" => FirstMissDiagnosticOutcome::CpuProfileEnableFailed,
+        b"start_failed\n" => FirstMissDiagnosticOutcome::CpuProfileStartFailed,
+        b"stop_failed\n" => FirstMissDiagnosticOutcome::CpuProfileStopFailed,
+        b"profile_too_large\n" => FirstMissDiagnosticOutcome::CpuProfileTooLarge,
+        b"write_failed\n" => FirstMissDiagnosticOutcome::CpuProfileWriteFailed,
+        _ => FirstMissDiagnosticOutcome::CpuProfileInvalidResponse,
+    }
+}
+
+#[cfg(not(unix))]
+async fn trigger_main_thread_profile(
+    _diagnostic_paths: &NodeDiagnosticPaths,
+    _source_owner: Arc<InnerLocalNodeExecutor>,
+) -> FirstMissDiagnosticOutcome {
+    FirstMissDiagnosticOutcome::CpuProfileUnsupported
+}
+
 struct ActiveRequestGuard {
     inner: Arc<InnerLocalNodeExecutor>,
+    diagnostic_id: Option<u64>,
     outcome: &'static str,
 }
 
@@ -665,13 +1662,42 @@ impl Drop for WaitingRequestGuard {
 }
 
 impl ActiveRequestGuard {
-    fn new(inner: Arc<InnerLocalNodeExecutor>) -> Self {
-        inner.active_requests.fetch_add(1, Ordering::Relaxed);
-        crate::metrics::log_local_node_request_start();
-        Self {
+    fn new(inner: Arc<InnerLocalNodeExecutor>, metadata: RequestDiagnosticMetadata) -> Self {
+        let mut guard = Self {
             inner,
+            diagnostic_id: None,
             outcome: "internal_error",
-        }
+        };
+        guard.inner.active_requests.fetch_add(1, Ordering::Relaxed);
+        let diagnostic_id = {
+            let mut active = guard
+                .inner
+                .active_request_diagnostics
+                .lock()
+                .expect("Local Node active-request diagnostic lock is poisoned");
+            if active.len() >= MAX_DIAGNOSTIC_ACTIVE_REQUESTS {
+                None
+            } else {
+                let id = guard
+                    .inner
+                    .next_active_request_id
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        current.checked_add(1)
+                    })
+                    .expect("Local Node active-request diagnostic id overflow");
+                active.insert(
+                    id,
+                    ActiveRequestDiagnostic {
+                        metadata,
+                        started_at: Instant::now(),
+                    },
+                );
+                Some(id)
+            }
+        };
+        guard.diagnostic_id = diagnostic_id;
+        crate::metrics::log_local_node_request_start();
+        guard
     }
 
     fn set_outcome(&mut self, outcome: &'static str) {
@@ -681,6 +1707,15 @@ impl ActiveRequestGuard {
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
+        if let Some(diagnostic_id) = self.diagnostic_id {
+            let removed = self
+                .inner
+                .active_request_diagnostics
+                .lock()
+                .expect("Local Node active-request diagnostic lock is poisoned")
+                .remove(&diagnostic_id);
+            assert!(removed.is_some());
+        }
         let generation_previous = self.inner.active_requests.fetch_sub(1, Ordering::Relaxed);
         assert!(generation_previous > 0);
         if generation_previous == 1 {
@@ -756,6 +1791,13 @@ impl LocalNodeExecutorConfig {
 }
 
 impl InnerLocalNodeExecutor {
+    fn claim_first_miss_diagnostics(&self) -> bool {
+        self.diagnostic_paths.is_some()
+            && !self
+                .first_miss_diagnostics_started
+                .swap(true, Ordering::AcqRel)
+    }
+
     async fn wait_until_idle(&self) {
         loop {
             let notified = self.idle.notified();
@@ -785,8 +1827,19 @@ impl InnerLocalNodeExecutor {
 
     async fn new(generation: u64, config: &LocalNodeExecutorConfig) -> anyhow::Result<Self> {
         tracing::info!("Initializing inner local node executor");
+        if let Some(diagnostics_dir) = &config.diagnostics_dir {
+            // Retention is lifecycle telemetry, not a prerequisite for child
+            // startup or replacement.
+            spawn_diagnostic_artifact_pruning(
+                diagnostics_dir.clone(),
+                config.diagnostic_pruning_in_progress.clone(),
+            );
+        }
         // Create a single temp directory for both source files and Node.js temp files
         let source_dir = TempDir::new()?;
+        let diagnostic_paths = config.diagnostics_dir.as_deref().map(|diagnostics_dir| {
+            NodeDiagnosticPaths::new(&source_dir, diagnostics_dir, generation)
+        });
         let (source, source_map) =
             node_executor_file("local.cjs").expect("local.cjs not generated!");
         let source_map = source_map.context("Missing local.cjs.map")?;
@@ -819,8 +1872,14 @@ impl InnerLocalNodeExecutor {
             client_builder = client_builder.windows_named_pipe(socket_path.clone());
         }
         let client = client_builder.build()?;
-        let server_handle =
-            Self::start_node_with_listener(config, &source_path, &source_dir, &socket_path).await?;
+        let server_handle = Self::start_node_with_listener(
+            config,
+            &source_path,
+            &source_dir,
+            &socket_path,
+            diagnostic_paths.as_ref(),
+        )
+        .await?;
         let pid = server_handle
             .id()
             .context("Local Node executor child has no process id")?;
@@ -877,6 +1936,10 @@ impl InnerLocalNodeExecutor {
                     retained_external_packages: AtomicU64::new(0),
                     imported_source_packages: AtomicU64::new(0),
                     registered_stack_roots: AtomicU64::new(0),
+                    first_miss_diagnostics_started: AtomicBool::new(false),
+                    next_active_request_id: AtomicU64::new(0),
+                    active_request_diagnostics: StdMutex::new(BTreeMap::new()),
+                    diagnostic_paths,
                     server_handle: Mutex::new(server_handle),
                     client,
                 });
@@ -950,18 +2013,13 @@ impl InnerLocalNodeExecutor {
                     )
                 })?;
 
-        if output_too_large
-            || !status.success()
-            || (!version.starts_with(b"v20.")
-                && !version.starts_with(b"v22.")
-                && !version.starts_with(b"v24."))
-        {
+        if output_too_large || !status.success() || !version.starts_with(b"v24.") {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "DeploymentNotConfiguredForNodeActions",
                 "Deployment is not configured to deploy \"use node\" actions. \
-                 Node.js v20, 22, or 24 is not installed. \
-                 Install a supported Node.js version with nvm (https://github.com/nvm-sh/nvm) \
-                 to deploy Node.js actions."
+                 Node.js v24 is not installed. \
+                 Install Node.js v24 with nvm (https://github.com/nvm-sh/nvm) \
+                  to deploy Node.js actions."
             ))
         }
         Ok(())
@@ -1002,6 +2060,108 @@ impl InnerLocalNodeExecutor {
     async fn terminate(&self) -> anyhow::Result<ChildTerminationObservation> {
         let mut child = self.server_handle.lock().await;
         child.terminate().await
+    }
+
+    async fn owns_child_pid(&self) -> bool {
+        self.server_handle
+            .lock()
+            .await
+            .child
+            .as_ref()
+            .and_then(Child::id)
+            == Some(self.pid)
+    }
+
+    async fn read_owned_process_stat(&self) -> anyhow::Result<Option<ProcessStatSnapshot>> {
+        anyhow::ensure!(
+            self.owns_child_pid().await,
+            "Local Node child was reaped before process sampling"
+        );
+        let process = read_process_stat(self.pid).await?;
+        // Retirement may reap the child while /proc is being read. Verify the
+        // owner again so PID reuse can never turn another process into evidence
+        // for this generation.
+        anyhow::ensure!(
+            self.owns_child_pid().await,
+            "Local Node child was reaped during process sampling"
+        );
+        Ok(process)
+    }
+
+    async fn read_owned_thread_stats(
+        &self,
+        expected_start_time_ticks: u64,
+    ) -> anyhow::Result<Option<(Vec<ThreadStatSnapshot>, bool)>> {
+        anyhow::ensure!(
+            self.owns_child_pid().await,
+            "Local Node child was reaped before thread sampling"
+        );
+        let threads = read_thread_stats(self.pid, expected_start_time_ticks).await?;
+        anyhow::ensure!(
+            self.owns_child_pid().await,
+            "Local Node child was reaped during thread sampling"
+        );
+        Ok(threads)
+    }
+
+    async fn request_diagnostic_report(self: &Arc<Self>) -> FirstMissDiagnosticOutcome {
+        let report = self
+            .diagnostic_paths
+            .as_ref()
+            .expect("First-miss report request has no diagnostic paths")
+            .report
+            .clone();
+        let report_source_path = report.source_path.clone();
+        let setup_source_owner = self.clone();
+        let source_identity = match tokio::time::timeout(
+            DIAGNOSTIC_FILESYSTEM_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let result = prepare_private_diagnostic_file(&report_source_path);
+                // The blocking create can continue after its async timeout.
+                drop(setup_source_owner);
+                result
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Ok(source_identity))) => source_identity,
+            Err(_) | Ok(Err(_)) | Ok(Ok(Err(_))) => {
+                return FirstMissDiagnosticOutcome::DiagnosticReportRequestFailed;
+            },
+        };
+        let child = self.server_handle.lock().await;
+        let Some(pid) = child.child.as_ref().and_then(Child::id) else {
+            return FirstMissDiagnosticOutcome::DiagnosticReportRequestFailed;
+        };
+        if pid != self.pid {
+            return FirstMissDiagnosticOutcome::DiagnosticReportInvalidPid;
+        }
+        // ManagedChild retains an exited child until it is reaped, so this PID
+        // cannot be reused while the owner lock is held.
+        let outcome = trigger_node_diagnostic_report(pid);
+        drop(child);
+        if matches!(
+            outcome,
+            FirstMissDiagnosticOutcome::DiagnosticReportRequested
+        ) {
+            let source_owner = self.clone();
+            tokio::spawn(async move {
+                let publication_outcome = if publish_node_diagnostic_report(
+                    report,
+                    source_identity,
+                    source_owner,
+                )
+                .await
+                {
+                    FirstMissDiagnosticOutcome::DiagnosticReportCompleted
+                } else {
+                    tracing::warn!("Failed to publish local Node diagnostic report");
+                    FirstMissDiagnosticOutcome::DiagnosticReportWriteFailed
+                };
+                crate::metrics::log_local_node_first_miss_diagnostic(publication_outcome);
+            });
+        }
+        outcome
     }
 
     async fn terminate_child(
@@ -1073,6 +2233,7 @@ impl InnerLocalNodeExecutor {
         source_path: &Path,
         temp_dir: &TempDir,
         socket_path: &Path,
+        diagnostic_paths: Option<&NodeDiagnosticPaths>,
     ) -> anyhow::Result<Child> {
         let preferred_node_version = NVMRC_VERSION.trim();
 
@@ -1090,15 +2251,37 @@ impl InnerLocalNodeExecutor {
         cmd.arg(format!(
             "--max-old-space-size={}",
             config.max_old_space_size_mib
-        ))
-            .arg(source_path)
+        ));
+        #[cfg(unix)]
+        if let Some(report) = diagnostic_paths.map(|paths| &paths.report) {
+            cmd.arg("--report-on-signal")
+                .arg("--report-signal=SIGUSR2")
+                .arg("--report-exclude-env")
+                .arg("--report-exclude-network")
+                .arg("--report-directory")
+                .arg(temp_dir.path())
+                .arg("--report-filename")
+                .arg(&report.filename);
+        }
+        cmd.arg(source_path)
             .arg("--ipc-path")
             .arg(socket_path)
             .arg("--tempdir")
-            .arg(temp_dir.path())
-            // Function console output uses the bounded response protocol.
-            // Do not let direct user writes bypass it into infrastructure logs.
-            .stdin(Stdio::null())
+            .arg(temp_dir.path());
+        #[cfg(unix)]
+        if let Some(diagnostic_paths) = diagnostic_paths {
+            cmd.arg("--diagnostic-control-path")
+                .arg(&diagnostic_paths.control_path)
+                .arg("--diagnostic-profile-path")
+                .arg(&diagnostic_paths.profile_source_path)
+                .arg("--diagnostic-profile-duration-ms")
+                .arg(DIAGNOSTIC_PROFILE_DURATION_MS.to_string());
+        }
+        #[cfg(not(unix))]
+        let _ = diagnostic_paths;
+        // Function console output uses the bounded response protocol.
+        // Do not let direct user writes bypass it into infrastructure logs.
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
@@ -1124,6 +2307,8 @@ impl LocalNodeExecutor {
         node_process_timeout: Duration,
         memory_pressure: MemoryPressureSignal,
     ) -> anyhow::Result<Self> {
+        crate::metrics::initialize_local_node_first_miss_diagnostic_counters();
+        let diagnostics_dir = prepare_diagnostic_directory().await;
         let config = LocalNodeExecutorConfig {
             node_process_timeout,
             callback_initial_backoff: None,
@@ -1144,6 +2329,8 @@ impl LocalNodeExecutor {
                 *LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
             )
             .context("Local Node executor package threshold does not fit u64")?,
+            diagnostics_dir,
+            diagnostic_pruning_in_progress: Arc::new(AtomicBool::new(false)),
         };
         config.validate()?;
         let executor = Self {
@@ -1175,9 +2362,13 @@ impl LocalNodeExecutor {
 
     async fn acquire_inner(
         &self,
+        request_metadata: RequestDiagnosticMetadata,
     ) -> anyhow::Result<(Arc<InnerLocalNodeExecutor>, ActiveRequestGuard, bool)> {
         loop {
-            match self.acquire_existing_inner().await? {
+            match self
+                .acquire_existing_inner(request_metadata.clone())
+                .await?
+            {
                 InnerAcquisition::Ready { inner, guard } => {
                     return Ok((inner, guard, false));
                 },
@@ -1191,7 +2382,10 @@ impl LocalNodeExecutor {
         // still inspect the generation slot without waiting for its replacement.
         let _startup_guard = self.startup_lock.lock().await;
         loop {
-            match self.acquire_existing_inner().await? {
+            match self
+                .acquire_existing_inner(request_metadata.clone())
+                .await?
+            {
                 InnerAcquisition::Ready { inner, guard } => {
                     return Ok((inner, guard, false));
                 },
@@ -1286,11 +2480,14 @@ impl LocalNodeExecutor {
             startup_seconds = startup_elapsed.as_secs_f64(),
             "Started local Node executor generation"
         );
-        let request_guard = ActiveRequestGuard::new(replacement.clone());
+        let request_guard = ActiveRequestGuard::new(replacement.clone(), request_metadata);
         Ok((replacement, request_guard, true))
     }
 
-    async fn acquire_existing_inner(&self) -> anyhow::Result<InnerAcquisition> {
+    async fn acquire_existing_inner(
+        &self,
+        request_metadata: RequestDiagnosticMetadata,
+    ) -> anyhow::Result<InnerAcquisition> {
         let state = self.state.lock().await;
         anyhow::ensure!(
             !self.shutting_down.load(Ordering::Acquire),
@@ -1304,7 +2501,7 @@ impl LocalNodeExecutor {
             // Selection and the active increment happen under the generation
             // slot lock, so proactive retirement cannot observe zero and close
             // admission between these operations.
-            let guard = ActiveRequestGuard::new(inner.clone());
+            let guard = ActiveRequestGuard::new(inner.clone(), request_metadata);
             return Ok(InnerAcquisition::Ready { inner, guard });
         }
         if let Some(retiring) = &state.retiring {
@@ -1516,12 +2713,11 @@ impl LocalNodeExecutor {
         Ok(true)
     }
 
-    async fn drain_and_retire_inner_state(
+    async fn start_draining_inner_state(
         state: &Arc<Mutex<LocalNodeExecutorState>>,
         expected: &Arc<InnerLocalNodeExecutor>,
-        diagnostics: GenerationRetirementDiagnostics,
-    ) -> anyhow::Result<bool> {
-        let reason = diagnostics.reason;
+        reason: GenerationRetirementReason,
+    ) -> bool {
         let started_draining = {
             let state = state.lock().await;
             if !state
@@ -1530,7 +2726,7 @@ impl LocalNodeExecutor {
                 .is_some_and(|current| Arc::ptr_eq(current, expected))
             {
                 crate::metrics::log_local_node_retirement_decision(reason.as_str(), "not_current");
-                return Ok(false);
+                return false;
             }
             let started_draining = !expected.retirement_requested.swap(true, Ordering::AcqRel);
             if started_draining {
@@ -1543,12 +2739,20 @@ impl LocalNodeExecutor {
         };
         if !started_draining {
             crate::metrics::log_local_node_retirement_decision(reason.as_str(), "already_draining");
-            return Ok(false);
+            return false;
         }
 
         // Admission and the active-request increment share the state lock with
         // this transition. Once draining is visible, the count can only fall.
         crate::metrics::log_local_node_retirement_decision(reason.as_str(), "drain_started");
+        true
+    }
+
+    async fn finish_draining_inner_state(
+        state: &Arc<Mutex<LocalNodeExecutorState>>,
+        expected: &Arc<InnerLocalNodeExecutor>,
+        diagnostics: GenerationRetirementDiagnostics,
+    ) -> anyhow::Result<bool> {
         let state = state.clone();
         let expected = expected.clone();
         let retirement = tokio::spawn(async move {
@@ -1568,6 +2772,240 @@ impl LocalNodeExecutor {
         }
     }
 
+    #[cfg(all(test, unix))]
+    async fn drain_and_retire_inner_state(
+        state: &Arc<Mutex<LocalNodeExecutorState>>,
+        expected: &Arc<InnerLocalNodeExecutor>,
+        diagnostics: GenerationRetirementDiagnostics,
+    ) -> anyhow::Result<bool> {
+        if !Self::start_draining_inner_state(state, expected, diagnostics.reason).await {
+            return Ok(false);
+        }
+        Self::finish_draining_inner_state(state, expected, diagnostics).await
+    }
+
+    fn spawn_first_miss_diagnostics(
+        expected: &Arc<InnerLocalNodeExecutor>,
+        rss_bytes: Option<u64>,
+        previous_process: Option<ProcessStatBaseline>,
+        config: &LocalNodeExecutorConfig,
+    ) {
+        if !expected.claim_first_miss_diagnostics() {
+            return;
+        }
+
+        let expected = expected.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            let captured_at = Instant::now();
+            let (active_request_count, active_requests) = {
+                let active = expected
+                    .active_request_diagnostics
+                    .lock()
+                    .expect("Local Node active-request diagnostic lock is poisoned");
+                // Admissions increment the aggregate count before taking this lock,
+                // while completions remove metadata before decrementing it. Reading
+                // the count under the metadata lock cannot undercount these entries.
+                let active_request_count = expected.active_requests.load(Ordering::Relaxed);
+                let active_requests = active
+                    .values()
+                    .map(|request| ActiveRequestDiagnosticSnapshot {
+                        request_kind: request.metadata.request_kind,
+                        module_path: request.metadata.module_path.clone(),
+                        function_name: request.metadata.function_name.clone(),
+                        elapsed_ms: u64::try_from(
+                            captured_at.duration_since(request.started_at).as_millis(),
+                        )
+                        .unwrap_or(u64::MAX),
+                    })
+                    .collect::<Vec<_>>();
+                (active_request_count, active_requests)
+            };
+            let active_requests_truncated = active_request_count > active_requests.len();
+            let generation = expected.generation;
+            let pid = expected.pid;
+            let generation_age_ms =
+                u64::try_from(expected.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let imported_source_packages =
+                expected.imported_source_packages.load(Ordering::Relaxed);
+            let diagnostic_paths = expected
+                .diagnostic_paths
+                .clone()
+                .expect("Claimed first-miss diagnostics have no paths");
+            tracing::warn!(
+                generation,
+                pid,
+                generation_age_seconds = expected.started_at.elapsed().as_secs_f64(),
+                active_requests = active_request_count,
+                active_requests_truncated,
+                "Started first-miss local Node executor diagnostics"
+            );
+
+            let report_expected = expected.clone();
+            tokio::spawn(async move {
+                let outcome = match tokio::time::timeout(
+                    DIAGNOSTIC_REPORT_REQUEST_TIMEOUT,
+                    report_expected.request_diagnostic_report(),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => FirstMissDiagnosticOutcome::DiagnosticReportRequestFailed,
+                };
+                crate::metrics::log_local_node_first_miss_diagnostic(outcome);
+            });
+
+            let profile_paths = diagnostic_paths.clone();
+            let profile_source_owner = expected.clone();
+            tokio::spawn(async move {
+                let outcome =
+                    trigger_main_thread_profile(&profile_paths, profile_source_owner).await;
+                crate::metrics::log_local_node_first_miss_diagnostic(outcome);
+            });
+
+            let captured_at_unix_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                Ok(duration) => duration.as_millis(),
+                Err(_) => {
+                    crate::metrics::log_local_node_first_miss_diagnostic(
+                        FirstMissDiagnosticOutcome::ProcSnapshotClockFailure,
+                    );
+                    return;
+                },
+            };
+            let (process, process_stat_outcome, process_sampled_at) = match tokio::time::timeout(
+                DIAGNOSTIC_PROCESS_SNAPSHOT_TIMEOUT,
+                expected.read_owned_process_stat(),
+            )
+            .await
+            {
+                Ok(Ok(Some(process))) => (
+                    Some(process),
+                    DiagnosticSnapshotOutcome::Success,
+                    Some(Instant::now()),
+                ),
+                Ok(Ok(None)) => (None, DiagnosticSnapshotOutcome::Unsupported, None),
+                Ok(Err(_)) => (None, DiagnosticSnapshotOutcome::Failure, None),
+                Err(_) => (None, DiagnosticSnapshotOutcome::Timeout, None),
+            };
+            let process_cpu_delta = process.as_ref().and_then(|current| {
+                let current_sampled_at = process_sampled_at?;
+                let previous = previous_process.as_ref()?;
+                let previous_process = previous.process.as_ref()?;
+                if current.start_time_ticks != previous_process.start_time_ticks {
+                    return None;
+                }
+                Some(ProcessCpuDelta {
+                    user_ticks: current
+                        .user_ticks
+                        .checked_sub(previous_process.user_ticks)?,
+                    system_ticks: current
+                        .system_ticks
+                        .checked_sub(previous_process.system_ticks)?,
+                    interval_ms: u64::try_from(
+                        current_sampled_at
+                            .saturating_duration_since(previous.sampled_at)
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX),
+                })
+            });
+            let (threads, threads_truncated, thread_stat_outcome) = match process.as_ref() {
+                Some(process) => match tokio::time::timeout(
+                    DIAGNOSTIC_PROCESS_SNAPSHOT_TIMEOUT,
+                    expected.read_owned_thread_stats(process.start_time_ticks),
+                )
+                .await
+                {
+                    Ok(Ok(Some((threads, truncated)))) => {
+                        (threads, truncated, DiagnosticSnapshotOutcome::Success)
+                    },
+                    Ok(Ok(None)) => (Vec::new(), false, DiagnosticSnapshotOutcome::Unsupported),
+                    Ok(Err(_)) => (Vec::new(), false, DiagnosticSnapshotOutcome::Failure),
+                    Err(_) => (Vec::new(), false, DiagnosticSnapshotOutcome::Timeout),
+                },
+                None => (Vec::new(), false, process_stat_outcome),
+            };
+            let artifact = FirstMissDiagnosticArtifact {
+                schema_version: 1,
+                captured_at_unix_ms,
+                generation,
+                pid,
+                generation_age_ms,
+                active_request_count,
+                active_requests_truncated,
+                active_requests,
+                rss_bytes,
+                old_space_limit_bytes: config.old_space_bytes(),
+                rss_retirement_threshold_bytes: config.max_rss_bytes,
+                generation_age_retirement_threshold_ms: u64::try_from(
+                    config.max_generation_age.as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+                imported_source_packages,
+                imported_source_package_retirement_threshold: config.max_imported_source_packages,
+                process_stat_outcome,
+                process,
+                process_cpu_delta,
+                thread_stat_outcome,
+                threads_truncated,
+                threads,
+            };
+            let outcome = match serde_json::to_vec(&artifact) {
+                Ok(contents) => match tokio::time::timeout(
+                    DIAGNOSTIC_FILESYSTEM_TIMEOUT,
+                    tokio::task::spawn_blocking(move || {
+                        write_private_diagnostic_artifact(
+                            &diagnostic_paths.first_miss_path,
+                            &contents,
+                        )
+                    }),
+                )
+                .await
+                {
+                    Ok(Ok(Ok(()))) => FirstMissDiagnosticOutcome::ProcSnapshotCompleted,
+                    Err(_) | Ok(Err(_)) | Ok(Ok(Err(_))) => {
+                        FirstMissDiagnosticOutcome::ProcSnapshotWriteFailed
+                    },
+                },
+                Err(_) => FirstMissDiagnosticOutcome::ProcSnapshotSerializationFailed,
+            };
+            crate::metrics::log_local_node_first_miss_diagnostic(outcome);
+        });
+    }
+
+    fn spawn_process_stat_sample(
+        expected: &Arc<InnerLocalNodeExecutor>,
+        sequence: u64,
+        latest: &Arc<StdMutex<Option<ProcessStatBaseline>>>,
+    ) {
+        let expected = expected.clone();
+        let latest = latest.clone();
+        tokio::spawn(async move {
+            let process = match tokio::time::timeout(
+                DIAGNOSTIC_PROCESS_SNAPSHOT_TIMEOUT,
+                expected.read_owned_process_stat(),
+            )
+            .await
+            {
+                Ok(Ok(process)) => process,
+                Err(_) | Ok(Err(_)) => None,
+            };
+            let mut latest = latest
+                .lock()
+                .expect("Local Node process-stat diagnostic lock is poisoned");
+            if latest
+                .as_ref()
+                .is_none_or(|previous| previous.sequence < sequence)
+            {
+                *latest = Some(ProcessStatBaseline {
+                    sequence,
+                    sampled_at: Instant::now(),
+                    process,
+                });
+            }
+        });
+    }
+
     fn spawn_watchdog(&self, inner: &Arc<InnerLocalNodeExecutor>) {
         let state = Arc::downgrade(&self.state);
         let expected = Arc::downgrade(inner);
@@ -1585,6 +3023,8 @@ impl LocalNodeExecutor {
         let mut consecutive_misses = 0;
         let mut previous_package_stats = NodePackageCacheStats::default();
         let mut previous_stack_stats = NodeStackTraceStats::default();
+        let latest_process_stat = Arc::new(StdMutex::new(None));
+        let mut process_stat_sequence = 0u64;
         let mut memory_pressure_started_at = None;
         loop {
             tokio::time::sleep(config.watchdog_interval).await;
@@ -1665,10 +3105,42 @@ impl LocalNodeExecutor {
                         &mut previous_stack_stats,
                     );
                 }
+                if expected.diagnostic_paths.is_some()
+                    && !expected
+                        .first_miss_diagnostics_started
+                        .load(Ordering::Acquire)
+                {
+                    process_stat_sequence = process_stat_sequence
+                        .checked_add(1)
+                        .expect("Local Node process-stat sample sequence overflow");
+                    Self::spawn_process_stat_sample(
+                        &expected,
+                        process_stat_sequence,
+                        &latest_process_stat,
+                    );
+                }
                 false
             } else {
                 consecutive_misses += 1;
                 crate::metrics::set_local_node_consecutive_health_misses(consecutive_misses);
+                if consecutive_misses == 1 {
+                    // A CPU-delta baseline is optional evidence. Never block the
+                    // watchdog behind a sample task that was descheduled while
+                    // publishing it.
+                    let previous_process = match latest_process_stat.try_lock() {
+                        Ok(latest) => latest.clone(),
+                        Err(std::sync::TryLockError::WouldBlock) => None,
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            panic!("Local Node process-stat diagnostic lock is poisoned")
+                        },
+                    };
+                    Self::spawn_first_miss_diagnostics(
+                        &expected,
+                        rss_bytes,
+                        previous_process,
+                        &config,
+                    );
+                }
                 consecutive_misses >= config.watchdog_failure_threshold
             };
 
@@ -1683,24 +3155,10 @@ impl LocalNodeExecutor {
                 memory_pressure_active_for,
             );
             drop(current_state);
-            if let Some(reason) = retirement_reason {
-                if Self::drain_and_retire_inner_state(
-                    &state,
-                    &expected,
-                    GenerationRetirementDiagnostics::proactive(reason),
-                )
-                .await
-                .is_err()
-                {
-                    tracing::error!(
-                        generation = expected.generation,
-                        reason = reason.as_str(),
-                        "Failed to drain and retire local Node executor generation"
-                    );
-                }
-                return;
-            }
             if should_retire_unhealthy {
+                // Do not start a new graceful drain on the terminal miss. An
+                // idle drain could otherwise win the slot race and misclassify
+                // this unhealthy retirement as proactive.
                 if Self::retire_inner_state(
                     &state,
                     &expected,
@@ -1717,6 +3175,29 @@ impl LocalNodeExecutor {
                     );
                 }
                 return;
+            }
+            if let Some(reason) = retirement_reason
+                && !expected.retirement_requested.load(Ordering::Acquire)
+                && Self::start_draining_inner_state(&state, &expected, reason).await
+            {
+                let drain_state = state.clone();
+                let drain_expected = expected.clone();
+                tokio::spawn(async move {
+                    if Self::finish_draining_inner_state(
+                        &drain_state,
+                        &drain_expected,
+                        GenerationRetirementDiagnostics::proactive(reason),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::error!(
+                            generation = drain_expected.generation,
+                            reason = reason.as_str(),
+                            "Failed to drain and retire local Node executor generation"
+                        );
+                    }
+                });
             }
         }
     }
@@ -1839,9 +3320,10 @@ impl NodeExecutor for LocalNodeExecutor {
             "Local Node executor is shutting down"
         );
         let request_kind = request.kind();
+        let request_metadata = request_diagnostic_metadata(&request);
         let request_json = JsonValue::try_from(request)?;
         let waiting_guard = WaitingRequestGuard::new();
-        let (inner, mut request_guard, created) = self.acquire_inner().await?;
+        let (inner, mut request_guard, created) = self.acquire_inner(request_metadata).await?;
         waiting_guard.finish();
         if created {
             self.spawn_watchdog(&inner);
@@ -2078,8 +3560,12 @@ impl NodeExecutor for LocalNodeExecutor {
 #[cfg(all(test, unix))]
 mod tests {
     use std::{
+        fs::FileTimes,
         future,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{
+            symlink,
+            PermissionsExt,
+        },
     };
 
     use futures::future::join_all;
@@ -2107,6 +3593,16 @@ mod tests {
             memory_pressure_grace: Duration::from_secs(5),
             max_generation_age: Duration::from_secs(60),
             max_imported_source_packages: 100,
+            diagnostics_dir: None,
+            diagnostic_pruning_in_progress: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn test_request_metadata() -> RequestDiagnosticMetadata {
+        RequestDiagnosticMetadata {
+            request_kind: "build_deps",
+            module_path: None,
+            function_name: None,
         }
     }
 
@@ -2319,6 +3815,307 @@ mod tests {
         assert!(parse_process_rss("VmRSS:\t1 kB\nVmRSS:\t2 kB\n").is_err());
     }
 
+    #[test]
+    fn process_stat_parser_handles_spaces_and_parentheses_in_command() {
+        let process = parse_process_stat(
+            "123 (node worker (main)) R 1 2 3 4 5 6 7 8 9 10 101 202 13 14 15 16 8 18 303\n",
+        )
+        .unwrap();
+        assert_eq!(process.state, 'R');
+        assert_eq!(process.user_ticks, 101);
+        assert_eq!(process.system_ticks, 202);
+        assert_eq!(process.thread_count, 8);
+        assert_eq!(process.start_time_ticks, 303);
+
+        assert!(parse_process_stat("123 node R 1 2 3").is_err());
+        assert!(parse_process_stat("123 (node) running 1 2 3").is_err());
+        assert!(parse_process_stat("123 (node) R 1 2 3").is_err());
+    }
+
+    #[test]
+    fn private_diagnostic_directory_rejects_symlinks_and_nonempty_nonprivate_directories() {
+        let parent = TempDir::new().unwrap();
+        let directory = parent.path().join("artifacts");
+        create_private_diagnostic_directory(&directory).unwrap();
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let symlink_path = parent.path().join("artifact-link");
+        symlink(&directory, &symlink_path).unwrap();
+        assert!(create_private_diagnostic_directory(&symlink_path).is_err());
+
+        let nonempty_directory = parent.path().join("nonempty");
+        fs::create_dir(&nonempty_directory).unwrap();
+        fs::write(
+            nonempty_directory.join("node-report-existing.json"),
+            b"keep",
+        )
+        .unwrap();
+        fs::set_permissions(&nonempty_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(create_private_diagnostic_directory(&nonempty_directory).is_err());
+        assert_eq!(
+            fs::metadata(&nonempty_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn diagnostic_retention_ignores_unrecognized_recent_files_and_directories() {
+        let diagnostics_dir = TempDir::new().unwrap();
+        let old_modified = SystemTime::now()
+            .checked_sub(MIN_DIAGNOSTIC_ARTIFACT_PRUNE_AGE + Duration::from_secs(1))
+            .unwrap();
+        for index in 0..=MAX_DIAGNOSTIC_ARTIFACTS {
+            let path = diagnostics_dir
+                .path()
+                .join(format!("node-first-miss-{index}.json"));
+            fs::write(&path, b"diagnostic").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(old_modified))
+                .unwrap();
+        }
+        let recent_artifact = diagnostics_dir
+            .path()
+            .join("node-profile-recent.cpuprofile");
+        fs::write(&recent_artifact, b"diagnostic").unwrap();
+        let stale_partial = diagnostics_dir
+            .path()
+            .join("node-diagnostic-partial-stale.partial");
+        fs::write(&stale_partial, b"partial").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stale_partial)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old_modified))
+            .unwrap();
+        let recent_partial = diagnostics_dir
+            .path()
+            .join("node-first-miss-partial-recent.json.partial");
+        fs::write(&recent_partial, b"partial").unwrap();
+        let future_partial = diagnostics_dir
+            .path()
+            .join("node-diagnostic-partial-future.partial");
+        fs::write(&future_partial, b"partial").unwrap();
+        let future_modified = SystemTime::now()
+            .checked_add(MAX_DIAGNOSTIC_CLOCK_SKEW + Duration::from_secs(1))
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&future_partial)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(future_modified))
+            .unwrap();
+        let unrelated_file = diagnostics_dir.path().join("operator-notes.json");
+        fs::write(&unrelated_file, b"keep").unwrap();
+        let misleading_file = diagnostics_dir.path().join("node-report-keep.txt");
+        fs::write(&misleading_file, b"keep").unwrap();
+        let recognized_directory = diagnostics_dir
+            .path()
+            .join("node-profile-directory.cpuprofile");
+        fs::create_dir(&recognized_directory).unwrap();
+
+        prune_diagnostic_artifacts(diagnostics_dir.path()).unwrap();
+
+        let retained_artifacts = fs::read_dir(diagnostics_dir.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry.file_type().unwrap().is_file()
+                    && is_local_node_diagnostic_artifact(&entry.path())
+            })
+            .count();
+        assert_eq!(retained_artifacts, MAX_DIAGNOSTIC_ARTIFACTS);
+        assert!(recent_artifact.exists());
+        assert!(!stale_partial.exists());
+        assert!(recent_partial.exists());
+        assert!(future_partial.exists());
+        assert!(unrelated_file.exists());
+        assert!(misleading_file.exists());
+        assert!(recognized_directory.is_dir());
+    }
+
+    #[test]
+    fn diagnostic_copy_out_requires_complete_private_generation_local_sources() {
+        let source_dir = TempDir::new().unwrap();
+        let diagnostics_dir = TempDir::new().unwrap();
+        let paths = NodeDiagnosticPaths::new(&source_dir, diagnostics_dir.path(), 1);
+
+        assert_eq!(paths.report.source_path.parent(), Some(source_dir.path()));
+        assert_eq!(
+            paths.report.destination_path.parent(),
+            Some(diagnostics_dir.path())
+        );
+        assert_eq!(paths.profile_source_path.parent(), Some(source_dir.path()));
+        assert_eq!(paths.profile_path.parent(), Some(diagnostics_dir.path()));
+
+        fs::write(&paths.report.source_path, b"stale report").unwrap();
+        fs::set_permissions(&paths.report.source_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let stale_report_metadata = fs::metadata(&paths.report.source_path).unwrap();
+        let report_source_identity =
+            prepare_private_diagnostic_file(&paths.report.source_path).unwrap();
+        assert_eq!(
+            report_source_identity,
+            DiagnosticFileIdentity {
+                device: stale_report_metadata.dev(),
+                inode: stale_report_metadata.ino(),
+            }
+        );
+        assert_eq!(fs::metadata(&paths.report.source_path).unwrap().len(), 0);
+        assert_eq!(
+            fs::metadata(&paths.report.source_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::write(&paths.report.source_path, br#"{"complete":"#).unwrap();
+        assert!(
+            !try_publish_node_diagnostic_report(&paths.report, report_source_identity).unwrap()
+        );
+        assert!(!paths.report.destination_path.exists());
+
+        fs::write(
+            &paths.report.source_path,
+            br#"{
+                "complete": true,
+                "environmentVariables": {"SECRET": "value"},
+                "header": {"networkInterfaces": [{"address": "127.0.0.1"}]},
+                "libuv": [{
+                    "type": "tcp",
+                    "localEndpoint": {"host": "127.0.0.1", "port": 1},
+                    "remoteEndpoint": {"host": "127.0.0.1", "port": 2}
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(try_publish_node_diagnostic_report(&paths.report, report_source_identity).unwrap());
+        let published: JsonValue =
+            serde_json::from_slice(&fs::read(&paths.report.destination_path).unwrap()).unwrap();
+        assert_eq!(published["complete"], true);
+        assert!(published.get("environmentVariables").is_none());
+        assert!(published["header"].get("networkInterfaces").is_none());
+        assert!(published["libuv"][0].get("localEndpoint").is_none());
+        assert!(published["libuv"][0].get("remoteEndpoint").is_none());
+        assert_eq!(published["libuv"][0]["type"], "tcp");
+        assert_eq!(
+            fs::metadata(&paths.report.destination_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(try_publish_node_diagnostic_report(&paths.report, report_source_identity).is_err());
+
+        let replaced_paths =
+            NodeDiagnosticPaths::new(&source_dir, diagnostics_dir.path(), 2).report;
+        let replaced_identity =
+            prepare_private_diagnostic_file(&replaced_paths.source_path).unwrap();
+        fs::rename(
+            &replaced_paths.source_path,
+            source_dir.path().join("original-report-source"),
+        )
+        .unwrap();
+        prepare_private_diagnostic_file(&replaced_paths.source_path).unwrap();
+        fs::write(&replaced_paths.source_path, br#"{"complete":true}"#).unwrap();
+        assert!(try_publish_node_diagnostic_report(&replaced_paths, replaced_identity).is_err());
+        assert!(!replaced_paths.destination_path.exists());
+
+        prepare_private_diagnostic_file(&paths.profile_source_path).unwrap();
+        fs::write(&paths.profile_source_path, b"profile").unwrap();
+        copy_private_diagnostic_artifact(
+            &paths.profile_source_path,
+            &paths.profile_path,
+            MAX_DIAGNOSTIC_PROFILE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&paths.profile_path).unwrap(), b"profile");
+        assert_eq!(
+            fs::metadata(&paths.profile_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let profile_link = source_dir.path().join("linked-profile-source");
+        fs::hard_link(&paths.profile_source_path, &profile_link).unwrap();
+        let linked_destination = diagnostics_dir
+            .path()
+            .join("node-profile-linked.cpuprofile");
+        assert!(copy_private_diagnostic_artifact(
+            &paths.profile_source_path,
+            &linked_destination,
+            MAX_DIAGNOSTIC_PROFILE_BYTES,
+        )
+        .is_err());
+        assert!(!linked_destination.exists());
+        fs::remove_file(profile_link).unwrap();
+
+        fs::remove_file(&paths.profile_source_path).unwrap();
+        symlink(&paths.report.destination_path, &paths.profile_source_path).unwrap();
+        let rejected_destination = diagnostics_dir
+            .path()
+            .join("node-profile-rejected.cpuprofile");
+        assert!(copy_private_diagnostic_artifact(
+            &paths.profile_source_path,
+            &rejected_destination,
+            MAX_DIAGNOSTIC_PROFILE_BYTES,
+        )
+        .is_err());
+        assert!(!rejected_destination.exists());
+    }
+
+    #[tokio::test]
+    async fn profiler_control_connect_retries_worker_startup_race() {
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("profiler.sock");
+        let connecting_path = socket_path.clone();
+        let connecting =
+            tokio::spawn(async move { connect_main_thread_profiler(&connecting_path).await });
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let connected = connecting.await.unwrap().unwrap();
+
+        drop(accepted);
+        drop(connected);
+    }
+
+    #[tokio::test]
+    async fn profiler_control_half_closes_request_before_reading_response() {
+        let source_dir = TempDir::new().unwrap();
+        let diagnostics_dir = TempDir::new().unwrap();
+        let paths = NodeDiagnosticPaths::new(&source_dir, diagnostics_dir.path(), 1);
+        let listener = UnixListener::bind(&paths.control_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut accepted, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            accepted.read_to_end(&mut request).await.unwrap();
+            assert_eq!(request, b"profile\n");
+            accepted.write_all(b"already_started\n").await.unwrap();
+        });
+
+        let outcome = trigger_main_thread_profile(&paths, test_inner(1).await).await;
+        assert!(matches!(
+            outcome,
+            FirstMissDiagnosticOutcome::CpuProfileAlreadyStarted
+        ));
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn node_version_probe_stops_reading_oversized_output() {
         let temp_dir = TempDir::new().unwrap();
@@ -2326,7 +4123,7 @@ mod tests {
         fs::write(
             &node_path,
             r#"#!/bin/sh
-printf 'v22.'
+printf 'v24.'
 while true; do
   printf x
 done
@@ -2378,9 +4175,72 @@ done
             retained_external_packages: AtomicU64::new(0),
             imported_source_packages: AtomicU64::new(0),
             registered_stack_roots: AtomicU64::new(0),
+            first_miss_diagnostics_started: AtomicBool::new(false),
+            next_active_request_id: AtomicU64::new(0),
+            active_request_diagnostics: StdMutex::new(BTreeMap::new()),
+            diagnostic_paths: None,
             server_handle: Mutex::new(ManagedChild::new(generation, server_handle, source_dir)),
             client,
         })
+    }
+
+    #[tokio::test]
+    async fn active_request_diagnostics_are_bounded_and_removed_with_guards() {
+        let generation = test_inner(1).await;
+        let mut guards = Vec::new();
+        for index in 0..=MAX_DIAGNOSTIC_ACTIVE_REQUESTS {
+            guards.push(ActiveRequestGuard::new(
+                generation.clone(),
+                RequestDiagnosticMetadata {
+                    request_kind: "execute",
+                    module_path: Some(format!("module_{index}.js")),
+                    function_name: Some("run".to_owned()),
+                },
+            ));
+        }
+        assert_eq!(
+            generation.active_requests.load(Ordering::Relaxed),
+            MAX_DIAGNOSTIC_ACTIVE_REQUESTS + 1
+        );
+        assert_eq!(
+            generation.active_request_diagnostics.lock().unwrap().len(),
+            MAX_DIAGNOSTIC_ACTIVE_REQUESTS
+        );
+
+        drop(guards.remove(0));
+        let replacement = ActiveRequestGuard::new(generation.clone(), test_request_metadata());
+        assert_eq!(
+            generation.active_request_diagnostics.lock().unwrap().len(),
+            MAX_DIAGNOSTIC_ACTIVE_REQUESTS
+        );
+
+        drop(replacement);
+        drop(guards);
+        assert_eq!(generation.active_requests.load(Ordering::Relaxed), 0);
+        assert!(generation
+            .active_request_diagnostics
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_miss_diagnostics_are_claimed_once_per_enabled_generation() {
+        let disabled = test_inner(1).await;
+        assert!(!disabled.claim_first_miss_diagnostics());
+        assert!(!disabled
+            .first_miss_diagnostics_started
+            .load(Ordering::Acquire));
+
+        let mut enabled = test_inner(2).await;
+        let source_dir = TempDir::new().unwrap();
+        Arc::get_mut(&mut enabled).unwrap().diagnostic_paths =
+            Some(NodeDiagnosticPaths::new(&source_dir, source_dir.path(), 2));
+        assert!(enabled.claim_first_miss_diagnostics());
+        assert!(!enabled.claim_first_miss_diagnostics());
+        assert!(enabled
+            .first_miss_diagnostics_started
+            .load(Ordering::Acquire));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2545,7 +4405,11 @@ done
     async fn graceful_retirement_stops_admission_and_waits_for_active_request() {
         let generation = test_inner(1).await;
         let (executor, state) = test_executor(generation.clone(), test_config());
-        let active_guard = match executor.acquire_existing_inner().await.unwrap() {
+        let active_guard = match executor
+            .acquire_existing_inner(test_request_metadata())
+            .await
+            .unwrap()
+        {
             InnerAcquisition::Ready { inner, guard } => {
                 assert!(Arc::ptr_eq(&inner, &generation));
                 guard
@@ -2576,7 +4440,11 @@ done
         .await
         .unwrap();
 
-        match executor.acquire_existing_inner().await.unwrap() {
+        match executor
+            .acquire_existing_inner(test_request_metadata())
+            .await
+            .unwrap()
+        {
             InnerAcquisition::Draining(inner) => assert!(Arc::ptr_eq(&inner, &generation)),
             InnerAcquisition::Ready { .. } | InnerAcquisition::Missing => {
                 panic!("Draining generation admitted a new request")
@@ -2600,7 +4468,11 @@ done
     async fn canceled_drain_caller_does_not_wedge_generation_retirement() {
         let generation = test_inner(1).await;
         let (executor, state) = test_executor(generation.clone(), test_config());
-        let active_guard = match executor.acquire_existing_inner().await.unwrap() {
+        let active_guard = match executor
+            .acquire_existing_inner(test_request_metadata())
+            .await
+            .unwrap()
+        {
             InnerAcquisition::Ready { guard, .. } => guard,
             InnerAcquisition::Draining(_) | InnerAcquisition::Missing => {
                 panic!("Test generation was not available")
@@ -2760,7 +4632,11 @@ done
         })
         .await
         .unwrap();
-        match executor.acquire_existing_inner().await.unwrap() {
+        match executor
+            .acquire_existing_inner(test_request_metadata())
+            .await
+            .unwrap()
+        {
             InnerAcquisition::Draining(inner) => assert!(Arc::ptr_eq(&inner, &generation)),
             InnerAcquisition::Ready { .. } | InnerAcquisition::Missing => {
                 panic!("Unreaped generation did not fence replacement startup")
@@ -2848,6 +4724,64 @@ done
         assert_eq!(health_requests.load(Ordering::Relaxed), 4);
         assert!(state.lock().await.inner.is_none());
         assert!(generation.server_handle.lock().await.child.is_none());
+    }
+
+    #[tokio::test]
+    async fn unhealthy_watchdog_preempts_stuck_proactive_drain() {
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("executor.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path)
+            .build()
+            .unwrap();
+        let generation = test_inner_with_client(1, client).await;
+        let active_guard = ActiveRequestGuard::new(generation.clone(), test_request_metadata());
+        let state = Arc::new(Mutex::new(LocalNodeExecutorState {
+            inner: Some(generation.clone()),
+            retiring: None,
+            replacement_for_generation: None,
+            next_generation: 1,
+        }));
+        let mut config = test_config();
+        config.health_check_timeout = Duration::from_secs(1);
+        config.watchdog_interval = Duration::from_millis(1);
+        config.max_generation_age = Duration::from_nanos(1);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            LocalNodeExecutor::watch_generation(
+                Arc::downgrade(&state),
+                Arc::downgrade(&generation),
+                config,
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(generation.retirement_requested.load(Ordering::Acquire));
+        assert_eq!(generation.active_requests.load(Ordering::Acquire), 1);
+        assert!(state.lock().await.inner.is_none());
+        assert!(generation.server_handle.lock().await.child.is_none());
+        drop(active_guard);
     }
 
     #[tokio::test]

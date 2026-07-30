@@ -116,16 +116,22 @@ chain.
   a process-declared exit, repeated event-loop health failure, or backend shutdown; bound startup
   probes and local response streaming; prevent child stdio from bypassing function-log handling;
   terminate and reap only that direct child; and expose bounded lifecycle and health metrics.
-  Proactive RSS, imported-package, and age thresholds close admission and drain a healthy
-  generation before replacement. Backend memory resilience extends the same mechanism with
-  cgroup-pressure retirement.
-  Detached descendant process groups, including `build_deps` npm installs, require separate
-  ownership. The atomic-package patch adds best-effort npm process-group containment, but Rust does
-  not wait for descendant exit before removing a generation tempdir.
-- Prerequisites: none for generation recovery or RSS/package/age retirement. The atomic-package
-  patch adds package and stack aggregate metrics to the same health protocol; backend memory
-  resilience adds cgroup-pressure retirement.
-- Activation: automatic in the local Node executor.
+  Proactive RSS, imported-package, and age thresholds close admission while watchdog checks
+  continue, so unhealthy retirement can preempt a stuck drain. Backend memory resilience extends
+  the same mechanism with cgroup-pressure retirement. This patch also moves the local runtime to
+  Node.js 24 and captures bounded
+  active-request, process, diagnostic-report, and main-thread CPU-profile evidence on the first
+  watchdog miss without delaying replacement. Published diagnostic artifacts are private,
+  retained local files rather than logs. Detached descendant process groups, including
+  `build_deps` npm installs, require separate ownership. The atomic-package patch adds best-effort
+  npm process-group containment, but Rust does not wait for descendant exit before removing a
+  generation tempdir.
+- Prerequisites: none for generation recovery, RSS/package/age retirement, or diagnostics. The
+  atomic-package patch adds package and stack aggregate metrics to the same health protocol; backend
+  memory resilience adds cgroup-pressure retirement.
+- Activation: automatic in the local Node executor. Set
+  `LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR` to an absolute mounted path when first-miss artifacts must
+  survive container replacement.
 - Rollback: restore the previous backend image if healthy generations are retired unexpectedly.
 
 ## Scheduler, admission, and queueing

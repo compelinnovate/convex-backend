@@ -56,18 +56,21 @@ retention, so the RSS threshold must remain larger and is validated
 independently. The age and lifetime-unique imported source-package thresholds
 bound growth that disk-cache eviction cannot reclaim from Node's ESM module
 graph. When any threshold is reached, the generation stops accepting new
-requests, waits for in-flight requests to finish, terminates and reaps the
-child, and lets the next request start a replacement generation.
+requests and starts detached drain completion. The watchdog continues health
+checks while in-flight requests finish; repeated health failure can preempt a
+stuck drain. A healthy drained generation is terminated and reaped before the
+next request starts a replacement generation.
 
 The watchdog normally observes direct-child RSS roughly every one to two
-seconds. An active invocation can delay retirement until its remaining Rust
-deadline expires, up to 605 seconds with the default Node action timeout, and
-termination/reaping can take longer. Non-Linux builds report RSS sampling as
+seconds. An active invocation can delay healthy proactive drain completion
+until its remaining Rust deadline expires, up to 605 seconds with the default
+Node action timeout, and termination/reaping can take longer. It does not delay
+the unhealthy-watchdog threshold. Non-Linux builds report RSS sampling as
 unsupported and do not use the RSS trigger. A failed Linux sample marks RSS
 telemetry unavailable and skips only that trigger for the iteration; age,
 package, and unhealthy-generation checks continue. The RSS byte gauge retains
-its last value while unavailable, so pair it with the RSS telemetry-availability
-gauge.
+its last value while unavailable, so pair it with the RSS
+telemetry-availability gauge.
 
 The stock Compose file passes these controls through without setting
 different defaults. Changing one requires a backend restart.

@@ -17,11 +17,11 @@ allowedAlternativeVersions in npm-packages/common-versions.json (checked by
 
 # node version
 
-Node.js 20 is the expected version for the whole repo. We no longer run
-integration tests with Node.js 18.
+Node.js 24 is the expected version for the whole repo. `.nvmrc` and the
+self-hosted images pin Node.js 24.18.1. The local backend accepts another
+Node.js 24 binary from `PATH` but rejects other major versions.
 
-We're rolling out configurable Node.js versions for Lambda functions ("use
-node") and function runner / local backend now expect Node.js 18, 20, or 22.
+Lambda function Node.js versions are configured separately with `"use node"`.
 
 # JS build systems
 
