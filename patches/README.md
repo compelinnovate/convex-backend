@@ -90,15 +90,18 @@ chain.
 ### [Backend memory resilience](backend_memory_resilience/README.md)
 
 - Purpose: account for configured and observed backend memory, reclaim optional allocator and local
-  Node state before external HTTP shedding, export a shared pressure signal for owner-specific
-  patches, and preserve finite cgroup limits as the hard boundary.
+  Node state before external HTTP shedding, select bounded jemalloc in the standard backend build,
+  export a shared pressure signal for owner-specific patches, and preserve finite cgroup limits as
+  the hard boundary.
 - Prerequisites: local Node executor resilience for pressure-triggered generation retirement and
   shared-base HTTP admission for dependency-preserving external shedding. Pressure control also
-  requires Linux cgroup v2 with a finite readable memory limit; explicit allocator trim and arena
-  counting require glibc.
-- Activation: all pressure switches default to disabled. Internal reclamation, allocator trim, and
-  external shedding have separate enable switches and ordered headroom thresholds documented in the
-  patch essay. The shedding-entry value also bounds trim deferral while reclamation is enabled.
+  requires Linux cgroup v2 with a finite readable memory limit; explicit allocator trim requires a
+  GNU libc control build. Arena counting is available for GNU libc and jemalloc builds.
+- Activation: jemalloc is the default `local_backend` feature; a GNU libc control build uses
+  `--no-default-features`. All pressure switches default to disabled. Internal reclamation,
+  allocator trim, and external shedding have separate enable switches and ordered headroom
+  thresholds documented in the patch essay. The shedding-entry value also bounds trim deferral
+  while reclamation is enabled.
 - Rollback: restore the previous backend image and remove settings it does not understand; no schema
   or data change is required.
 

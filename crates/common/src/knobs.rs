@@ -523,7 +523,7 @@ pub static LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES: LazyLock<usize>
     });
 
 /// Ask glibc to discard free arena pages while internal cgroup reclamation is
-/// active. Unsupported allocators report explicit telemetry and do nothing.
+/// active. A backend build that selects another allocator rejects this setting.
 pub static LOCAL_BACKEND_MALLOC_TRIM_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_config_bool_strict("LOCAL_BACKEND_MALLOC_TRIM_ENABLED", false));
 

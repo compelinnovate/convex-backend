@@ -12,6 +12,15 @@ name = "convex-local-backend"
 path = "src/main.rs"
 
 [features]
+default = ["jemalloc"]
+# build.rs limits this feature to targets where process-wide interposition and
+# the in-binary configuration pointer are both supported.
+jemalloc = [
+    "dep:tikv-jemalloc-ctl",
+    "dep:tikv-jemalloc-sys",
+    "dep:tikv-jemallocator",
+    "tikv-jemallocator/override_allocator_on_supported_platforms",
+]
 testing = [
     "common/testing",
     "clusters/testing",
@@ -107,6 +116,11 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 value = { workspace = true }
 vector = { workspace = true }
+
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "windows", target_os = "android", target_os = "bitrig", target_os = "dragonfly", target_os = "fuchsia", target_os = "redox", target_vendor = "rumprun")))'.dependencies]
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+tikv-jemalloc-sys = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

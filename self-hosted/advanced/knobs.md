@@ -75,6 +75,42 @@ telemetry-availability gauge.
 The stock Compose file passes these controls through without setting
 different defaults. Changing one requires a backend restart.
 
+## Backend process allocator
+
+The standard local backend build enables its default `jemalloc` feature. On supported targets,
+including the GNU Linux self-hosted image, jemalloc is both the Rust global allocator and the
+process allocator used by V8 and other native code. The explicit override forces the allocator
+entry points into the final link; Apple builds register the jemalloc allocator zone. Windows,
+Android, DragonFly, and targets rejected by the pinned jemalloc retain their system allocator
+because the process-wide override and configuration contract is not available on those targets.
+Building `local_backend` with `--no-default-features` also retains the target's system allocator and
+provides the GNU libc control on the standard Linux target.
+
+The GNU Linux executable supplies
+`abort_conf:true,background_thread:true,narenas:32,prof:false` through jemalloc's platform-correct
+`malloc_conf` pointer. Targets where jemalloc does not support background workers omit
+`background_thread:true` rather than making allocator initialization fail. `/etc/malloc.conf` and
+the allocator configuration environment value `MALLOC_CONF` have later precedence and can change
+the effective settings at process startup. The embedded automatic-arena default is 32; set
+`MALLOC_CONF=narenas:<value>` to select a value from 1 through 128. Jemalloc retains configuration
+errors and checks fatal handling after each nonempty source. Linux backend startup reads the
+effective settings back through mallctl and rejects disabled fatal handling for invalid
+configuration, an automatic-arena limit outside 1 through 128, disabled dirty-page purging,
+inactive background purging where it is supported, missing statistics or profiling support, or
+enabled or active profiling. Linux metrics report the effective automatic-arena limit and
+distinguish profiling support, initial enablement, and current activation, and distinguish the
+configured background-thread option from its current active state.
+
+Jemalloc memory metrics report `allocated` application bytes, bytes in `active` application pages,
+allocator `metadata`, the allocator's `resident` upper estimate, mapped active extents, and retained
+virtual address space outside those mappings. The components overlap and must not be added. They are
+not equivalent to the GNU libc `mallinfo2` component set. Jemalloc arena telemetry counts all
+initialized automatic, oversize, and explicitly created arenas; the separately reported `narenas`
+value is only the configured automatic thread-arena limit.
+
+`LOCAL_BACKEND_MALLOC_TRIM_ENABLED` is available only in a GNU libc Linux build. Jemalloc builds and
+other system-allocator builds reject an enabled trim setting at startup.
+
 ## Cgroup memory-pressure reclamation and admission
 
 The reclamation, allocator-trim, and shedding switches are Linux-only. Enabling any of them on
@@ -112,8 +148,9 @@ trim result do not prove resident bytes were released, so the backend records im
 changes in process RSS, anonymous RSS, cgroup usage, cgroup anonymous memory, and allocator free
 space, plus duration and page faults. Once the libc call starts it cannot be preempted; one-second
 control sampling continues, asynchronous runtime shutdown does not join its detached native worker,
-and process exit is the termination boundary. Unsupported allocators report that trim is
-unavailable.
+and process exit is the termination boundary. Only a GNU libc Linux build accepts this glibc-only
+setting; every other allocator build rejects it at startup instead of reporting glibc state or
+calling `malloc_trim`.
 
 The reclamation exit threshold must exceed its entry threshold and remain below the cgroup limit.
 When reclamation and external shedding are both enabled, both reclamation thresholds must preserve
