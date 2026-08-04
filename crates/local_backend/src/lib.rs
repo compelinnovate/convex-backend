@@ -84,6 +84,117 @@ use search::{
 };
 use serde::Serialize;
 pub use sync::subscription_reconnect::SubscriptionReconnectRateLimiter;
+#[cfg(local_backend_jemalloc)]
+use tikv_jemalloc_sys as _;
+#[cfg(local_backend_jemalloc)]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(local_backend_jemalloc)]
+#[global_allocator]
+static ALLOCATOR: Jemalloc = Jemalloc;
+
+#[cfg(local_backend_jemalloc)]
+union JemallocConfigurationPointer {
+    byte: &'static u8,
+    character: &'static libc::c_char,
+}
+
+#[cfg(local_backend_jemalloc)]
+pub(crate) const JEMALLOC_BACKGROUND_THREAD_SUPPORTED: bool = cfg!(all(
+    unix,
+    not(target_vendor = "apple"),
+    not(target_env = "musl")
+));
+
+#[cfg(local_backend_jemalloc)]
+const JEMALLOC_MALLOC_CONF_BYTES: &[u8] = if JEMALLOC_BACKGROUND_THREAD_SUPPORTED {
+    b"abort_conf:true,background_thread:true,narenas:32,prof:false\0"
+} else {
+    b"abort_conf:true,narenas:32,prof:false\0"
+};
+
+#[cfg(local_backend_jemalloc)]
+#[cfg_attr(
+    any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "dragonfly"
+    ),
+    unsafe(export_name = "_rjem_malloc_conf")
+)]
+#[cfg_attr(
+    not(any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "dragonfly"
+    )),
+    unsafe(export_name = "malloc_conf")
+)]
+pub static JEMALLOC_MALLOC_CONF: Option<&'static libc::c_char> = Some(unsafe {
+    // jemalloc reads a `const char *` before main. Keep the exported static in
+    // that exact C ABI shape rather than relying on a Rust slice-fat-pointer
+    // layout.
+    JemallocConfigurationPointer {
+        byte: &JEMALLOC_MALLOC_CONF_BYTES[0],
+    }
+    .character
+});
+
+#[cfg(all(
+    test,
+    local_backend_jemalloc,
+    any(not(unix), target_vendor = "apple", target_env = "musl")
+))]
+#[test]
+fn unsupported_background_thread_target_omits_the_option() {
+    // SAFETY: the backend exports this symbol as a non-null pointer to a
+    // static NUL-terminated configuration string.
+    let malloc_conf = unsafe {
+        let malloc_conf = tikv_jemalloc_sys::malloc_conf.unwrap();
+        std::ffi::CStr::from_ptr(malloc_conf)
+    };
+    assert_eq!(
+        malloc_conf.to_bytes(),
+        b"abort_conf:true,narenas:32,prof:false"
+    );
+}
+
+#[cfg(all(
+    test,
+    local_backend_jemalloc,
+    not(any(target_os = "android", target_os = "dragonfly"))
+))]
+#[test]
+fn libc_allocations_use_the_process_jemalloc() {
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        assert_eq!(
+            tikv_jemalloc_sys::malloc as *const (),
+            libc::malloc as *const ()
+        );
+        assert_eq!(
+            tikv_jemalloc_sys::calloc as *const (),
+            libc::calloc as *const ()
+        );
+        assert_eq!(
+            tikv_jemalloc_sys::realloc as *const (),
+            libc::realloc as *const ()
+        );
+        assert_eq!(
+            tikv_jemalloc_sys::free as *const (),
+            libc::free as *const ()
+        );
+    }
+    // SAFETY: the override feature binds both APIs to the same process
+    // allocator. This also checks Apple's allocator-zone override, where the
+    // prefixed jemalloc and libc entry-point addresses intentionally differ.
+    unsafe {
+        let allocation = libc::malloc(4096);
+        assert!(!allocation.is_null());
+        assert!(tikv_jemallocator::usable_size(allocation) >= 4096);
+        libc::free(allocation);
+    }
+}
 
 pub mod admin;
 mod app_metrics;

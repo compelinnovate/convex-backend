@@ -51,13 +51,25 @@ use common::{
 use metrics::{
     log_counter,
     log_counter_with_labels,
-    log_distribution,
     log_gauge,
     log_gauge_with_labels,
     register_convex_counter,
     register_convex_gauge,
-    register_convex_histogram,
     StaticMetricLabel,
+};
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
+use metrics::{
+    log_distribution,
+    register_convex_histogram,
+};
+#[cfg(local_backend_jemalloc)]
+use tikv_jemalloc_ctl::{
+    arenas,
+    background_thread,
+    epoch,
+    opt,
+    raw,
+    stats,
 };
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(15);
@@ -65,8 +77,17 @@ const PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const ALLOCATOR_ARENA_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MEMORY_REPORTS_PER_ALLOCATOR_ARENA_REPORT: usize =
     (ALLOCATOR_ARENA_REPORT_INTERVAL.as_secs() / REPORT_INTERVAL.as_secs()) as usize;
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 const MAX_MALLOC_INFO_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc))
+))]
 const MAX_MALLOC_INFO_XML_DEPTH: usize = 16;
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc))
+))]
 const MAX_MALLOC_INFO_TAG_ATTRIBUTES: usize = 16;
 const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 const PROC_SELF_MOUNTINFO: &str = "/proc/self/mountinfo";
@@ -78,20 +99,30 @@ register_convex_gauge!(
 );
 register_convex_gauge!(
     BACKEND_ALLOCATOR_MEMORY_BYTES,
-    "Main-arena and process-wide mmap memory reported by the backend process allocator",
+    "Memory reported by the selected backend process allocator",
+    &["component"]
+);
+register_convex_gauge!(
+    BACKEND_ALLOCATOR_SELECTED_INFO,
+    "Selected backend process allocator",
+    &["allocator"]
+);
+register_convex_gauge!(
+    BACKEND_ALLOCATOR_CONFIGURATION_INFO,
+    "Numeric configuration of the selected backend process allocator",
     &["component"]
 );
 register_convex_gauge!(
     BACKEND_ALLOCATOR_MMAP_REGIONS_INFO,
-    "Number of mmap-backed regions reported by the backend process allocator"
+    "Number of mmap-backed regions reported by glibc malloc"
 );
 register_convex_gauge!(
     BACKEND_ALLOCATOR_ARENAS_INFO,
-    "Number of glibc malloc arenas reported by malloc_info"
+    "Number of initialized arenas reported by the selected backend process allocator"
 );
 register_convex_gauge!(
     BACKEND_ALLOCATOR_ARENA_TELEMETRY_INFO,
-    "Whether glibc malloc arena-count telemetry is available"
+    "Whether allocator arena-count telemetry is available"
 );
 register_convex_gauge!(
     BACKEND_ALLOCATOR_TELEMETRY_INFO,
@@ -213,15 +244,18 @@ register_convex_counter!(
     "Explicit backend allocator trim attempts by outcome",
     &["outcome"]
 );
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 register_convex_histogram!(
     BACKEND_ALLOCATOR_TRIM_SECONDS,
     "Duration of explicit backend allocator trim calls"
 );
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 register_convex_gauge!(
     BACKEND_ALLOCATOR_TRIM_MEMORY_CHANGE_BYTES,
     "Immediate signed memory change after explicit allocator trim",
     &["component"]
 );
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 register_convex_counter!(
     BACKEND_ALLOCATOR_TRIM_PAGE_FAULTS_TOTAL,
     "Process page faults observed during an explicit allocator trim sample",
@@ -238,14 +272,40 @@ struct ProcessMemory {
     swap_bytes: u64,
 }
 
+#[cfg(not(local_backend_jemalloc))]
 #[derive(Debug, Eq, PartialEq)]
-struct AllocatorMemory {
+struct GlibcAllocatorMemory {
     arena_bytes: u64,
     mmap_bytes: u64,
     in_use_bytes: u64,
     free_bytes: u64,
     main_arena_top_chunk_bytes: u64,
     mmap_regions: u64,
+}
+
+#[cfg(local_backend_jemalloc)]
+#[derive(Debug, Eq, PartialEq)]
+struct JemallocMemory {
+    allocated_bytes: u64,
+    active_bytes: u64,
+    metadata_bytes: u64,
+    resident_bytes: u64,
+    mapped_bytes: u64,
+    retained_bytes: u64,
+}
+
+#[cfg(local_backend_jemalloc)]
+#[derive(Debug, Eq, PartialEq)]
+struct JemallocConfiguration {
+    narenas: u32,
+    dirty_decay_ms: libc::ssize_t,
+    abort_on_invalid_configuration: bool,
+    background_thread_configured: bool,
+    background_thread_active: bool,
+    statistics_supported: bool,
+    profiling_supported: bool,
+    profiling_enabled: bool,
+    profiling_active: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -270,16 +330,18 @@ pub struct CgroupMemoryPressureController {
     last_allocator_trim_evaluated: Option<Instant>,
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 #[derive(Debug, Eq, PartialEq)]
 struct PageFaults {
     minor: u64,
     major: u64,
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 #[derive(Debug, Eq, PartialEq)]
 struct AllocatorTrimSnapshot {
     process: ProcessMemory,
-    allocator: Option<AllocatorMemory>,
+    allocator: Option<GlibcAllocatorMemory>,
     cgroup_current_bytes: u64,
     cgroup_anon_bytes: u64,
     page_faults: PageFaults,
@@ -287,7 +349,9 @@ struct AllocatorTrimSnapshot {
 
 enum AllocatorTrimRun {
     Unsupported,
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
     BelowFreeThreshold,
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
     Completed {
         before: AllocatorTrimSnapshot,
         after: anyhow::Result<AllocatorTrimSnapshot>,
@@ -321,7 +385,9 @@ impl AllocatorTrimTask {
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
                 log_allocator_trim_attempt("sample_failure");
-                Some(Err(anyhow::anyhow!("allocator trim worker stopped without a result")))
+                Some(Err(anyhow::anyhow!(
+                    "allocator trim worker stopped without a result"
+                )))
             },
         }
     }
@@ -364,6 +430,7 @@ pub fn initialize_memory_pressure_controller(
     let shedding_enabled = *LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED;
     let reclamation_enabled = *LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED;
     let allocator_trim_enabled = *LOCAL_BACKEND_MALLOC_TRIM_ENABLED;
+    validate_allocator_configuration(allocator_trim_enabled)?;
     log_gauge(
         &BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED_INFO,
         if shedding_enabled { 1.0 } else { 0.0 },
@@ -749,19 +816,30 @@ fn run_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<()> {
             return Err(error);
         },
     };
-    let (before, after, returned, elapsed) = match run {
+    match run {
         AllocatorTrimRun::Unsupported => {
             log_allocator_trim_attempt("unsupported");
-            return Ok(());
+            Ok(())
         },
-        AllocatorTrimRun::BelowFreeThreshold => return Ok(()),
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
+        AllocatorTrimRun::BelowFreeThreshold => Ok(()),
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
         AllocatorTrimRun::Completed {
             before,
             after,
             returned,
             elapsed,
-        } => (before, after, returned, elapsed),
-    };
+        } => finish_allocator_trim(before, after, returned, elapsed),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
+fn finish_allocator_trim(
+    before: AllocatorTrimSnapshot,
+    after: anyhow::Result<AllocatorTrimSnapshot>,
+    returned: bool,
+    elapsed: Duration,
+) -> anyhow::Result<()> {
     let outcome = if returned {
         "returned_true"
     } else {
@@ -856,7 +934,7 @@ fn log_allocator_trim_attempt(outcome: &'static str) {
     );
 }
 
-#[cfg(target_env = "gnu")]
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 fn measure_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<AllocatorTrimRun> {
     let before = allocator_trim_snapshot(root)?;
     let Some(allocator) = &before.allocator else {
@@ -880,11 +958,15 @@ fn measure_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<Al
     })
 }
 
-#[cfg(not(target_env = "gnu"))]
+#[cfg(any(
+    not(all(target_os = "linux", target_env = "gnu")),
+    local_backend_jemalloc
+))]
 fn measure_allocator_trim(_root: &Path, _min_free_bytes: u64) -> anyhow::Result<AllocatorTrimRun> {
     Ok(AllocatorTrimRun::Unsupported)
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 fn log_trim_memory_change(component: &'static str, before: u64, after: u64) {
     let change = signed_memory_change(before, after);
     log_gauge_with_labels(
@@ -894,13 +976,18 @@ fn log_trim_memory_change(component: &'static str, before: u64, after: u64) {
     );
 }
 
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc))
+))]
 fn signed_memory_change(before: u64, after: u64) -> i128 {
     i128::from(after) - i128::from(before)
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 fn allocator_trim_snapshot(root: &Path) -> anyhow::Result<AllocatorTrimSnapshot> {
     let process = parse_process_status(&fs::read_to_string("/proc/self/status")?)?;
-    let allocator = allocator_memory()?;
+    let allocator = glibc_allocator_memory()?;
     let cgroup = read_cgroup_memory(root)?
         .context("allocator trim requires the cgroup v2 memory controller")?;
     let stat = parse_keyed_u64(&fs::read_to_string(root.join("memory.stat"))?)?;
@@ -916,6 +1003,7 @@ fn allocator_trim_snapshot(root: &Path) -> anyhow::Result<AllocatorTrimSnapshot>
     })
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 fn read_process_page_faults() -> anyhow::Result<PageFaults> {
     // SAFETY: `getrusage` initializes the provided process-local `rusage`
     // structure and does not retain the pointer.
@@ -928,7 +1016,7 @@ fn read_process_page_faults() -> anyhow::Result<PageFaults> {
     })
 }
 
-#[cfg(target_env = "gnu")]
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 fn explicit_allocator_trim() -> bool {
     // SAFETY: glibc documents `malloc_trim` as MT-Safe. A zero pad asks the
     // allocator to retain no extra main-arena top space.
@@ -946,7 +1034,7 @@ fn report_allocator_arena_count() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_env = "gnu")]
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
 fn allocator_arena_count() -> anyhow::Result<Option<usize>> {
     let mut contents = vec![0u8; MAX_MALLOC_INFO_BYTES];
     // SAFETY: `contents` is writable for its full length and remains alive until
@@ -979,11 +1067,41 @@ fn allocator_arena_count() -> anyhow::Result<Option<usize>> {
     Ok(Some(parse_malloc_info_arena_count(xml)?))
 }
 
-#[cfg(not(target_env = "gnu"))]
+#[cfg(local_backend_jemalloc)]
+fn allocator_arena_count() -> anyhow::Result<Option<usize>> {
+    epoch::advance()?;
+    // `opt.narenas` bounds automatic thread multiplexing, but the dedicated
+    // oversize arena and any explicitly created arenas have higher indexes.
+    let narenas = usize::try_from(arenas::narenas::read()?)?;
+    let mut initialized_mib = [0usize; 3];
+    raw::name_to_mib(b"arena.0.initialized\0", &mut initialized_mib)?;
+    let mut initialized = 0usize;
+    for arena in 0..narenas {
+        initialized_mib[1] = arena;
+        // SAFETY: jemalloc documents arena.<i>.initialized as a boolean
+        // mallctl value, and name_to_mib resolved the remaining components.
+        if unsafe { raw::read_mib::<bool>(&initialized_mib)? } {
+            initialized = initialized
+                .checked_add(1)
+                .context("jemalloc initialized arena count overflow")?;
+        }
+    }
+    anyhow::ensure!(initialized > 0, "jemalloc reported no initialized arenas");
+    Ok(Some(initialized))
+}
+
+#[cfg(all(
+    not(all(target_os = "linux", target_env = "gnu")),
+    not(local_backend_jemalloc)
+))]
 fn allocator_arena_count() -> anyhow::Result<Option<usize>> {
     Ok(None)
 }
 
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc))
+))]
 fn parse_malloc_info_arena_count(xml: &str) -> anyhow::Result<usize> {
     let bytes = xml.as_bytes();
     anyhow::ensure!(!bytes.contains(&0), "malloc_info output contains NUL");
@@ -1130,6 +1248,10 @@ fn parse_malloc_info_arena_count(xml: &str) -> anyhow::Result<usize> {
     Ok(arena_count)
 }
 
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc))
+))]
 fn parse_malloc_info_xml_name<'a>(xml: &'a str, index: &mut usize) -> anyhow::Result<&'a str> {
     let bytes = xml.as_bytes();
     let start = *index;
@@ -1149,6 +1271,10 @@ fn parse_malloc_info_xml_name<'a>(xml: &'a str, index: &mut usize) -> anyhow::Re
     Ok(&xml[start..*index])
 }
 
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc))
+))]
 fn skip_ascii_whitespace(bytes: &[u8], index: &mut usize) {
     while bytes
         .get(*index)
@@ -1364,10 +1490,29 @@ pub fn start<RT: Runtime>(
                 .await;
                 let failures = match report {
                     Ok(failures) => failures,
-                    Err(error) => vec![SourceFailure {
-                        source: "blocking_task",
-                        error: error.into(),
-                    }],
+                    Err(error) => {
+                        log_gauge(&BACKEND_ALLOCATOR_TELEMETRY_INFO, 0.0);
+                        log_gauge(&BACKEND_CGROUP_MEMORY_CONTROLLER_INFO, 0.0);
+                        log_gauge(&BACKEND_CGROUP_MEMORY_LIMITED_INFO, 0.0);
+                        set_cgroup_field_availability(0.0);
+                        for source in [
+                            "process",
+                            "allocator",
+                            "cgroup_controller",
+                            "cgroup_stat",
+                            "cgroup_events",
+                        ] {
+                            log_gauge_with_labels(
+                                &BACKEND_MEMORY_TELEMETRY_SOURCE_UP_INFO,
+                                0.0,
+                                vec![StaticMetricLabel::new("source", source)],
+                            );
+                        }
+                        vec![SourceFailure {
+                            source: "blocking_task",
+                            error: error.into(),
+                        }]
+                    },
                 };
                 log_gauge(
                     &BACKEND_MEMORY_TELEMETRY_UP_INFO,
@@ -1480,8 +1625,18 @@ fn report_process_memory() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(local_backend_jemalloc))]
 fn report_allocator_memory() -> anyhow::Result<()> {
-    let allocator = match allocator_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let allocator_name = "glibc";
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let allocator_name = "system";
+    log_gauge_with_labels(
+        &BACKEND_ALLOCATOR_SELECTED_INFO,
+        1.0,
+        vec![StaticMetricLabel::new("allocator", allocator_name)],
+    );
+    let allocator = match glibc_allocator_memory() {
         Ok(allocator) => allocator,
         Err(error) => {
             log_gauge(&BACKEND_ALLOCATOR_TELEMETRY_INFO, 0.0);
@@ -1509,6 +1664,108 @@ fn report_allocator_memory() -> anyhow::Result<()> {
         );
     } else {
         log_gauge(&BACKEND_ALLOCATOR_TELEMETRY_INFO, 0.0);
+    }
+    Ok(())
+}
+
+#[cfg(local_backend_jemalloc)]
+fn report_allocator_memory() -> anyhow::Result<()> {
+    log_gauge_with_labels(
+        &BACKEND_ALLOCATOR_SELECTED_INFO,
+        1.0,
+        vec![StaticMetricLabel::new("allocator", "jemalloc")],
+    );
+    let sample = jemalloc_memory().and_then(|memory| {
+        let configuration = jemalloc_configuration()?;
+        Ok((memory, configuration))
+    });
+    let (allocator, configuration) = match sample {
+        Ok(sample) => sample,
+        Err(error) => {
+            log_gauge(&BACKEND_ALLOCATOR_TELEMETRY_INFO, 0.0);
+            return Err(error);
+        },
+    };
+    log_gauge(&BACKEND_ALLOCATOR_TELEMETRY_INFO, 1.0);
+    for (component, value) in [
+        ("allocated", allocator.allocated_bytes),
+        ("active", allocator.active_bytes),
+        ("metadata", allocator.metadata_bytes),
+        ("resident", allocator.resident_bytes),
+        ("mapped", allocator.mapped_bytes),
+        ("retained", allocator.retained_bytes),
+    ] {
+        log_gauge_with_labels(
+            &BACKEND_ALLOCATOR_MEMORY_BYTES,
+            value as f64,
+            vec![StaticMetricLabel::new("component", component)],
+        );
+    }
+    for (component, value) in [
+        ("narenas", f64::from(configuration.narenas)),
+        ("dirty_decay_ms", configuration.dirty_decay_ms as f64),
+        (
+            "abort_on_invalid_configuration",
+            if configuration.abort_on_invalid_configuration {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+        (
+            "background_thread_configured",
+            if configuration.background_thread_configured {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+        (
+            "background_thread_active",
+            if configuration.background_thread_active {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+        (
+            "statistics_supported",
+            if configuration.statistics_supported {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+        (
+            "profiling_supported",
+            if configuration.profiling_supported {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+        (
+            "profiling_enabled",
+            if configuration.profiling_enabled {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+        (
+            "profiling_active",
+            if configuration.profiling_active {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+    ] {
+        log_gauge_with_labels(
+            &BACKEND_ALLOCATOR_CONFIGURATION_INFO,
+            value,
+            vec![StaticMetricLabel::new("component", component)],
+        );
     }
     Ok(())
 }
@@ -1578,6 +1835,8 @@ fn report_cgroup_memory(
 }
 
 fn report_cgroup_stat(root: &Path) -> anyhow::Result<()> {
+    // Value gauges retain their last sample; availability describes this attempt.
+    set_cgroup_component_availability(0.0);
     let stat = parse_keyed_u64(&fs::read_to_string(root.join("memory.stat"))?)?;
     for component in ["anon", "file", "kernel", "shmem", "sock"] {
         let value = stat.get(component);
@@ -1602,6 +1861,8 @@ fn report_cgroup_stat(root: &Path) -> anyhow::Result<()> {
 }
 
 fn report_cgroup_events(root: &Path) -> anyhow::Result<()> {
+    // Value gauges retain their last sample; availability describes this attempt.
+    set_cgroup_event_availability(0.0);
     let events = parse_keyed_u64(&fs::read_to_string(root.join("memory.events"))?)?;
     for event in ["low", "high", "max", "oom", "oom_kill"] {
         let value = events.get(event);
@@ -1642,6 +1903,11 @@ fn report_cgroup_events(root: &Path) -> anyhow::Result<()> {
 }
 
 fn set_cgroup_field_availability(value: f64) {
+    set_cgroup_component_availability(value);
+    set_cgroup_event_availability(value);
+}
+
+fn set_cgroup_component_availability(value: f64) {
     for component in ["anon", "file", "kernel", "shmem", "sock"] {
         log_gauge_with_labels(
             &BACKEND_CGROUP_MEMORY_COMPONENT_AVAILABLE_INFO,
@@ -1649,6 +1915,9 @@ fn set_cgroup_field_availability(value: f64) {
             vec![StaticMetricLabel::new("component", component)],
         );
     }
+}
+
+fn set_cgroup_event_availability(value: f64) {
     for event in ["low", "high", "max", "oom", "oom_kill", "oom_group_kill"] {
         log_gauge_with_labels(
             &BACKEND_CGROUP_MEMORY_EVENT_AVAILABLE_INFO,
@@ -1710,11 +1979,13 @@ fn parse_kib(value: &str) -> anyhow::Result<u64> {
     kib.checked_mul(1024).context("memory byte count overflow")
 }
 
-#[cfg(target_env = "gnu")]
-fn allocator_memory() -> anyhow::Result<Option<AllocatorMemory>> {
+#[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
+fn glibc_allocator_memory() -> anyhow::Result<Option<GlibcAllocatorMemory>> {
     // SAFETY: `mallinfo2` has no arguments and returns a value snapshot. glibc
-    // documents it as MT-Safe. Its arena, in-use, free, and top-chunk fields
-    // cover only the main arena; mmap fields are process-wide.
+    // marks it unsafe only during allocator initialization or concurrent
+    // `mallopt`; initialization is complete and this backend does not call
+    // `mallopt`. Its arena, in-use, free, and top-chunk fields cover only the
+    // main arena; mmap fields are process-wide.
     let info = unsafe { libc::mallinfo2() };
     let arena_bytes = u64::try_from(info.arena)?;
     let in_use_bytes = u64::try_from(info.uordblks)?;
@@ -1728,7 +1999,7 @@ fn allocator_memory() -> anyhow::Result<Option<AllocatorMemory>> {
         main_arena_top_chunk_bytes <= free_bytes,
         "allocator main-arena top chunk exceeds free arena bytes"
     );
-    Ok(Some(AllocatorMemory {
+    Ok(Some(GlibcAllocatorMemory {
         arena_bytes,
         mmap_bytes: u64::try_from(info.hblkhd)?,
         in_use_bytes,
@@ -1738,9 +2009,147 @@ fn allocator_memory() -> anyhow::Result<Option<AllocatorMemory>> {
     }))
 }
 
-#[cfg(not(target_env = "gnu"))]
-fn allocator_memory() -> anyhow::Result<Option<AllocatorMemory>> {
+#[cfg(all(
+    not(local_backend_jemalloc),
+    not(all(target_os = "linux", target_env = "gnu"))
+))]
+fn glibc_allocator_memory() -> anyhow::Result<Option<GlibcAllocatorMemory>> {
     Ok(None)
+}
+
+#[cfg(local_backend_jemalloc)]
+fn jemalloc_memory() -> anyhow::Result<JemallocMemory> {
+    epoch::advance()?;
+    let memory = JemallocMemory {
+        allocated_bytes: u64::try_from(stats::allocated::read()?)?,
+        active_bytes: u64::try_from(stats::active::read()?)?,
+        metadata_bytes: u64::try_from(stats::metadata::read()?)?,
+        resident_bytes: u64::try_from(stats::resident::read()?)?,
+        mapped_bytes: u64::try_from(stats::mapped::read()?)?,
+        retained_bytes: u64::try_from(stats::retained::read()?)?,
+    };
+    anyhow::ensure!(
+        memory.allocated_bytes <= memory.active_bytes,
+        "jemalloc allocated bytes exceed active bytes"
+    );
+    anyhow::ensure!(
+        memory.active_bytes <= memory.resident_bytes,
+        "jemalloc active bytes exceed resident bytes"
+    );
+    anyhow::ensure!(
+        memory.metadata_bytes <= memory.resident_bytes,
+        "jemalloc metadata bytes exceed resident bytes"
+    );
+    Ok(memory)
+}
+
+#[cfg(local_backend_jemalloc)]
+fn jemalloc_configuration() -> anyhow::Result<JemallocConfiguration> {
+    // SAFETY: jemalloc documents config.stats and config.prof as boolean
+    // mallctl values. Profiling controls exist only when support is compiled in.
+    let statistics_supported = unsafe { raw::read::<bool>(b"config.stats\0")? };
+    let profiling_supported = unsafe { raw::read::<bool>(b"config.prof\0")? };
+    let (profiling_enabled, profiling_active) = if profiling_supported {
+        // SAFETY: jemalloc documents opt.prof and prof.active as boolean
+        // mallctl values.
+        unsafe {
+            (
+                raw::read::<bool>(b"opt.prof\0")?,
+                raw::read::<bool>(b"prof.active\0")?,
+            )
+        }
+    } else {
+        (false, false)
+    };
+    let background_thread_active = if crate::JEMALLOC_BACKGROUND_THREAD_SUPPORTED {
+        background_thread::read()?
+    } else {
+        false
+    };
+    Ok(JemallocConfiguration {
+        narenas: opt::narenas::read()?,
+        // SAFETY: jemalloc documents opt.dirty_decay_ms as an ssize_t mallctl value.
+        dirty_decay_ms: unsafe { raw::read::<libc::ssize_t>(b"opt.dirty_decay_ms\0")? },
+        // SAFETY: jemalloc documents opt.abort_conf as a boolean mallctl value.
+        abort_on_invalid_configuration: unsafe { raw::read::<bool>(b"opt.abort_conf\0")? },
+        background_thread_configured: opt::background_thread::read()?,
+        background_thread_active,
+        statistics_supported,
+        profiling_supported,
+        profiling_enabled,
+        profiling_active,
+    })
+}
+
+#[cfg(local_backend_jemalloc)]
+fn validate_jemalloc_configuration(
+    configuration: &JemallocConfiguration,
+    allocator_trim_enabled: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !allocator_trim_enabled,
+        "LOCAL_BACKEND_MALLOC_TRIM_ENABLED is incompatible with the jemalloc backend build"
+    );
+    anyhow::ensure!(
+        (1..=128).contains(&configuration.narenas),
+        "jemalloc automatic arena limit must be between 1 and 128"
+    );
+    anyhow::ensure!(
+        configuration.abort_on_invalid_configuration,
+        "jemalloc invalid-configuration handling must remain fatal for this backend build"
+    );
+    if crate::JEMALLOC_BACKGROUND_THREAD_SUPPORTED {
+        anyhow::ensure!(
+            configuration.background_thread_configured && configuration.background_thread_active,
+            "jemalloc background threads must remain configured and active for this backend build"
+        );
+    } else {
+        anyhow::ensure!(
+            !configuration.background_thread_configured && !configuration.background_thread_active,
+            "jemalloc background threads must remain disabled when this target does not support \
+             them"
+        );
+    }
+    anyhow::ensure!(
+        configuration.dirty_decay_ms >= 0,
+        "jemalloc dirty-page purging must remain enabled for this backend build"
+    );
+    anyhow::ensure!(
+        configuration.statistics_supported,
+        "jemalloc statistics support is required for this backend build"
+    );
+    anyhow::ensure!(
+        configuration.profiling_supported,
+        "jemalloc profiling support is required for this backend build"
+    );
+    anyhow::ensure!(
+        !configuration.profiling_enabled && !configuration.profiling_active,
+        "jemalloc profiling must remain disabled and inactive for this backend build"
+    );
+    Ok(())
+}
+
+#[cfg(local_backend_jemalloc)]
+fn validate_allocator_configuration(allocator_trim_enabled: bool) -> anyhow::Result<()> {
+    let configuration = jemalloc_configuration()?;
+    validate_jemalloc_configuration(&configuration, allocator_trim_enabled)
+}
+
+#[cfg(all(not(local_backend_jemalloc), target_os = "linux", target_env = "gnu"))]
+fn validate_allocator_configuration(_allocator_trim_enabled: bool) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(
+    not(local_backend_jemalloc),
+    not(all(target_os = "linux", target_env = "gnu"))
+))]
+fn validate_allocator_configuration(allocator_trim_enabled: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !allocator_trim_enabled,
+        "LOCAL_BACKEND_MALLOC_TRIM_ENABLED requires a GNU libc Linux backend build"
+    );
+    Ok(())
 }
 
 fn effective_cgroup_root() -> anyhow::Result<Option<PathBuf>> {
@@ -1913,7 +2322,10 @@ fn parse_keyed_u64(input: &str) -> anyhow::Result<BTreeMap<String, u64>> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_env = "gnu"))]
+    #[cfg(any(
+        not(all(target_os = "linux", target_env = "gnu")),
+        local_backend_jemalloc
+    ))]
     use std::path::Path;
     use std::{
         fs,
@@ -1930,7 +2342,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    #[cfg(target_env = "gnu")]
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
     use super::allocator_arena_count;
     use super::{
         effective_cgroup_root_from,
@@ -2088,7 +2500,7 @@ mod tests {
         assert_eq!(signed_memory_change(40, 40), 0);
     }
 
-    #[cfg(target_env = "gnu")]
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
     #[test]
     fn live_glibc_arena_count_is_bounded_and_nonzero() {
         assert!(allocator_arena_count().unwrap().unwrap() > 0);
@@ -2122,13 +2534,70 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_env = "gnu"))]
+    #[cfg(any(
+        not(all(target_os = "linux", target_env = "gnu")),
+        local_backend_jemalloc
+    ))]
     #[test]
     fn unsupported_allocator_trim_does_not_sample_proc_or_cgroup_files() {
         assert!(matches!(
             super::measure_allocator_trim(Path::new("/missing"), 1).unwrap(),
             super::AllocatorTrimRun::Unsupported
         ));
+    }
+
+    #[cfg(local_backend_jemalloc)]
+    #[test]
+    fn live_jemalloc_configuration_matches_the_backend_contract() {
+        // SAFETY: the backend exports this symbol as a non-null pointer to a
+        // static NUL-terminated configuration string.
+        let malloc_conf = unsafe {
+            let malloc_conf = tikv_jemalloc_sys::malloc_conf.unwrap();
+            std::ffi::CStr::from_ptr(malloc_conf)
+        };
+        let expected: &[u8] = if crate::JEMALLOC_BACKGROUND_THREAD_SUPPORTED {
+            b"abort_conf:true,background_thread:true,narenas:32,prof:false"
+        } else {
+            b"abort_conf:true,narenas:32,prof:false"
+        };
+        assert_eq!(malloc_conf.to_bytes(), expected);
+        super::validate_allocator_configuration(false).unwrap();
+        assert!(super::allocator_arena_count().unwrap().unwrap() > 0);
+        assert!(super::jemalloc_memory().unwrap().allocated_bytes > 0);
+    }
+
+    #[cfg(local_backend_jemalloc)]
+    #[test]
+    fn jemalloc_build_rejects_glibc_trim() {
+        let error = super::validate_allocator_configuration(true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("LOCAL_BACKEND_MALLOC_TRIM_ENABLED is incompatible"));
+    }
+
+    #[cfg(local_backend_jemalloc)]
+    #[test]
+    fn jemalloc_build_requires_profiling_support() {
+        let mut configuration = super::jemalloc_configuration().unwrap();
+        configuration.profiling_supported = false;
+        let error = super::validate_jemalloc_configuration(&configuration, false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "jemalloc profiling support is required for this backend build"
+        );
+    }
+
+    #[cfg(all(
+        not(local_backend_jemalloc),
+        not(all(target_os = "linux", target_env = "gnu"))
+    ))]
+    #[test]
+    fn system_allocator_build_rejects_glibc_trim() {
+        let error = super::validate_allocator_configuration(true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "LOCAL_BACKEND_MALLOC_TRIM_ENABLED requires a GNU libc Linux backend build"
+        );
     }
 
     #[test]
