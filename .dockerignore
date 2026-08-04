@@ -7,6 +7,10 @@
 # Rust-related includes
 !/Cargo.*
 !/crates*/*
+!/third_party/
+!/third_party/mysql_async/
+!/third_party/mysql_async/**
+/third_party/mysql_async/target/
 !/.cargo/*
 !/rust-toolchain
 !/self-hosted/*

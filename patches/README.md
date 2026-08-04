@@ -13,6 +13,22 @@ extension are one queue-control patch. The matching degradable-query client half
 `convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
 chain.
 
+## Database connection reliability
+
+### [Cancellation-safe MySQL connections](cancellation_safe_mysql_connections/README.md)
+
+- Purpose: discard interrupted pooled MySQL connections, with optional server-side cancellation
+  through dedicated control capacity on an operator-asserted trusted topology.
+- Prerequisites: MySQL persistence; no runtime scheduler or function-execution patch.
+- Activation: cancel-safe ownership and client force-disconnect of canceled or incomplete
+  connections are automatic for direct MySQL operations and lease-owned transactions. In the
+  default untrusted-topology mode, cancellation force-closes the client connection and never sends
+  numeric `KILL CONNECTION`. Server-side cancellation requires the strict
+  `MYSQL_SERVER_SIDE_CANCELLATION_TRUSTED_SINGLE_NAMESPACE=true` operator assertion described in
+  the patch essay.
+- Rollback: restore the upstream connection wrapper only after confirming that canceled operations
+  cannot leave pending statements or reusable unread responses.
+
 ## Snapshot and import reliability
 
 ### [Materialize snapshot import ZIPs](snapshot_import_zip_materialization/README.md)

@@ -18,6 +18,7 @@ RUN rustup self update && rustup toolchain install
 # exact revisions.
 ENV CARGO_UNSTABLE_GIT=shallow-deps
 COPY --parents crates* Cargo* ./
+COPY third_party/mysql_async ./third_party/mysql_async
 COPY .cargo ./.cargo
 # Exclusive cache mounts make it safe to remove Git locks left by a canceled
 # BuildKit step before Cargo accesses the persistent repositories.
@@ -89,6 +90,7 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="v$(sed -nE 's/^min_version = "([
 # directory, so the complete Cargo configuration must be present before
 # `cargo chef cook` builds dependencies.
 COPY .cargo ./.cargo
+COPY third_party/mysql_async ./third_party/mysql_async
 COPY --from=chef /tmp/recipe.json recipe.json
 ARG CARGO_BUILD_PROFILE=release
 ARG CARGO_PROFILE_RELEASE_DEBUG=
