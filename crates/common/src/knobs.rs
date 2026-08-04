@@ -538,7 +538,11 @@ pub static LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES: LazyLock<usize> = LazyLock:
 /// Minimum time between explicit glibc trim attempts during one or more
 /// pressure episodes.
 pub static LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_secs(env_config("LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS", 300))
+    Duration::from_secs(
+        env_config_usize_strict("LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS", 300)
+            .try_into()
+            .expect("LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS does not fit in u64"),
+    )
 });
 
 /// Minimum sampled direct-child RSS for sustained cgroup pressure to retire a
@@ -554,10 +558,11 @@ pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES: LazyLock<usize> =
 /// Time internal cgroup pressure must remain active before it may retire a
 /// material local Node executor generation.
 pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_secs(env_config(
-        "LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS",
-        60,
-    ))
+    Duration::from_secs(
+        env_config_usize_strict("LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS", 60)
+            .try_into()
+            .expect("LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS does not fit in u64"),
+    )
 });
 
 /// Reject new external HTTP work when finite cgroup memory headroom is low.

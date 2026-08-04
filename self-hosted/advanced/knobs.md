@@ -77,6 +77,9 @@ different defaults. Changing one requires a backend restart.
 
 ## Cgroup memory-pressure reclamation and admission
 
+The reclamation, allocator-trim, and shedding switches are Linux-only. Enabling any of them on
+another platform fails backend startup.
+
 `LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED` defaults to `false`. When enabled on Linux, the backend
 requires a readable finite cgroup v2 memory limit and enters internal reclamation when headroom
 reaches `LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES`, which defaults to 6 GiB. It clears
@@ -93,14 +96,24 @@ retires its generation only after the signal has remained active for
 `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`. The ordinary Node RSS limit remains the
 higher-priority retirement reason.
 
+A new shared-pressure entry waits behind an in-flight trim only while headroom is above
+`LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES`. At or below that value, owner reclamation
+starts without waiting even when external shedding is disabled. This shedding-entry setting is
+therefore also the trim-deferral cutoff whenever reclamation is enabled. A value at or above the
+reclamation entry removes the trim-first interval; a lower value extends it.
+
 `LOCAL_BACKEND_MALLOC_TRIM_ENABLED` also defaults to `false` and requires internal reclamation to
-be enabled. On glibc builds, an eligible pressure sample calls `malloc_trim(0)` in bounded blocking
-work only when `mallinfo2` reports at least `LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES` of logical
-arena free space, default 1 GiB. Evaluation is limited by
+be enabled. On glibc builds, an eligible pressure sample starts at most one blocking
+`malloc_trim(0)` call only when `mallinfo2` reports at least
+`LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES` of logical free space in the main arena, default 1 GiB.
+Evaluation is limited by
 `LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS`, default 300 seconds. Logical free space and the Boolean
 trim result do not prove resident bytes were released, so the backend records immediate signed
 changes in process RSS, anonymous RSS, cgroup usage, cgroup anonymous memory, and allocator free
-space, plus duration and page faults. Unsupported allocators report that trim is unavailable.
+space, plus duration and page faults. Once the libc call starts it cannot be preempted; one-second
+control sampling continues, asynchronous runtime shutdown does not join its detached native worker,
+and process exit is the termination boundary. Unsupported allocators report that trim is
+unavailable.
 
 The reclamation exit threshold must exceed its entry threshold and remain below the cgroup limit.
 When reclamation and external shedding are both enabled, both reclamation thresholds must preserve

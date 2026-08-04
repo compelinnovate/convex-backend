@@ -228,8 +228,10 @@ After every watchdog observation, proactive trigger precedence in the base patch
 RSS, lifetime imported source-package count, then generation age. When the
 [`backend_memory_resilience`](../backend_memory_resilience/README.md) patch is also carried,
 sustained cgroup pressure with a material direct-child RSS sample follows the ordinary RSS check
-and precedes the package and age checks. These checks remain active while the health endpoint is
-failing. Reaching a proactive
+and precedes the package and age checks. The watchdog observes pressure transitions independently
+of health and RSS sampling. Clearing pressure resets the continuous-pressure grace, and re-entry
+starts a new grace interval. These checks remain active while the health endpoint is failing.
+Reaching a proactive
 threshold closes admission and starts detached drain completion without
 stopping the watchdog loop. On the terminal watchdog miss, unhealthy retirement
 runs before any new proactive drain and can preempt an existing drain that is
@@ -447,6 +449,7 @@ Focused Rust tests cover:
 - shutdown retirement and child reaping;
 - inclusive and ordered RSS/package/age retirement decisions, with cgroup-pressure ordering in the
   backend memory-resilience composition;
+- continuous cgroup-pressure grace resetting after pressure clears and re-enters;
 - strict old-space/RSS configuration validation and Linux RSS parsing;
 - graceful admission closure and drain before proactive retirement;
 - unhealthy watchdog retirement preempting a proactive drain blocked by a

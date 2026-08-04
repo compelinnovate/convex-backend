@@ -3,8 +3,8 @@
 Status: the maintained backend patch accounts for configured and observed memory, reclaims optional
 allocator and local Node state before external admission shedding, exports a shared pressure signal
 for downstream owner-specific patches, and preserves the finite cgroup limit as the hard boundary.
-All controls are disabled by default and require a readable, finite cgroup v2 memory limit when
-enabled.
+All controls are disabled by default. Enabling reclamation, allocator trim, or shedding requires
+Linux; enabling a controller also requires a readable, finite cgroup v2 memory limit.
 
 ## Problem
 
@@ -20,11 +20,18 @@ reclamation and external HTTP shedding, allocator trim, and the shared pressure 
 the maintained local Node generation-retirement patch with a pressure response and exposes the
 signal to later owner-specific patches.
 
-The maintained commit is applied after
+Backend memory resilience is carried as an ordered adoption composition after
 [`local_node_executor_resilience`](../local_node_executor_resilience/README.md), whose generation
 fencing and graceful retirement it reuses, and
 [`shared_base_http_admission`](../shared_base_http_admission/README.md), whose dependency-aware HTTP
-gate it extends. It does not require a context-reuse patch.
+gate it extends. The primary `runtime: add backend memory resilience` commit introduces the memory
+controller and owner responses. The later `node-executor: capture first-miss wedge diagnostics`
+commit supplies continued watchdog checks and health-failure preemption while proactive retirement
+drains. The final `runtime: harden backend memory pressure` integration commit supplies effective
+cgroup discovery, concurrent control sampling during trim, strict parser and configuration handling,
+and corrected Node pressure-grace transitions. Carry these commits in that order; the primary commit
+alone does not implement the settled lifecycle contract. The composition does not require a
+context-reuse patch.
 
 ## Pressure controller
 
@@ -33,36 +40,51 @@ headroom is at or below `LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES` 
 headroom reaches `LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES`. Defaults are 6 GiB and
 8 GiB. The exit boundary must exceed the entry boundary and remain below `memory.max`.
 
-The existing external shedding controller remains independently gated by
+External shedding is independently gated by
 `LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED`, with default 3 GiB entry and 5 GiB exit headroom.
 When both controllers are enabled, the reclamation entry and exit boundaries must each preserve
 more headroom than the corresponding shedding boundary. Invalid relationships fail startup.
 
-The controller samples cgroup headroom every second. On an eligible reclamation sample it first
-evaluates allocator trim in bounded blocking work, then resamples the cgroup. It publishes the
-shared pressure signal only if headroom remains below the reclamation exit condition. A slow or
-failed trim cannot hide a later crossing of the external-shedding boundary. Losing the required
-cgroup source or observing a runtime limit that invalidates configured thresholds triggers
-controlled backend shutdown rather than silently disabling the safety dependency.
+The controller samples cgroup headroom every second. On an eligible reclamation sample it starts at
+most one allocator trim on a detached native worker while control sampling continues, then consumes
+its completion and resamples the cgroup. It publishes the shared pressure signal only if headroom
+remains below the reclamation exit condition. A slow or failed trim cannot hide a later crossing of
+the external-shedding boundary. Once the blocking `malloc_trim` call starts it cannot be preempted;
+the controller continues sampling, asynchronous runtime shutdown does not join the worker, and
+process exit is its termination boundary. Losing the required cgroup source or observing a runtime
+limit that invalidates configured thresholds triggers controlled backend shutdown rather than
+silently disabling the safety dependency.
+
+A new shared-pressure entry waits behind an in-flight trim only while headroom remains above
+`LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES`. At or below that numeric boundary, owner
+reclamation starts without waiting for trim even when external shedding is disabled. The shedding
+entry value is therefore also the trim-deferral cutoff whenever reclamation is enabled. Setting it at
+or above the reclamation entry removes the trim-first interval; setting it lower extends that interval.
 
 ## Allocator reclamation and telemetry
 
 `LOCAL_BACKEND_MALLOC_TRIM_ENABLED` enables explicit glibc `malloc_trim(0)` while reclamation is
 active. It requires reclamation to be enabled. A trim is evaluated only when `mallinfo2` reports at
-least `LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES` of logical free arena space, default 1 GiB, and no
-evaluation has occurred within `LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS`, default 300 seconds.
+least `LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES` of logical free space in the main arena, default
+1 GiB, and no evaluation has occurred within `LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS`, default 300
+seconds.
 
-`mallinfo2` aggregates glibc arenas, but its `fordblks` value is logical allocator free space. It is
-not proof that the same number of resident bytes can be returned. The Boolean `malloc_trim` result
-also does not quantify released memory. Each completed trim therefore records immediate signed
-changes in process RSS, process anonymous RSS, cgroup current usage, cgroup anonymous memory, and
-allocator free bytes. It also records duration and process page faults across the bounded sample.
-Unsupported allocators publish an explicit unsupported outcome and do nothing.
+`mallinfo2` reports its `arena`, `uordblks`, `fordblks`, and `keepcost` fields for the main arena, not
+all glibc arenas. Its mmap fields are process-wide. The allocator memory metric publishes these as
+the `arena`, `in_use`, `free`, `main_arena_top_chunk`, and `mmap` components. Neither main-arena free
+space nor the top-chunk estimate proves that the same number of resident bytes can be returned, and
+the Boolean `malloc_trim` result does not quantify released memory. Each completed trim therefore
+records immediate signed changes in process RSS, process anonymous RSS, cgroup current usage, cgroup
+anonymous memory, and main-arena free bytes. It also records duration and process page faults across
+the before/after sample. Unsupported allocators publish an explicit unsupported outcome and do
+nothing.
 
 Arena-count telemetry uses `malloc_info` with a fixed 4 MiB `fmemopen` buffer and runs once every
 five minutes. Oversized, malformed, or unsupported output is a telemetry failure; it cannot allocate
-an unbounded diagnostic buffer. Allocator sampling, arena counting, full process/cgroup reporting,
-and trim run in blocking work rather than occupying an asynchronous runtime worker.
+an unbounded diagnostic buffer. Allocator sampling, arena counting, and full process/cgroup
+reporting run in blocking work rather than occupying an asynchronous runtime worker. The
+duration-unbounded trim uses the detached native worker described above so it cannot hold
+asynchronous runtime shutdown open.
 
 Trim failure is an optional-recovery failure. It is counted and logged, but it does not suppress the
 shared pressure signal or the Node consumer. A diagnostic or allocator failure must not disable the
@@ -93,9 +115,9 @@ positive and strictly below the ordinary RSS retirement threshold.
 
 The ordinary RSS limit remains the first proactive decision, followed by cgroup pressure, imported
 package count, and generation age. Missing RSS telemetry, a smaller child, a shorter pressure
-interval, or a cleared signal cannot trigger pressure retirement. The existing generation fencing,
-admission close, active-request drain, health-failure preemption, direct-child termination, and
-reaping contract is unchanged. The new bounded retirement reason is `cgroup_pressure`.
+interval, or a cleared signal cannot trigger pressure retirement. The ordered composition preserves
+generation fencing, admission close, active-request drain, health-failure preemption, direct-child
+termination, and reaping. The new bounded retirement reason is `cgroup_pressure`.
 
 ## Observability
 
@@ -123,11 +145,12 @@ distinguish measured zero from unsupported or failed telemetry.
 
 ## Activation and verification
 
-The reclamation, allocator-trim, and external-shedding switches default to `false`. Enabling either
-controller requires a finite cgroup v2 limit. Enabling trim additionally requires reclamation. All
-byte settings use strict nonnegative decimal parsing; trim minimum free space, trim cooldown, Node
-pressure RSS, and Node pressure grace must be positive. Changing the process environment requires a
-backend restart.
+The reclamation, allocator-trim, and external-shedding switches default to `false`. Enabling any of
+them on a non-Linux platform fails startup. Enabling either controller requires a finite cgroup v2
+limit. Enabling trim additionally requires reclamation. When either controller is enabled, all four
+headroom settings use strict nonnegative decimal parsing. Trim minimum free space, trim cooldown,
+Node pressure RSS, and Node pressure grace must be positive. Changing the process environment
+requires a backend restart.
 
 Focused tests cover hysteresis, pressure-signal publication after trim evaluation, trim cooldown and
 signed results, bounded live glibc arena counting, Node RSS and grace requirements, and ordinary-RSS
