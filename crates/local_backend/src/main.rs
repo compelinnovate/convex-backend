@@ -12,12 +12,19 @@ use common::{
         HTTP_SERVER_DEPENDENCY_RESERVE,
         HTTP_SERVER_MAX_CONCURRENT_REQUESTS,
         HTTP_SERVER_TIMEOUT_DURATION,
+        NODE_ACTION_USER_TIMEOUT,
     },
     runtime::Runtime,
     sentry::set_sentry_tags,
     shutdown::ShutdownSignal,
     types::MemberId,
     version::SERVER_VERSION_STR,
+};
+#[cfg(not(target_os = "linux"))]
+use common::knobs::{
+    LOCAL_BACKEND_MALLOC_TRIM_ENABLED,
+    LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED,
+    LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED,
 };
 use db_connection::{
     connect_persistence,
@@ -30,6 +37,7 @@ use futures::{
     },
     FutureExt,
 };
+use function_runner::in_process_function_runner::InProcessFunctionRunner;
 use keybroker::{
     DeploymentSecret,
     KeyBroker,
@@ -48,6 +56,7 @@ use local_backend::{
     router::router,
     HttpActionRouteMapper,
 };
+use node_executor::local::LocalNodeExecutor;
 use runtime::prod::ProdRuntime;
 use tokio::{
     signal::{
@@ -187,10 +196,24 @@ async fn run_server_inner(
         (external_request_shedding, memory_reclamation)
     };
     #[cfg(not(target_os = "linux"))]
-    let (external_request_shedding, memory_reclamation) = (
-        None,
-        common::memory_pressure::MemoryPressureSignal::default(),
-    );
+    let (external_request_shedding, memory_reclamation) = {
+        anyhow::ensure!(
+            !*LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED
+                && !*LOCAL_BACKEND_MALLOC_TRIM_ENABLED
+                && !*LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED,
+            "Backend memory pressure control requires Linux"
+        );
+        (
+            None,
+            common::memory_pressure::MemoryPressureSignal::default(),
+        )
+    };
+
+    InProcessFunctionRunner::<ProdRuntime>::preflight_context_cache_configuration()?;
+    let node_executor_config = LocalNodeExecutor::preflight_configuration(
+        *NODE_ACTION_USER_TIMEOUT + Duration::from_secs(5),
+        memory_reclamation.clone(),
+    )?;
 
     // Use to signal to the http service to stop.
     let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
@@ -217,6 +240,7 @@ async fn run_server_inner(
         shutdown_rx.clone(),
         preempt_signal.clone(),
         memory_reclamation,
+        node_executor_config,
     )
     .await?;
     let router = router(st.clone());

@@ -1,7 +1,13 @@
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs,
-    path::Path,
+    os::unix::ffi::OsStringExt,
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::mpsc,
     time::{
         Duration,
         Instant,
@@ -36,6 +42,7 @@ use common::{
     },
     memory_pressure::MemoryPressureSignal,
     runtime::{
+        propagate_tracing_blocking,
         tokio_spawn_blocking,
         Runtime,
     },
@@ -59,7 +66,10 @@ const ALLOCATOR_ARENA_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MEMORY_REPORTS_PER_ALLOCATOR_ARENA_REPORT: usize =
     (ALLOCATOR_ARENA_REPORT_INTERVAL.as_secs() / REPORT_INTERVAL.as_secs()) as usize;
 const MAX_MALLOC_INFO_BYTES: usize = 4 * 1024 * 1024;
-const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const MAX_MALLOC_INFO_XML_DEPTH: usize = 16;
+const MAX_MALLOC_INFO_TAG_ATTRIBUTES: usize = 16;
+const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
+const PROC_SELF_MOUNTINFO: &str = "/proc/self/mountinfo";
 
 register_convex_gauge!(
     BACKEND_PROCESS_MEMORY_BYTES,
@@ -68,7 +78,7 @@ register_convex_gauge!(
 );
 register_convex_gauge!(
     BACKEND_ALLOCATOR_MEMORY_BYTES,
-    "Memory reported by the backend process allocator",
+    "Main-arena and process-wide mmap memory reported by the backend process allocator",
     &["component"]
 );
 register_convex_gauge!(
@@ -151,7 +161,7 @@ register_convex_gauge!(
 );
 register_convex_gauge!(
     BACKEND_MEMORY_PRESSURE_HEADROOM_BYTES,
-    "Finite cgroup memory headroom used by the external-admission pressure controller"
+    "Finite cgroup memory headroom used by the memory-pressure controller"
 );
 register_convex_gauge!(
     BACKEND_MEMORY_PRESSURE_HEADROOM_THRESHOLD_BYTES,
@@ -200,7 +210,7 @@ register_convex_gauge!(
 );
 register_convex_counter!(
     BACKEND_ALLOCATOR_TRIM_ATTEMPTS_TOTAL,
-    "Explicit backend allocator trim attempts by bounded measurement outcome",
+    "Explicit backend allocator trim attempts by outcome",
     &["outcome"]
 );
 register_convex_histogram!(
@@ -234,7 +244,7 @@ struct AllocatorMemory {
     mmap_bytes: u64,
     in_use_bytes: u64,
     free_bytes: u64,
-    releasable_bytes: u64,
+    main_arena_top_chunk_bytes: u64,
     mmap_regions: u64,
 }
 
@@ -248,6 +258,7 @@ pub struct CgroupMemoryPressureController {
     external_request_shedding: Option<ExternalRequestShedding>,
     shedding_enter_headroom_bytes: u64,
     shedding_exit_headroom_bytes: u64,
+    latest_headroom_bytes: u64,
     memory_reclamation: MemoryPressureSignal,
     reclamation_active: bool,
     reclamation_enabled: bool,
@@ -283,6 +294,37 @@ enum AllocatorTrimRun {
         returned: bool,
         elapsed: Duration,
     },
+}
+
+struct AllocatorTrimTask {
+    completion: mpsc::Receiver<anyhow::Result<()>>,
+}
+
+impl AllocatorTrimTask {
+    fn start(root: PathBuf, min_free_bytes: u64) -> anyhow::Result<Self> {
+        let (completion_tx, completion) = mpsc::sync_channel(1);
+        // Tokio runtime shutdown waits indefinitely for spawn_blocking tasks.
+        // malloc_trim cannot be canceled after it enters libc, so detach this
+        // duration-unbounded call from the runtime and let process exit remain
+        // its final termination boundary.
+        std::thread::Builder::new()
+            .name("backend-allocator-trim".to_owned())
+            .spawn(propagate_tracing_blocking(move || {
+                let _ = completion_tx.send(run_allocator_trim(&root, min_free_bytes));
+            }))?;
+        Ok(Self { completion })
+    }
+
+    fn try_result(&self) -> Option<anyhow::Result<()>> {
+        match self.completion.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                log_allocator_trim_attempt("sample_failure");
+                Some(Err(anyhow::anyhow!("allocator trim worker stopped without a result")))
+            },
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -441,7 +483,9 @@ pub fn initialize_memory_pressure_controller(
         );
     }
 
-    let cgroup = read_cgroup_memory(Path::new(CGROUP_ROOT))?
+    let cgroup_root = effective_cgroup_root()?
+        .context("Memory pressure control requires a mounted cgroup v2 hierarchy")?;
+    let cgroup = read_cgroup_memory(&cgroup_root)?
         .context("Memory pressure control requires the cgroup v2 memory controller")?;
     let max_bytes = cgroup
         .max_bytes
@@ -496,6 +540,7 @@ pub fn initialize_memory_pressure_controller(
             .then(|| ExternalRequestShedding::new(shedding_initially_active)),
         shedding_enter_headroom_bytes,
         shedding_exit_headroom_bytes,
+        latest_headroom_bytes: headroom_bytes,
         // Consumers enter only after the controller has attempted allocator
         // trim for the initial pressure state.
         memory_reclamation: MemoryPressureSignal::default(),
@@ -524,6 +569,7 @@ impl CgroupMemoryPressureController {
             .max_bytes
             .context("Memory pressure control requires a finite cgroup v2 memory limit")?;
         let headroom_bytes = max_bytes.saturating_sub(cgroup.current_bytes);
+        self.latest_headroom_bytes = headroom_bytes;
         log_gauge(
             &BACKEND_MEMORY_PRESSURE_HEADROOM_BYTES,
             headroom_bytes as f64,
@@ -639,8 +685,27 @@ impl CgroupMemoryPressureController {
         true
     }
 
-    fn publish_reclamation_state(&self) {
+    fn publish_reclamation_state(&self, allocator_trim_in_flight: bool) {
         let was_active = self.memory_reclamation.is_active();
+        // Defer only a new reclamation entry while trim has the first chance to
+        // recover. The numeric shedding boundary remains the safety cutoff even
+        // when request shedding is disabled, so owner reclamation cannot remain
+        // behind an unbounded trim. An existing signal still clears immediately
+        // on recovery.
+        let shedding_active = self
+            .external_request_shedding
+            .as_ref()
+            .is_some_and(|shedding| shedding.is_active());
+        let reached_shedding_boundary =
+            self.latest_headroom_bytes <= self.shedding_enter_headroom_bytes;
+        if allocator_trim_in_flight
+            && self.reclamation_active
+            && !was_active
+            && !shedding_active
+            && !reached_shedding_boundary
+        {
+            return;
+        }
         if was_active == self.reclamation_active {
             return;
         }
@@ -654,10 +719,13 @@ impl CgroupMemoryPressureController {
 
 fn update_memory_pressure_controller(
     controller: &mut CgroupMemoryPressureController,
-) -> anyhow::Result<()> {
-    let cgroup = read_cgroup_memory(Path::new(CGROUP_ROOT))?
+) -> anyhow::Result<PathBuf> {
+    let cgroup_root = effective_cgroup_root()?
+        .context("Enabled memory pressure controller lost its mounted cgroup v2 hierarchy")?;
+    let cgroup = read_cgroup_memory(&cgroup_root)?
         .context("Enabled memory pressure controller lost the cgroup v2 memory controller")?;
-    controller.update(&cgroup)
+    controller.update(&cgroup)?;
+    Ok(cgroup_root)
 }
 
 fn pressure_state(
@@ -673,15 +741,8 @@ fn pressure_state(
     }
 }
 
-async fn run_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<()> {
-    let root = root.to_owned();
-    let run = match tokio_spawn_blocking("backend_allocator_trim", move || {
-        measure_allocator_trim(&root, min_free_bytes)
-    })
-    .await
-    .context("allocator trim blocking task failed")
-    .and_then(|result| result)
-    {
+fn run_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<()> {
+    let run = match measure_allocator_trim(root, min_free_bytes) {
         Ok(run) => run,
         Err(error) => {
             log_allocator_trim_attempt("sample_failure");
@@ -795,6 +856,7 @@ fn log_allocator_trim_attempt(outcome: &'static str) {
     );
 }
 
+#[cfg(target_env = "gnu")]
 fn measure_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<AllocatorTrimRun> {
     let before = allocator_trim_snapshot(root)?;
     let Some(allocator) = &before.allocator else {
@@ -809,7 +871,6 @@ fn measure_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<Al
     let returned = explicit_allocator_trim();
     let elapsed = started.elapsed();
     log_gauge(&BACKEND_ALLOCATOR_TRIM_ACTIVE_INFO, 0.0);
-    let returned = returned.context("allocator telemetry was available but trim is unsupported")?;
     let after = allocator_trim_snapshot(root);
     Ok(AllocatorTrimRun::Completed {
         before,
@@ -817,6 +878,11 @@ fn measure_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<Al
         returned,
         elapsed,
     })
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn measure_allocator_trim(_root: &Path, _min_free_bytes: u64) -> anyhow::Result<AllocatorTrimRun> {
+    Ok(AllocatorTrimRun::Unsupported)
 }
 
 fn log_trim_memory_change(component: &'static str, before: u64, after: u64) {
@@ -863,15 +929,10 @@ fn read_process_page_faults() -> anyhow::Result<PageFaults> {
 }
 
 #[cfg(target_env = "gnu")]
-fn explicit_allocator_trim() -> Option<bool> {
+fn explicit_allocator_trim() -> bool {
     // SAFETY: glibc documents `malloc_trim` as MT-Safe. A zero pad asks the
     // allocator to retain no extra main-arena top space.
-    Some(unsafe { libc::malloc_trim(0) } != 0)
-}
-
-#[cfg(not(target_env = "gnu"))]
-fn explicit_allocator_trim() -> Option<bool> {
-    None
+    (unsafe { libc::malloc_trim(0) }) != 0
 }
 
 fn report_allocator_arena_count() -> anyhow::Result<()> {
@@ -915,14 +976,186 @@ fn allocator_arena_count() -> anyhow::Result<Option<usize>> {
     );
     let xml =
         std::str::from_utf8(&contents[..length]).context("malloc_info returned invalid UTF-8")?;
-    let count = xml.match_indices("<heap nr=").count();
-    anyhow::ensure!(count > 0, "malloc_info returned no allocator arenas");
-    Ok(Some(count))
+    Ok(Some(parse_malloc_info_arena_count(xml)?))
 }
 
 #[cfg(not(target_env = "gnu"))]
 fn allocator_arena_count() -> anyhow::Result<Option<usize>> {
     Ok(None)
+}
+
+fn parse_malloc_info_arena_count(xml: &str) -> anyhow::Result<usize> {
+    let bytes = xml.as_bytes();
+    anyhow::ensure!(!bytes.contains(&0), "malloc_info output contains NUL");
+
+    let mut open_tags = [""; MAX_MALLOC_INFO_XML_DEPTH];
+    let mut depth = 0;
+    let mut root_seen = false;
+    let mut root_complete = false;
+    let mut arena_count = 0usize;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'<' {
+            anyhow::ensure!(
+                bytes[index].is_ascii_whitespace(),
+                "malloc_info output contains text outside a tag"
+            );
+            index += 1;
+            continue;
+        }
+        anyhow::ensure!(
+            !root_complete,
+            "malloc_info output contains content after its root element"
+        );
+        index += 1;
+        anyhow::ensure!(
+            index < bytes.len(),
+            "malloc_info output has an incomplete tag"
+        );
+
+        if bytes[index] == b'/' {
+            index += 1;
+            let name = parse_malloc_info_xml_name(xml, &mut index)?;
+            skip_ascii_whitespace(bytes, &mut index);
+            anyhow::ensure!(
+                bytes.get(index) == Some(&b'>'),
+                "malloc_info closing tag is malformed"
+            );
+            index += 1;
+            anyhow::ensure!(depth > 0, "malloc_info output has an unmatched closing tag");
+            anyhow::ensure!(
+                open_tags[depth - 1] == name,
+                "malloc_info output has mismatched tags"
+            );
+            depth -= 1;
+            if depth == 0 {
+                root_complete = true;
+            }
+            continue;
+        }
+
+        let name = parse_malloc_info_xml_name(xml, &mut index)?;
+        if depth == 0 {
+            anyhow::ensure!(!root_seen, "malloc_info output has multiple root elements");
+            anyhow::ensure!(name == "malloc", "malloc_info root element is not malloc");
+            root_seen = true;
+        }
+
+        let mut attributes = [""; MAX_MALLOC_INFO_TAG_ATTRIBUTES];
+        let mut attribute_count = 0;
+        let self_closing = loop {
+            let before_whitespace = index;
+            skip_ascii_whitespace(bytes, &mut index);
+            match bytes.get(index) {
+                Some(b'>') => {
+                    index += 1;
+                    break false;
+                },
+                Some(b'/') if bytes.get(index + 1) == Some(&b'>') => {
+                    index += 2;
+                    break true;
+                },
+                Some(_) => {},
+                None => anyhow::bail!("malloc_info output has an incomplete opening tag"),
+            }
+            anyhow::ensure!(
+                index > before_whitespace,
+                "malloc_info tag attributes are not separated by whitespace"
+            );
+            anyhow::ensure!(
+                attribute_count < attributes.len(),
+                "malloc_info tag has too many attributes"
+            );
+            let attribute = parse_malloc_info_xml_name(xml, &mut index)?;
+            anyhow::ensure!(
+                !attributes[..attribute_count].contains(&attribute),
+                "malloc_info tag has a duplicate attribute"
+            );
+            attributes[attribute_count] = attribute;
+            attribute_count += 1;
+            skip_ascii_whitespace(bytes, &mut index);
+            anyhow::ensure!(
+                bytes.get(index) == Some(&b'='),
+                "malloc_info tag attribute is missing '='"
+            );
+            index += 1;
+            skip_ascii_whitespace(bytes, &mut index);
+            let quote = *bytes
+                .get(index)
+                .context("malloc_info tag attribute is missing a value")?;
+            anyhow::ensure!(
+                quote == b'\'' || quote == b'\"',
+                "malloc_info tag attribute value is not quoted"
+            );
+            index += 1;
+            while bytes.get(index).is_some_and(|byte| *byte != quote) {
+                anyhow::ensure!(
+                    bytes[index] != b'<',
+                    "malloc_info tag attribute value contains '<'"
+                );
+                index += 1;
+            }
+            anyhow::ensure!(
+                bytes.get(index) == Some(&quote),
+                "malloc_info tag attribute value is unterminated"
+            );
+            index += 1;
+        };
+
+        if depth == 1 && name == "heap" {
+            arena_count = arena_count
+                .checked_add(1)
+                .context("malloc_info arena count overflow")?;
+        }
+        if self_closing {
+            if depth == 0 {
+                root_complete = true;
+            }
+        } else {
+            anyhow::ensure!(
+                depth < open_tags.len(),
+                "malloc_info output exceeds its nesting limit"
+            );
+            open_tags[depth] = name;
+            depth += 1;
+        }
+    }
+
+    anyhow::ensure!(root_seen, "malloc_info output has no root element");
+    anyhow::ensure!(
+        root_complete && depth == 0,
+        "malloc_info output is truncated"
+    );
+    anyhow::ensure!(arena_count > 0, "malloc_info returned no allocator arenas");
+    Ok(arena_count)
+}
+
+fn parse_malloc_info_xml_name<'a>(xml: &'a str, index: &mut usize) -> anyhow::Result<&'a str> {
+    let bytes = xml.as_bytes();
+    let start = *index;
+    let first = *bytes
+        .get(*index)
+        .context("malloc_info tag or attribute name is missing")?;
+    anyhow::ensure!(
+        first.is_ascii_alphabetic() || matches!(first, b'_' | b':'),
+        "malloc_info tag or attribute name is invalid"
+    );
+    *index += 1;
+    while bytes.get(*index).is_some_and(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b':' | b'.' | b'-')
+    }) {
+        *index += 1;
+    }
+    Ok(&xml[start..*index])
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], index: &mut usize) {
+    while bytes
+        .get(*index)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        *index += 1;
+    }
 }
 
 pub fn validate_startup_budget() -> anyhow::Result<()> {
@@ -940,7 +1173,11 @@ pub fn validate_startup_budget() -> anyhow::Result<()> {
         vec![StaticMetricLabel::new("component", "configured_total")],
     );
 
-    match startup_budget_headroom(Path::new(CGROUP_ROOT), &budget)? {
+    let headroom = match effective_cgroup_root()? {
+        Some(root) => startup_budget_headroom(&root, &budget)?,
+        None => None,
+    };
+    match headroom {
         Some(headroom_bytes) => {
             log_gauge(&BACKEND_STARTUP_MEMORY_BUDGET_LIMIT_AVAILABLE_INFO, 1.0);
             log_gauge(
@@ -1054,40 +1291,59 @@ pub fn start<RT: Runtime>(
         runtime
             .clone()
             .spawn_background("backend_memory_pressure_controller", async move {
+                let mut allocator_trim: Option<AllocatorTrimTask> = None;
                 loop {
-                    if let Err(error) = update_memory_pressure_controller(&mut controller) {
-                        log_counter(&BACKEND_MEMORY_PRESSURE_FAILURES_TOTAL, 1);
-                        shutdown.signal(error);
-                        return;
-                    }
-                    if controller.claim_allocator_trim() {
-                        if let Err(error) = run_allocator_trim(
-                            Path::new(CGROUP_ROOT),
-                            controller.allocator_trim_min_free_bytes,
-                        )
-                        .await
-                        {
-                            // Trimming is an optional recovery action. Keep the
-                            // remaining reclamation controls available when the
-                            // allocator or its diagnostic snapshot fails.
+                    let mut cgroup_root = match update_memory_pressure_controller(&mut controller) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            log_counter(&BACKEND_MEMORY_PRESSURE_FAILURES_TOTAL, 1);
+                            shutdown.signal(error);
+                            return;
+                        },
+                    };
+                    let completed_trim = allocator_trim
+                        .as_ref()
+                        .and_then(AllocatorTrimTask::try_result);
+                    if let Some(completed) = completed_trim {
+                        allocator_trim = None;
+                        if let Err(error) = completed {
+                            // Trimming is an optional recovery action. Keep
+                            // the remaining reclamation controls available
+                            // when a diagnostic snapshot fails.
                             log_counter(&BACKEND_MEMORY_TELEMETRY_FAILURES_TOTAL, 1);
                             tracing::error!(
                                 "Backend allocator trim or its telemetry failed: {error:#}"
                             );
                         }
-                        // Trim can either recover the reclamation threshold or
-                        // take long enough for headroom to cross the shedding
-                        // threshold. Publish only after a fresh cgroup sample.
-                        if let Err(error) = update_memory_pressure_controller(&mut controller) {
-                            log_counter(&BACKEND_MEMORY_PRESSURE_FAILURES_TOTAL, 1);
-                            shutdown.signal(error);
-                            return;
+                        // A completed trim may have crossed either controller
+                        // boundary. Resample before publishing owner pressure.
+                        cgroup_root = match update_memory_pressure_controller(&mut controller) {
+                            Ok(root) => root,
+                            Err(error) => {
+                                log_counter(&BACKEND_MEMORY_PRESSURE_FAILURES_TOTAL, 1);
+                                shutdown.signal(error);
+                                return;
+                            },
+                        };
+                    }
+                    if allocator_trim.is_none() && controller.claim_allocator_trim() {
+                        let min_free_bytes = controller.allocator_trim_min_free_bytes;
+                        match AllocatorTrimTask::start(cgroup_root, min_free_bytes) {
+                            Ok(task) => allocator_trim = Some(task),
+                            Err(error) => {
+                                log_allocator_trim_attempt("sample_failure");
+                                log_counter(&BACKEND_MEMORY_TELEMETRY_FAILURES_TOTAL, 1);
+                                tracing::error!(
+                                    "Failed to start backend allocator trim worker: {error}"
+                                );
+                            },
                         }
                     }
-                    // Allocator trim is the first pressure action. Context and
-                    // Node consumers observe entry only after it completes or
-                    // is skipped; exit is published in the same sample.
-                    controller.publish_reclamation_state();
+                    // A trim runs independently so the controller keeps its
+                    // one-second cgroup sampling and can activate external
+                    // shedding while allocator work is slow. New owner pressure
+                    // waits for that trim; recovery still clears an old signal.
+                    controller.publish_reclamation_state(allocator_trim.is_some());
                     pressure_runtime.wait(PRESSURE_SAMPLE_INTERVAL).await;
                 }
             });
@@ -1099,8 +1355,11 @@ pub fn start<RT: Runtime>(
             let mut memory_reports_since_allocator_arena_report = 0;
             loop {
                 let report = tokio_spawn_blocking("backend_memory_metrics_sample", || {
-                    let root = Path::new(CGROUP_ROOT);
-                    report_with_cgroup(root, read_cgroup_memory(root))
+                    match effective_cgroup_root() {
+                        Ok(Some(root)) => report_with_cgroup(&root, read_cgroup_memory(&root)),
+                        Ok(None) => report_with_cgroup(Path::new(""), Ok(None)),
+                        Err(error) => report_with_cgroup(Path::new(""), Err(error)),
+                    }
                 })
                 .await;
                 let failures = match report {
@@ -1162,8 +1421,11 @@ pub fn start<RT: Runtime>(
 
 #[cfg(test)]
 fn report() -> Vec<SourceFailure> {
-    let root = Path::new(CGROUP_ROOT);
-    report_with_cgroup(root, read_cgroup_memory(root))
+    match effective_cgroup_root() {
+        Ok(Some(root)) => report_with_cgroup(&root, read_cgroup_memory(&root)),
+        Ok(None) => report_with_cgroup(Path::new(""), Ok(None)),
+        Err(error) => report_with_cgroup(Path::new(""), Err(error)),
+    }
 }
 
 fn report_with_cgroup(
@@ -1219,14 +1481,21 @@ fn report_process_memory() -> anyhow::Result<()> {
 }
 
 fn report_allocator_memory() -> anyhow::Result<()> {
-    if let Some(allocator) = allocator_memory()? {
+    let allocator = match allocator_memory() {
+        Ok(allocator) => allocator,
+        Err(error) => {
+            log_gauge(&BACKEND_ALLOCATOR_TELEMETRY_INFO, 0.0);
+            return Err(error);
+        },
+    };
+    if let Some(allocator) = allocator {
         log_gauge(&BACKEND_ALLOCATOR_TELEMETRY_INFO, 1.0);
         for (component, value) in [
             ("arena", allocator.arena_bytes),
             ("mmap", allocator.mmap_bytes),
             ("in_use", allocator.in_use_bytes),
             ("free", allocator.free_bytes),
-            ("releasable", allocator.releasable_bytes),
+            ("main_arena_top_chunk", allocator.main_arena_top_chunk_bytes),
         ] {
             log_gauge_with_labels(
                 &BACKEND_ALLOCATOR_MEMORY_BYTES,
@@ -1274,6 +1543,7 @@ fn report_cgroup_memory(
     };
     let Some(cgroup) = cgroup else {
         log_gauge(&BACKEND_CGROUP_MEMORY_CONTROLLER_INFO, 0.0);
+        log_gauge(&BACKEND_CGROUP_MEMORY_LIMITED_INFO, 0.0);
         for source in ["cgroup_stat", "cgroup_events"] {
             log_gauge_with_labels(
                 &BACKEND_MEMORY_TELEMETRY_SOURCE_UP_INFO,
@@ -1443,7 +1713,8 @@ fn parse_kib(value: &str) -> anyhow::Result<u64> {
 #[cfg(target_env = "gnu")]
 fn allocator_memory() -> anyhow::Result<Option<AllocatorMemory>> {
     // SAFETY: `mallinfo2` has no arguments and returns a value snapshot. glibc
-    // documents it as MT-Safe.
+    // documents it as MT-Safe. Its arena, in-use, free, and top-chunk fields
+    // cover only the main arena; mmap fields are process-wide.
     let info = unsafe { libc::mallinfo2() };
     let arena_bytes = u64::try_from(info.arena)?;
     let in_use_bytes = u64::try_from(info.uordblks)?;
@@ -1452,17 +1723,17 @@ fn allocator_memory() -> anyhow::Result<Option<AllocatorMemory>> {
         in_use_bytes.checked_add(free_bytes) == Some(arena_bytes),
         "allocator arena accounting does not reconcile"
     );
-    let releasable_bytes = u64::try_from(info.keepcost)?;
+    let main_arena_top_chunk_bytes = u64::try_from(info.keepcost)?;
     anyhow::ensure!(
-        releasable_bytes <= free_bytes,
-        "allocator releasable bytes exceed free arena bytes"
+        main_arena_top_chunk_bytes <= free_bytes,
+        "allocator main-arena top chunk exceeds free arena bytes"
     );
     Ok(Some(AllocatorMemory {
         arena_bytes,
         mmap_bytes: u64::try_from(info.hblkhd)?,
         in_use_bytes,
         free_bytes,
-        releasable_bytes,
+        main_arena_top_chunk_bytes,
         mmap_regions: u64::try_from(info.hblks)?,
     }))
 }
@@ -1472,10 +1743,129 @@ fn allocator_memory() -> anyhow::Result<Option<AllocatorMemory>> {
     Ok(None)
 }
 
+fn effective_cgroup_root() -> anyhow::Result<Option<PathBuf>> {
+    let cgroup = match fs::read_to_string(PROC_SELF_CGROUP) {
+        Ok(cgroup) => cgroup,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mountinfo = match fs::read_to_string(PROC_SELF_MOUNTINFO) {
+        Ok(mountinfo) => mountinfo,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    effective_cgroup_root_from(&cgroup, &mountinfo)
+}
+
+fn effective_cgroup_root_from(cgroup: &str, mountinfo: &str) -> anyhow::Result<Option<PathBuf>> {
+    let mut process_cgroup = None;
+    for line in cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields
+            .next()
+            .context("cgroup entry is missing its hierarchy")?;
+        let controllers = fields
+            .next()
+            .context("cgroup entry is missing its controller list")?;
+        let path = fields.next().context("cgroup entry is missing its path")?;
+        if hierarchy == "0" && controllers.is_empty() {
+            anyhow::ensure!(
+                process_cgroup.is_none(),
+                "process has multiple unified cgroup entries"
+            );
+            let path = PathBuf::from(path);
+            anyhow::ensure!(path.is_absolute(), "unified cgroup path is not absolute");
+            process_cgroup = Some(path);
+        }
+    }
+    let Some(process_cgroup) = process_cgroup else {
+        return Ok(None);
+    };
+
+    let mut best_match: Option<(usize, PathBuf)> = None;
+    for line in mountinfo.lines() {
+        let (mount, filesystem) = line
+            .split_once(" - ")
+            .context("mountinfo entry is missing its filesystem separator")?;
+        let mut filesystem_fields = filesystem.split_whitespace();
+        if filesystem_fields.next() != Some("cgroup2") {
+            continue;
+        }
+        let mut mount_fields = mount.split_whitespace();
+        for _ in 0..3 {
+            mount_fields
+                .next()
+                .context("cgroup2 mountinfo entry is incomplete")?;
+        }
+        let mount_root = decode_mountinfo_path(
+            mount_fields
+                .next()
+                .context("cgroup2 mountinfo entry is missing its root")?,
+        )?;
+        let mount_point = decode_mountinfo_path(
+            mount_fields
+                .next()
+                .context("cgroup2 mountinfo entry is missing its mount point")?,
+        )?;
+        mount_fields
+            .next()
+            .context("cgroup2 mountinfo entry is missing its mount options")?;
+        anyhow::ensure!(
+            mount_root.is_absolute() && mount_point.is_absolute(),
+            "cgroup2 mount paths are not absolute"
+        );
+        let Ok(relative) = process_cgroup.strip_prefix(&mount_root) else {
+            continue;
+        };
+        let specificity = mount_root.components().count();
+        if best_match
+            .as_ref()
+            .is_none_or(|(best_specificity, _)| specificity > *best_specificity)
+        {
+            best_match = Some((specificity, mount_point.join(relative)));
+        }
+    }
+    best_match
+        .map(|(_, root)| root)
+        .context("unified process cgroup is not exposed by a cgroup2 mount")
+        .map(Some)
+}
+
+fn decode_mountinfo_path(value: &str) -> anyhow::Result<PathBuf> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        anyhow::ensure!(
+            index + 3 < bytes.len(),
+            "mountinfo path has an incomplete escape"
+        );
+        let mut octal = 0u8;
+        for digit in &bytes[index + 1..=index + 3] {
+            anyhow::ensure!(
+                (b'0'..=b'7').contains(digit),
+                "mountinfo path has an invalid escape"
+            );
+            octal = octal
+                .checked_mul(8)
+                .and_then(|value| value.checked_add(*digit - b'0'))
+                .context("mountinfo path escape overflow")?;
+        }
+        decoded.push(octal);
+        index += 4;
+    }
+    Ok(PathBuf::from(OsString::from_vec(decoded)))
+}
+
 fn read_cgroup_memory(root: &Path) -> anyhow::Result<Option<CgroupMemory>> {
     let current_path = root.join("memory.current");
     let max_path = root.join("memory.max");
-    match (current_path.exists(), max_path.exists()) {
+    match (current_path.try_exists()?, max_path.try_exists()?) {
         (false, false) => return Ok(None),
         (true, true) => {},
         _ => anyhow::bail!(
@@ -1523,20 +1913,28 @@ fn parse_keyed_u64(input: &str) -> anyhow::Result<BTreeMap<String, u64>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_env = "gnu"))]
+    use std::path::Path;
     use std::{
         fs,
+        path::PathBuf,
         time::{
             Duration,
             Instant,
         },
     };
 
-    use common::memory_pressure::MemoryPressureSignal;
+    use common::{
+        http::ExternalRequestShedding,
+        memory_pressure::MemoryPressureSignal,
+    };
     use tempfile::TempDir;
 
     #[cfg(target_env = "gnu")]
     use super::allocator_arena_count;
     use super::{
+        effective_cgroup_root_from,
+        parse_malloc_info_arena_count,
         parse_process_status,
         pressure_state,
         read_cgroup_memory,
@@ -1564,12 +1962,14 @@ mod tests {
     }
 
     #[test]
-    fn reclamation_signal_is_published_after_controller_state_changes() {
+    fn reclamation_entry_waits_for_trim_only_above_the_shedding_boundary() {
         let signal = MemoryPressureSignal::default();
+        let shedding = ExternalRequestShedding::new(false);
         let mut controller = CgroupMemoryPressureController {
-            external_request_shedding: None,
+            external_request_shedding: Some(shedding.clone()),
             shedding_enter_headroom_bytes: 3,
             shedding_exit_headroom_bytes: 5,
+            latest_headroom_bytes: 100,
             memory_reclamation: signal.clone(),
             reclamation_active: false,
             reclamation_enabled: true,
@@ -1583,13 +1983,26 @@ mod tests {
 
         controller
             .update(&CgroupMemory {
-                current_bytes: 94,
+                current_bytes: 95,
                 max_bytes: Some(100),
             })
             .unwrap();
         assert!(controller.reclamation_active);
+        assert!(!shedding.is_active());
         assert!(!signal.is_active());
-        controller.publish_reclamation_state();
+        controller.publish_reclamation_state(true);
+        assert!(!signal.is_active());
+
+        controller
+            .update(&CgroupMemory {
+                current_bytes: 97,
+                max_bytes: Some(100),
+            })
+            .unwrap();
+        assert!(shedding.is_active());
+        controller.publish_reclamation_state(true);
+        assert!(signal.is_active());
+        controller.publish_reclamation_state(false);
         assert!(signal.is_active());
 
         controller
@@ -1599,9 +2012,48 @@ mod tests {
             })
             .unwrap();
         assert!(!controller.reclamation_active);
+        assert!(!shedding.is_active());
         assert!(signal.is_active());
-        controller.publish_reclamation_state();
+        controller.publish_reclamation_state(true);
         assert!(!signal.is_active());
+    }
+
+    #[test]
+    fn reclamation_entry_does_not_wait_below_shedding_boundary_when_shedding_is_disabled() {
+        let signal = MemoryPressureSignal::default();
+        let mut controller = CgroupMemoryPressureController {
+            external_request_shedding: None,
+            shedding_enter_headroom_bytes: 3,
+            shedding_exit_headroom_bytes: 5,
+            latest_headroom_bytes: 100,
+            memory_reclamation: signal.clone(),
+            reclamation_active: false,
+            reclamation_enabled: true,
+            reclamation_enter_headroom_bytes: 6,
+            reclamation_exit_headroom_bytes: 8,
+            allocator_trim_enabled: false,
+            allocator_trim_min_free_bytes: 1,
+            allocator_trim_cooldown: Duration::from_secs(1),
+            last_allocator_trim_evaluated: None,
+        };
+
+        controller
+            .update(&CgroupMemory {
+                current_bytes: 95,
+                max_bytes: Some(100),
+            })
+            .unwrap();
+        controller.publish_reclamation_state(true);
+        assert!(!signal.is_active());
+
+        controller
+            .update(&CgroupMemory {
+                current_bytes: 97,
+                max_bytes: Some(100),
+            })
+            .unwrap();
+        controller.publish_reclamation_state(true);
+        assert!(signal.is_active());
     }
 
     #[test]
@@ -1611,6 +2063,7 @@ mod tests {
             external_request_shedding: None,
             shedding_enter_headroom_bytes: 3,
             shedding_exit_headroom_bytes: 5,
+            latest_headroom_bytes: 3,
             memory_reclamation: MemoryPressureSignal::default(),
             reclamation_active: true,
             reclamation_enabled: true,
@@ -1639,6 +2092,43 @@ mod tests {
     #[test]
     fn live_glibc_arena_count_is_bounded_and_nonzero() {
         assert!(allocator_arena_count().unwrap().unwrap() > 0);
+    }
+
+    #[test]
+    fn malloc_info_parser_counts_only_structural_heap_elements() {
+        let xml = r#"
+<malloc version="1" note="&lt;heap nr=&quot;9&quot;&gt;">
+  <heap nr="0"><sizes><size from="1" to='2'/></sizes></heap>
+  <heap nr="1"></heap>
+  <total type="rest" count="0" size="0"/>
+</malloc>
+"#;
+        assert_eq!(parse_malloc_info_arena_count(xml).unwrap(), 2);
+    }
+
+    #[test]
+    fn malloc_info_parser_rejects_malformed_or_incomplete_output() {
+        for xml in [
+            "",
+            "<malloc></malloc>",
+            "<malloc><heap nr=\"0\"></malloc>",
+            "<malloc><heap nr=\"0\"></heap>",
+            "<malloc><heap nr=0/></malloc>",
+            "<malloc><heap nr=\"0\" nr=\"1\"/></malloc>",
+            "<malloc><heap nr=\"0\"/></malloc><malloc><heap nr=\"1\"/></malloc>",
+            "<malloc><heap nr=\"0\0\"/></malloc>",
+        ] {
+            assert!(parse_malloc_info_arena_count(xml).is_err(), "{xml:?}");
+        }
+    }
+
+    #[cfg(not(target_env = "gnu"))]
+    #[test]
+    fn unsupported_allocator_trim_does_not_sample_proc_or_cgroup_files() {
+        assert!(matches!(
+            super::measure_allocator_trim(Path::new("/missing"), 1).unwrap(),
+            super::AllocatorTrimRun::Unsupported
+        ));
     }
 
     #[test]
@@ -1698,6 +2188,74 @@ VmSwap:\t50 kB
     fn missing_cgroup_memory_controller_is_explicit() {
         let root = TempDir::new().unwrap();
         assert_eq!(read_cgroup_memory(root.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn effective_cgroup_root_handles_private_and_host_cgroup_namespaces() {
+        let private = effective_cgroup_root_from(
+            "0::/\n",
+            "29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        )
+        .unwrap();
+        assert_eq!(private, Some(PathBuf::from("/sys/fs/cgroup")));
+
+        let host = effective_cgroup_root_from(
+            "0::/system.slice/backend.service\n",
+            "29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        )
+        .unwrap();
+        assert_eq!(
+            host,
+            Some(PathBuf::from("/sys/fs/cgroup/system.slice/backend.service"))
+        );
+
+        let subtree = effective_cgroup_root_from(
+            "0::/system.slice/backend.service\n",
+            "29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n30 23 0:26 /system.slice \
+             /run/cgroup rw - cgroup2 cgroup rw\n",
+        )
+        .unwrap();
+        assert_eq!(subtree, Some(PathBuf::from("/run/cgroup/backend.service")));
+    }
+
+    #[test]
+    fn effective_cgroup_root_decodes_mountinfo_paths() {
+        let root = effective_cgroup_root_from(
+            "0::/tenant/backend\n",
+            "29 23 0:26 /tenant /sys/fs/cgroup\\040space rw - cgroup2 cgroup rw\n",
+        )
+        .unwrap();
+        assert_eq!(root, Some(PathBuf::from("/sys/fs/cgroup space/backend")));
+    }
+
+    #[test]
+    fn effective_cgroup_root_distinguishes_absent_and_unmatched_v2() {
+        assert_eq!(
+            effective_cgroup_root_from(
+                "2:memory:/backend\n",
+                "29 23 0:26 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+            )
+            .unwrap(),
+            None
+        );
+
+        let error = effective_cgroup_root_from(
+            "0::/backend\n",
+            "29 23 0:26 /other /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not exposed"));
+    }
+
+    #[test]
+    fn effective_cgroup_root_rejects_malformed_unified_entries() {
+        for cgroup in ["0::relative\n", "0::/one\n0::/two\n"] {
+            assert!(effective_cgroup_root_from(
+                cgroup,
+                "29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+            )
+            .is_err());
+        }
     }
 
     #[test]

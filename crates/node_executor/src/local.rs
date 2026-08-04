@@ -153,7 +153,8 @@ struct LocalNodeExecutorState {
 }
 
 #[derive(Clone)]
-struct LocalNodeExecutorConfig {
+/// Validated local-Node settings captured before expensive backend startup.
+pub struct LocalNodeExecutorConfig {
     node_process_timeout: Duration,
     /// Overrides the initial callback retry backoff in the spawned node
     /// process (read by syscalls.ts at module load). Tests zero this so
@@ -546,6 +547,36 @@ fn proactive_retirement_reason(
         Some(GenerationRetirementReason::AgeLimit)
     } else {
         None
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MemoryPressureObservation {
+    active_since: Option<Instant>,
+}
+
+impl MemoryPressureObservation {
+    fn new(active: bool, observed_at: Instant) -> Self {
+        Self {
+            active_since: active.then_some(observed_at),
+        }
+    }
+
+    fn observe_publication(&mut self, active: bool, observed_at: Instant) {
+        // The controller publishes only state changes, but a watch receiver can
+        // coalesce false -> true before it is polled. Restarting the grace on
+        // every active publication preserves continuous-pressure semantics in
+        // that case and remains conservative for a redundant publication.
+        self.active_since = active.then_some(observed_at);
+    }
+
+    fn is_active(self) -> bool {
+        self.active_since.is_some()
+    }
+
+    fn active_for(self, observed_at: Instant) -> Option<Duration> {
+        self.active_since
+            .map(|active_since| observed_at.duration_since(active_since))
     }
 }
 
@@ -2303,12 +2334,10 @@ impl LocalNodeExecutor {
         Self::new_with_memory_pressure(node_process_timeout, MemoryPressureSignal::default()).await
     }
 
-    pub async fn new_with_memory_pressure(
+    pub fn preflight_configuration(
         node_process_timeout: Duration,
         memory_pressure: MemoryPressureSignal,
-    ) -> anyhow::Result<Self> {
-        crate::metrics::initialize_local_node_first_miss_diagnostic_counters();
-        let diagnostics_dir = prepare_diagnostic_directory().await;
+    ) -> anyhow::Result<LocalNodeExecutorConfig> {
         let config = LocalNodeExecutorConfig {
             node_process_timeout,
             callback_initial_backoff: None,
@@ -2329,10 +2358,26 @@ impl LocalNodeExecutor {
                 *LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
             )
             .context("Local Node executor package threshold does not fit u64")?,
-            diagnostics_dir,
+            diagnostics_dir: None,
             diagnostic_pruning_in_progress: Arc::new(AtomicBool::new(false)),
         };
         config.validate()?;
+        Ok(config)
+    }
+
+    pub async fn new_with_memory_pressure(
+        node_process_timeout: Duration,
+        memory_pressure: MemoryPressureSignal,
+    ) -> anyhow::Result<Self> {
+        let config = Self::preflight_configuration(node_process_timeout, memory_pressure)?;
+        Self::new_with_configuration(config).await
+    }
+
+    pub async fn new_with_configuration(
+        mut config: LocalNodeExecutorConfig,
+    ) -> anyhow::Result<Self> {
+        crate::metrics::initialize_local_node_first_miss_diagnostic_counters();
+        config.diagnostics_dir = prepare_diagnostic_directory().await;
         let executor = Self {
             state: Arc::new(Mutex::new(LocalNodeExecutorState::default())),
             startup_lock: Mutex::new(()),
@@ -3020,12 +3065,52 @@ impl LocalNodeExecutor {
         expected: Weak<InnerLocalNodeExecutor>,
         config: LocalNodeExecutorConfig,
     ) {
+        let mut memory_pressure = config.memory_pressure.subscribe();
+        let memory_pressure_observation = Arc::new(StdMutex::new(MemoryPressureObservation::new(
+            *memory_pressure.borrow_and_update(),
+            Instant::now(),
+        )));
+        let pressure_tracking_observation = memory_pressure_observation.clone();
+        let pressure_tracking = async move {
+            loop {
+                memory_pressure.changed().await.expect(
+                    "Local Node memory-pressure signal unexpectedly closed while configured",
+                );
+                let active = *memory_pressure.borrow_and_update();
+                pressure_tracking_observation
+                    .lock()
+                    .expect("Local Node memory-pressure observation lock is poisoned")
+                    .observe_publication(active, Instant::now());
+            }
+        };
+        tokio::select! {
+            // A pressure publication and a completed health check can wake this
+            // task together. Apply any ready pressure update before the check
+            // can use the prior episode's grace to start a proactive drain.
+            biased;
+            () = pressure_tracking => {
+                unreachable!("Local Node memory-pressure tracking loop returned")
+            },
+            () = Self::watch_generation_checks(
+                state,
+                expected,
+                config,
+                memory_pressure_observation,
+            ) => {},
+        }
+    }
+
+    async fn watch_generation_checks(
+        state: Weak<Mutex<LocalNodeExecutorState>>,
+        expected: Weak<InnerLocalNodeExecutor>,
+        config: LocalNodeExecutorConfig,
+        memory_pressure_observation: Arc<StdMutex<MemoryPressureObservation>>,
+    ) {
         let mut consecutive_misses = 0;
         let mut previous_package_stats = NodePackageCacheStats::default();
         let mut previous_stack_stats = NodeStackTraceStats::default();
         let latest_process_stat = Arc::new(StdMutex::new(None));
         let mut process_stat_sequence = 0u64;
-        let mut memory_pressure_started_at = None;
         loop {
             tokio::time::sleep(config.watchdog_interval).await;
             let Some(state) = state.upgrade() else {
@@ -3044,14 +3129,17 @@ impl LocalNodeExecutor {
                 return;
             }
 
-            let health_check_started = Instant::now();
-            let (health, rss) = tokio::join!(
-                InnerLocalNodeExecutor::check_server_health(
+            let health_check = async {
+                let started_at = Instant::now();
+                let health = InnerLocalNodeExecutor::check_server_health(
                     &expected.client,
                     config.health_check_timeout,
-                ),
-                read_process_rss(expected.pid),
-            );
+                )
+                .await;
+                (health, started_at.elapsed())
+            };
+            let ((health, health_check_elapsed), rss) =
+                tokio::join!(health_check, read_process_rss(expected.pid),);
             // RSS enforcement is Linux-only. A failed or unsupported sample
             // skips only the RSS trigger for this iteration; age, package, and
             // unhealthy-generation checks remain active.
@@ -3066,8 +3154,6 @@ impl LocalNodeExecutor {
                         .valid_runtime_stats_support(&previous_package_stats, &previous_stack_stats)
                         == Some(expected.runtime_stats_supported)
             });
-            let health_check_elapsed = health_check_started.elapsed();
-
             // A health response can complete after a separate timeout retired
             // this generation. Do not publish an old-generation observation
             // after its replacement.
@@ -3084,15 +3170,12 @@ impl LocalNodeExecutor {
             crate::metrics::set_local_node_child_rss(rss_bytes);
             let generation_age = expected.started_at.elapsed();
             crate::metrics::set_local_node_generation_age(generation_age);
-            let memory_pressure_active = config.memory_pressure.is_active();
+            let memory_pressure = *memory_pressure_observation
+                .lock()
+                .expect("Local Node memory-pressure observation lock is poisoned");
+            let memory_pressure_active = memory_pressure.is_active();
             crate::metrics::set_local_node_memory_pressure_active(memory_pressure_active);
-            let memory_pressure_active_for = if memory_pressure_active {
-                let started_at = memory_pressure_started_at.get_or_insert_with(Instant::now);
-                Some(started_at.elapsed())
-            } else {
-                memory_pressure_started_at = None;
-                None
-            };
+            let memory_pressure_active_for = memory_pressure.active_for(Instant::now());
 
             let should_retire_unhealthy = if let Some(health) = health.filter(|_| success) {
                 consecutive_misses = 0;
@@ -3575,6 +3658,7 @@ mod tests {
             AsyncWriteExt,
         },
         net::UnixListener,
+        sync::oneshot,
     };
 
     use super::*;
@@ -3800,6 +3884,42 @@ mod tests {
                 Some(config.memory_pressure_grace),
             ),
             Some(GenerationRetirementReason::RssLimit)
+        );
+    }
+
+    #[test]
+    fn memory_pressure_observation_requires_continuous_grace() {
+        let first_entry = Instant::now();
+        let mut observation = MemoryPressureObservation::new(true, first_entry);
+        assert_eq!(
+            observation.active_for(first_entry + Duration::from_secs(59)),
+            Some(Duration::from_secs(59))
+        );
+
+        observation.observe_publication(false, first_entry + Duration::from_secs(59));
+        assert!(!observation.is_active());
+        assert_eq!(
+            observation.active_for(first_entry + Duration::from_secs(60)),
+            None
+        );
+
+        let second_entry = first_entry + Duration::from_secs(60);
+        observation.observe_publication(true, second_entry);
+        assert_eq!(
+            observation.active_for(second_entry + Duration::from_secs(59)),
+            Some(Duration::from_secs(59))
+        );
+        assert_eq!(
+            observation.active_for(second_entry + Duration::from_secs(60)),
+            Some(Duration::from_secs(60))
+        );
+
+        // If watch coalesces false -> true, the active publication still
+        // restarts the grace even though the last observed value was true.
+        observation.observe_publication(true, second_entry + Duration::from_secs(60));
+        assert_eq!(
+            observation.active_for(second_entry + Duration::from_secs(119)),
+            Some(Duration::from_secs(59))
         );
     }
 
@@ -4724,6 +4844,111 @@ done
         assert_eq!(health_requests.load(Ordering::Relaxed), 4);
         assert!(state.lock().await.inner.is_none());
         assert!(generation.server_handle.lock().await.child.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pressure_clear_and_reentry_during_health_check_restarts_grace() {
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("executor.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (blocked_health_started_sender, blocked_health_started_receiver) = oneshot::channel();
+        let (release_blocked_health_sender, release_blocked_health_receiver) = oneshot::channel();
+        let (post_reentry_health_started_sender, post_reentry_health_started_receiver) =
+            oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut blocked_health_started_sender = Some(blocked_health_started_sender);
+            let mut release_blocked_health_receiver = Some(release_blocked_health_receiver);
+            let mut post_reentry_health_started_sender = Some(post_reentry_health_started_sender);
+            let mut health_request = 0;
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                health_request += 1;
+                if health_request == 2 {
+                    blocked_health_started_sender
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                    release_blocked_health_receiver
+                        .take()
+                        .unwrap()
+                        .await
+                        .unwrap();
+                } else if health_request == 3 {
+                    post_reentry_health_started_sender
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path)
+            .build()
+            .unwrap();
+        let generation = test_inner_with_client(1, client).await;
+        let state = Arc::new(Mutex::new(LocalNodeExecutorState {
+            inner: Some(generation.clone()),
+            retiring: None,
+            replacement_for_generation: None,
+            next_generation: 1,
+        }));
+        let pressure = MemoryPressureSignal::new(true);
+        let mut config = test_config();
+        config.health_check_timeout = Duration::from_secs(1);
+        config.watchdog_interval = Duration::from_millis(1);
+        config.max_rss_bytes = u64::MAX;
+        config.memory_pressure = pressure.clone();
+        config.memory_pressure_min_rss_bytes = 1;
+        config.memory_pressure_grace = Duration::from_millis(500);
+        let watchdog_task = tokio::spawn(LocalNodeExecutor::watch_generation(
+            Arc::downgrade(&state),
+            Arc::downgrade(&generation),
+            config,
+        ));
+
+        // The first health check establishes the old implementation's sampled
+        // grace. Hold the second check until that grace has expired, then prove
+        // that a clear and re-entry observed during the check starts a new one.
+        blocked_health_started_receiver.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(pressure.set_active(false));
+        assert!(!pressure.set_active(true));
+        release_blocked_health_sender.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), post_reentry_health_started_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state
+            .lock()
+            .await
+            .inner
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &generation)));
+
+        tokio::time::timeout(Duration::from_secs(1), watchdog_task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), generation.wait_until_retired())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.lock().await.inner.is_none());
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

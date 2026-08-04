@@ -7,7 +7,6 @@
 use std::{
     self,
     sync::Arc,
-    time::Duration,
 };
 
 use ::authentication::{
@@ -71,7 +70,10 @@ use model::{
     virtual_system_mapping,
 };
 use node_executor::{
-    local::LocalNodeExecutor,
+    local::{
+        LocalNodeExecutor,
+        LocalNodeExecutorConfig,
+    },
     NodeActions,
 };
 use runtime::prod::ProdRuntime;
@@ -158,6 +160,7 @@ pub async fn make_app(
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
     memory_reclamation: MemoryPressureSignal,
+    node_executor_config: LocalNodeExecutorConfig,
 ) -> anyhow::Result<LocalAppState> {
     let key_broker = config.key_broker()?;
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
@@ -204,14 +207,8 @@ pub async fn make_app(
         region: None,
         class: DeploymentClass::S16,
     };
-    let node_process_timeout = *NODE_ACTION_USER_TIMEOUT + Duration::from_secs(5);
-    let node_executor = Arc::new(
-        LocalNodeExecutor::new_with_memory_pressure(
-            node_process_timeout,
-            memory_reclamation.clone(),
-        )
-        .await?,
-    );
+    let node_executor =
+        Arc::new(LocalNodeExecutor::new_with_configuration(node_executor_config).await?);
     let node_actions = NodeActions::new(
         node_executor,
         config.convex_origin_url()?,

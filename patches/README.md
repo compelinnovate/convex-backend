@@ -5,8 +5,10 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
 a patch, preserve its prerequisites, and verify the effective configuration and metrics after every
 backend replacement.
 
-The maintained backend source chain keeps each product patch in its own operator-adoption commit;
-repository-maintenance commits can remain separate. Lane-aware queueing and its optional deployment
+The maintained backend source chain normally keeps each product patch in its own operator-adoption
+commit; repository-maintenance commits can remain separate. When lifecycle ownership spans patches,
+an explicitly ordered corrective integration commit may complete several earlier adoption commits;
+the owning essays identify those compositions. Lane-aware queueing and its optional deployment
 extension are one queue-control patch. The matching degradable-query client half is maintained in
 `convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
 chain.
@@ -79,8 +81,8 @@ chain.
   requires Linux cgroup v2 with a finite readable memory limit; explicit allocator trim and arena
   counting require glibc.
 - Activation: all pressure switches default to disabled. Internal reclamation, allocator trim, and
-  external shedding have strict independent settings and ordered headroom thresholds documented in
-  the patch essay.
+  external shedding have separate enable switches and ordered headroom thresholds documented in the
+  patch essay. The shedding-entry value also bounds trim deferral while reclamation is enabled.
 - Rollback: restore the previous backend image and remove settings it does not understand; no schema
   or data change is required.
 
