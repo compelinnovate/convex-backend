@@ -10,7 +10,10 @@ use clusters::{
     PersistenceArgs,
 };
 use common::{
-    knobs::DATABASE_USE_PREPARED_STATEMENTS,
+    knobs::{
+        DATABASE_USE_PREPARED_STATEMENTS,
+        MYSQL_SERVER_SIDE_CANCELLATION_TRUSTED_SINGLE_NAMESPACE,
+    },
     persistence::{
         Persistence,
         PersistenceReader,
@@ -21,6 +24,7 @@ use common::{
 };
 use mysql::{
     ConvexMySqlPool,
+    MySqlConnectionIdTopology,
     MySqlOptions,
     MySqlReaderOptions,
 };
@@ -125,7 +129,12 @@ pub fn persistence_seed<RT: Runtime>(
                             &url,
                             *DATABASE_USE_PREPARED_STATEMENTS,
                             require_leader,
-                            Some(runtime),
+                            runtime,
+                            if *MYSQL_SERVER_SIDE_CANCELLATION_TRUSTED_SINGLE_NAMESPACE {
+                                MySqlConnectionIdTopology::TrustedSingleNamespace
+                            } else {
+                                MySqlConnectionIdTopology::Untrusted
+                            },
                         )?),
                         db_name,
                         options,

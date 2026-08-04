@@ -1714,6 +1714,18 @@ pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIM
 pub static MYSQL_MAX_CONNECTIONS: LazyLock<usize> =
     LazyLock::new(|| env_config("MYSQL_MAX_CONNECTIONS", 128));
 
+/// Allow numeric MySQL `KILL CONNECTION` cancellation only when the operator
+/// has verified that data and control connections always share one connection
+/// identifier namespace. Defaults to false because proxies may route the two
+/// connections to different namespaces.
+pub static MYSQL_SERVER_SIDE_CANCELLATION_TRUSTED_SINGLE_NAMESPACE: LazyLock<bool> =
+    LazyLock::new(|| {
+        env_config_bool_strict(
+            "MYSQL_SERVER_SIDE_CANCELLATION_TRUSTED_SINGLE_NAMESPACE",
+            false,
+        )
+    });
+
 /// Minimum number of rows to read from MySQL in a single query.
 pub static MYSQL_MIN_QUERY_BATCH_SIZE: LazyLock<usize> =
     LazyLock::new(|| env_config("MYSQL_MIN_QUERY_BATCH_SIZE", 1));

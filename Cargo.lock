@@ -6614,8 +6614,6 @@ dependencies = [
 [[package]]
 name = "mysql_async"
 version = "0.37.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40d11da0e2d9fad4640c9f9198ee431c6d68444568f83ef1f10f3367270071e4"
 dependencies = [
  "arc-swap",
  "bytes",

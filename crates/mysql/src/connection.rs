@@ -1,6 +1,5 @@
 use std::{
     env,
-    mem,
     path::PathBuf,
     str::FromStr,
     time::Duration,
@@ -28,7 +27,6 @@ use common::{
     },
     runtime::{
         assert_send,
-        tokio_spawn,
         Runtime,
     },
 };
@@ -71,18 +69,26 @@ use prometheus::VMHistogramVec;
 use tokio::time::sleep;
 use url::Url;
 
-use crate::metrics::{
-    begin_transaction_timer,
-    connection_lifetime_timer,
-    get_connection_timer,
-    log_execute,
-    log_large_statement,
-    log_query,
-    log_query_result,
-    log_transaction,
-    new_connection_pool_stats,
-    query_progress_counter,
-    LARGE_STATEMENT_THRESHOLD,
+use crate::{
+    cancellation::{
+        CancellationReservation,
+        MySqlCancellationController,
+        MySqlConnectionIdTopology,
+    },
+    metrics::{
+        begin_transaction_timer,
+        commit_timer,
+        connection_lifetime_timer,
+        get_connection_timer,
+        log_execute,
+        log_large_statement,
+        log_query,
+        log_query_result,
+        log_transaction,
+        new_connection_pool_stats,
+        query_progress_counter,
+        LARGE_STATEMENT_THRESHOLD,
+    },
 };
 
 fn classify_mysql_error(e: mysql_async::Error) -> anyhow::Error {
@@ -122,9 +128,9 @@ fn classify_mysql_error(e: mysql_async::Error) -> anyhow::Error {
 // instances can't start -- and during commit -- which means all future commits
 // fail with OCC errors.
 //
-// To avoid these problems, wrap anything that talks to mysql in with_timeout
-// which will panic, cleaning up all broken connections,
-// if the future takes more than `MYSQL_TIMEOUT` to complete.
+// To avoid these problems, wrap anything that talks to mysql in with_timeout.
+// It returns a classified timeout error after `MYSQL_TIMEOUT`; guarded SQL
+// operations then discard their connection through the cancel-safe owner.
 pub(crate) async fn with_timeout<R, Fut: Future<Output = Result<R, mysql_async::Error>>>(
     f: Fut,
 ) -> anyhow::Result<R> {
@@ -254,7 +260,7 @@ fn format_mysql_binary_protocol(db_name: &str, statement: &str) -> anyhow::Resul
 }
 
 pub(crate) struct MySqlConnection<'a, RT: Runtime> {
-    conn: Conn,
+    conn: Option<Conn>,
     labels: Vec<StaticMetricLabel>,
     pool: &'a ConvexMySqlPool<RT>,
     db_name: &'a str,
@@ -262,15 +268,189 @@ pub(crate) struct MySqlConnection<'a, RT: Runtime> {
     _timer: Timer<VMHistogramVec>,
 }
 
+struct CancelSafeOperation<'a, RT: Runtime> {
+    cancellation: &'a MySqlCancellationController<RT>,
+    ownership:
+        OperationOwnership<'a, Conn, CancellationReservation, MySqlCancellationController<RT>>,
+}
+
+trait OperationControl<T, R> {
+    fn cancel(&self, value: T, reservation: R);
+
+    fn register(&self, value: &T);
+}
+
+impl<RT: Runtime> OperationControl<Conn, CancellationReservation>
+    for MySqlCancellationController<RT>
+{
+    fn cancel(&self, value: Conn, reservation: CancellationReservation) {
+        let _ = MySqlCancellationController::cancel(self, value, reservation);
+    }
+
+    fn register(&self, value: &Conn) {
+        MySqlCancellationController::register(self, value);
+    }
+}
+
+struct OperationOwnership<'a, T, R, C: OperationControl<T, R>> {
+    completed: bool,
+    cancellation: &'a C,
+    value: &'a mut Option<T>,
+    reservation: Option<R>,
+}
+
+impl<'a, T, R, C: OperationControl<T, R>> OperationOwnership<'a, T, R, C> {
+    fn new(value: &'a mut Option<T>, reservation: R, cancellation: &'a C) -> Self {
+        assert!(value.is_some(), "cancel-safe operation requires a value");
+        Self {
+            completed: false,
+            cancellation,
+            value,
+            reservation: Some(reservation),
+        }
+    }
+
+    fn value(&mut self) -> &mut T {
+        self.value
+            .as_mut()
+            .expect("cancel-safe operation lost its value")
+    }
+
+    fn take_for_cancellation(&mut self) -> Option<(T, R)> {
+        match (self.value.take(), self.reservation.take()) {
+            (Some(value), Some(reservation)) => Some((value, reservation)),
+            (None, None) => None,
+            _ => panic!("cancel-safe operation value and reservation diverged"),
+        }
+    }
+
+    fn install(&mut self, value: T, reservation: R) {
+        assert!(
+            self.value.is_none() && self.reservation.is_none(),
+            "cancel-safe operation installed a value while it still owned another value"
+        );
+        self.cancellation.register(&value);
+        *self.value = Some(value);
+        self.reservation = Some(reservation);
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl<T, R, C: OperationControl<T, R>> Drop for OperationOwnership<'_, T, R, C> {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Some((value, reservation)) = self.take_for_cancellation()
+        {
+            self.cancellation.cancel(value, reservation);
+        }
+    }
+}
+
+impl<'a, RT: Runtime> CancelSafeOperation<'a, RT> {
+    async fn begin(
+        value: &'a mut Option<Conn>,
+        cancellation: &'a MySqlCancellationController<RT>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            value.is_some(),
+            "MySQL connection cannot be reused after a canceled operation"
+        );
+        let reservation = cancellation.reserve().await?;
+        Ok(Self {
+            cancellation,
+            ownership: OperationOwnership::new(value, reservation, cancellation),
+        })
+    }
+
+    fn value(&mut self) -> &mut Conn {
+        self.ownership.value()
+    }
+
+    fn complete(mut self) {
+        self.ownership.complete();
+    }
+
+    async fn replace_after_discard(
+        &mut self,
+        replacement: impl Future<Output = anyhow::Result<Conn>>,
+    ) -> anyhow::Result<()> {
+        // Keep the slot empty before polling replacement acquisition. If acquisition
+        // waits or its caller is canceled, the failed value has already been
+        // synchronously discarded.
+        let (value, reservation) = self
+            .ownership
+            .take_for_cancellation()
+            .expect("cancel-safe operation lost its cancellation reservation");
+        let terminal = self.cancellation.cancel(value, reservation).wait().await;
+        anyhow::ensure!(
+            terminal != crate::cancellation::CancellationTerminal::ControlFailure,
+            "MySQL server-side cancellation failed"
+        );
+        let replacement = replacement.await?;
+        let replacement_reservation = self.cancellation.reserve().await?;
+        self.ownership.install(replacement, replacement_reservation);
+        Ok(())
+    }
+}
+
+fn connection_error_requires_discard(error: &anyhow::Error) -> bool {
+    // These errors may leave the protocol stream incomplete. Other server errors
+    // are complete responses, so a caller may catch them and continue using the
+    // same transaction.
+    error.is::<DatabaseOperationalError>() || error.is::<DatabaseTimeoutError>()
+}
+
+fn connection_result_requires_discard<R>(conn: &Conn, result: &anyhow::Result<R>) -> bool {
+    // mysql_async can preserve an ordinary server error while a follow-up
+    // protocol action (notably transaction rollback after failed commit) leaves
+    // the connection disconnected. The returned error alone is not sufficient
+    // to decide whether the server session still needs cancellation.
+    conn.is_disconnected()
+        || result
+            .as_ref()
+            .is_err_and(|error| connection_error_requires_discard(error))
+}
+
+struct TransactionConnectionUse<'a> {
+    poisoned: &'a mut bool,
+}
+
+impl<'a> TransactionConnectionUse<'a> {
+    fn begin(poisoned: &'a mut bool) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !*poisoned,
+            "MySQL transaction connection cannot be reused after a canceled or incomplete \
+             operation"
+        );
+        *poisoned = true;
+        Ok(Self { poisoned })
+    }
+
+    fn complete(self) {
+        *self.poisoned = false;
+    }
+}
+
+struct HandledMySqlOperation<R> {
+    connection_reusable: bool,
+    error_connection_replaced: bool,
+    result: anyhow::Result<R>,
+}
+
 async fn handle_errors_with_retries<R, RT: Runtime>(
-    conn: &mut Conn,
+    operation: &mut CancelSafeOperation<'_, RT>,
     pool: &ConvexMySqlPool<RT>,
     mut f: impl AsyncFnMut(&mut Conn) -> anyhow::Result<R>,
     max_retries: u32,
-) -> anyhow::Result<R> {
+) -> HandledMySqlOperation<R> {
     let mut attempt = 0;
     loop {
-        let (e, should_retry) = match f(conn).await {
+        let result = f(operation.value()).await;
+        let connection_disconnected = operation.value().is_disconnected();
+        let (e, should_retry) = match result {
             Err(e) if e.is::<DatabaseOperationalError>() => (e, attempt < max_retries),
             Err(e) if e.is::<DatabaseTimeoutError>() => {
                 // Don't retry here as we want the caller to receive some
@@ -281,41 +461,60 @@ async fn handle_errors_with_retries<R, RT: Runtime>(
                 // So don't return the connection to the pool.
                 (e, false)
             },
-            r => return r,
+            // Some mysql_async protocol paths return a driver error rather than
+            // the fatal follow-up error that actually disconnected the connection.
+            // Do not let recycler disposal replace authenticated server-side
+            // cancellation for those paths.
+            Err(e) if connection_disconnected => (e, false),
+            result => {
+                return HandledMySqlOperation {
+                    connection_reusable: true,
+                    error_connection_replaced: false,
+                    result,
+                };
+            },
         };
         if should_retry {
             tracing::warn!("Retrying after MySQL error: {e:#}")
-        } else {
+        } else if connection_error_requires_discard(&e) {
             tracing::warn!("Discarding connection after MySQL error: {e:#}")
+        } else {
+            // This branch can carry an ordinary server error preserved across
+            // a fatal driver cleanup failure. Do not add that raw server
+            // message to the new disconnected-state diagnostic.
+            tracing::warn!("Discarding disconnected MySQL connection after driver error")
         }
-        let old_conn = mem::replace(conn, pool.acquire_internal().await?);
+        if let Err(error) = operation
+            .replace_after_discard(pool.acquire_internal())
+            .await
+        {
+            return HandledMySqlOperation {
+                connection_reusable: false,
+                error_connection_replaced: false,
+                result: Err(error),
+            };
+        }
         if should_retry {
-            if let Err(e) = old_conn.disconnect().await {
-                tracing::warn!("Error disconnecting MySQL connection: {e}");
-            }
             attempt += 1;
             continue;
         } else {
-            tokio_spawn("disconnect_mysql_conn", async move {
-                // Disconnecting the connection could take a long time as well,
-                // so do it in the background.
-                if let Err(e) = old_conn.disconnect().await {
-                    tracing::warn!("Error disconnecting MySQL connection: {e}");
-                }
-            });
-            return Err(e);
+            return HandledMySqlOperation {
+                connection_reusable: true,
+                error_connection_replaced: true,
+                result: Err(e),
+            };
         }
     }
 }
 
 async fn handle_errors<R, RT: Runtime>(
-    conn: &mut Conn,
+    operation: &mut CancelSafeOperation<'_, RT>,
     pool: &ConvexMySqlPool<RT>,
     f: impl AsyncFnOnce(&mut Conn) -> anyhow::Result<R>,
-) -> anyhow::Result<R> {
+) -> HandledMySqlOperation<R> {
     let mut f = Some(f);
     handle_errors_with_retries(
-        conn,
+        operation,
         pool,
         async move |conn| f.take().expect("should never retry")(conn).await,
         0, /* max_retries */
@@ -329,7 +528,9 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
     pub async fn execute_many(&mut self, query: &str) -> anyhow::Result<()> {
         log_execute(self.labels.clone());
         let statement = format_mysql_text_protocol(self.db_name, query, vec![], &self.labels)?;
-        handle_errors(&mut self.conn, self.pool, async move |conn| {
+        let mut operation =
+            CancelSafeOperation::begin(&mut self.conn, &self.pool.cancellation).await?;
+        let result = handle_errors(&mut operation, self.pool, async move |conn| {
             // Every statement after the first runs only as its result set is
             // consumed, and reports its error only there. Dropping the result
             // instead leaves them pending on the connection, so they run if it
@@ -338,8 +539,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
             with_timeout(result.drop_result()).await?;
             Ok(())
         })
-        .await?;
-        Ok(())
+        .await;
+        if result.connection_reusable {
+            operation.complete();
+        }
+        result.result
     }
 
     /// Run a readonly query that returns one or zero results.
@@ -350,30 +554,43 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<Option<Row>> {
         log_query(self.labels.clone());
-        let row = if self.pool.use_prepared_statements {
-            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+        let (statement, prepared_params) = if self.pool.use_prepared_statements {
+            (
+                format_mysql_binary_protocol(self.db_name, statement)?,
+                Some(params),
+            )
+        } else {
+            (
+                format_mysql_text_protocol(self.db_name, statement, params, &self.labels)?,
+                None,
+            )
+        };
+        let mut operation =
+            CancelSafeOperation::begin(&mut self.conn, &self.pool.cancellation).await?;
+        let result = if let Some(params) = prepared_params {
             handle_errors_with_retries(
-                &mut self.conn,
+                &mut operation,
                 self.pool,
                 async move |conn| with_timeout(conn.exec_first(&statement, params.clone())).await,
                 *MYSQL_MAX_QUERY_RETRIES,
             )
-            .await?
+            .await
         } else {
-            let statement =
-                format_mysql_text_protocol(self.db_name, statement, params, &self.labels)?;
             handle_errors_with_retries(
-                &mut self.conn,
+                &mut operation,
                 self.pool,
                 async move |conn| with_timeout(conn.query_first(&statement)).await,
                 *MYSQL_MAX_QUERY_RETRIES,
             )
-            .await?
+            .await
         };
-        if let Some(row) = &row {
+        if result.connection_reusable {
+            operation.complete();
+        }
+        if let Ok(Some(row)) = &result.result {
             log_query_result(self.labels.clone()).add_row(row);
         }
-        Ok(row)
+        result.result
     }
 
     /// Run a readonly query and collect the results, mapping them with `f`
@@ -387,17 +604,27 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
     ) -> anyhow::Result<Vec<R>> {
         let labels = self.labels.clone();
         log_query(labels.clone());
-        if self.pool.use_prepared_statements {
-            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+        let (statement, prepared_params) = if self.pool.use_prepared_statements {
+            (
+                format_mysql_binary_protocol(self.db_name, statement)?,
+                Some(params),
+            )
+        } else {
+            (
+                format_mysql_text_protocol(self.db_name, statement, params, &self.labels)?,
+                None,
+            )
+        };
+        let mut operation =
+            CancelSafeOperation::begin(&mut self.conn, &self.pool.cancellation).await?;
+        let result = if let Some(params) = prepared_params {
             assert_send(handle_errors_with_retries(
-                &mut self.conn,
+                &mut operation,
                 self.pool,
                 async move |conn| {
-                    // Any error or dropped stream after this point leaves the connection
-                    // open with MySQL sending data into it. In the worst case, the data
-                    // will be consumed & dropped by the *next* client.acquire(), which can
-                    // make it hard to attribute latency. Therefore we start a progress
-                    // counter that will log if the stream is dropped before being consumed.
+                    // The outer cancel-safe owner disconnects this connection if the stream is
+                    // canceled or returns an error. The progress counter records incomplete
+                    // consumption before ownership is discarded.
                     let progress_counter = query_progress_counter(size_hint, labels.clone());
                     Self::collect_query_stream(
                         with_timeout(
@@ -414,10 +641,8 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
             ))
             .await
         } else {
-            let statement =
-                format_mysql_text_protocol(self.db_name, statement, params, &self.labels)?;
             assert_send(handle_errors_with_retries(
-                &mut self.conn,
+                &mut operation,
                 self.pool,
                 async move |conn| {
                     let progress_counter = query_progress_counter(size_hint, labels.clone());
@@ -432,7 +657,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
                 *MYSQL_MAX_QUERY_RETRIES,
             ))
             .await
+        };
+        if result.result.is_ok() || result.error_connection_replaced {
+            operation.complete();
         }
+        result.result
     }
 
     async fn collect_query_stream<R>(
@@ -466,53 +695,105 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<u64> {
         log_execute(self.labels.clone());
-        let affected_rows = if self.pool.use_prepared_statements {
-            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
-            handle_errors(&mut self.conn, self.pool, async move |conn| {
-                Ok(
-                    with_timeout(conn.exec_iter(statement, Params::Positional(params)))
-                        .await?
-                        .affected_rows(),
-                )
-            })
-            .await?
+        let (statement, prepared_params) = if self.pool.use_prepared_statements {
+            (
+                format_mysql_binary_protocol(self.db_name, statement)?,
+                Some(params),
+            )
         } else {
-            let statement =
-                format_mysql_text_protocol(self.db_name, statement, params, &self.labels)?;
-            handle_errors(&mut self.conn, self.pool, async move |conn| {
-                Ok(with_timeout(conn.query_iter(statement))
-                    .await?
-                    .affected_rows())
-            })
-            .await?
+            (
+                format_mysql_text_protocol(self.db_name, statement, params, &self.labels)?,
+                None,
+            )
         };
-        Ok(affected_rows)
+        let mut operation =
+            CancelSafeOperation::begin(&mut self.conn, &self.pool.cancellation).await?;
+        let result = if let Some(params) = prepared_params {
+            handle_errors(&mut operation, self.pool, async move |conn| {
+                with_timeout(async {
+                    let result = conn
+                        .exec_iter(statement, Params::Positional(params))
+                        .await?;
+                    let affected_rows = result.affected_rows();
+                    result.drop_result().await?;
+                    Ok(affected_rows)
+                })
+                .await
+            })
+            .await
+        } else {
+            handle_errors(&mut operation, self.pool, async move |conn| {
+                with_timeout(async {
+                    let result = conn.query_iter(statement).await?;
+                    let affected_rows = result.affected_rows();
+                    result.drop_result().await?;
+                    Ok(affected_rows)
+                })
+                .await
+            })
+            .await
+        };
+        if result.connection_reusable {
+            operation.complete();
+        }
+        result.result
     }
 
     #[fastrace::trace]
-    pub async fn transaction(
+    pub async fn transaction<F, T>(
         &mut self,
         db_cluster_name: &str,
         isolation: Option<IsolationLevel>,
-    ) -> anyhow::Result<MySqlTransaction<'_>> {
+        f: F,
+    ) -> anyhow::Result<T>
+    where
+        F: for<'b> AsyncFnOnce(&'b mut MySqlTransaction<'_>) -> anyhow::Result<T>,
+    {
         let timer = begin_transaction_timer(db_cluster_name);
         log_transaction(self.labels.clone());
-        let mut tx_opts = TxOpts::new();
-        if let Some(isolation) = isolation {
+        let mut operation =
+            CancelSafeOperation::begin(&mut self.conn, &self.pool.cancellation).await?;
+        let mut transaction_connection_poisoned = false;
+        let result: anyhow::Result<T> = async {
+            let mut tx_opts = TxOpts::new();
             tx_opts.with_isolation_level(isolation);
+            let inner = with_timeout(operation.value().start_transaction(tx_opts)).await?;
+            timer.finish();
+            let mut transaction = MySqlTransaction {
+                inner,
+                use_prepared_statements: self.pool.use_prepared_statements,
+                db_name: self.db_name,
+                labels: &self.labels,
+                connection_poisoned: &mut transaction_connection_poisoned,
+            };
+            let value = f(&mut transaction).await?;
+            let timer = commit_timer(db_cluster_name);
+            transaction.commit().await?;
+            timer.finish();
+            Ok(value)
         }
-        let inner = with_timeout(self.conn.start_transaction(tx_opts)).await?;
-        timer.finish();
-        Ok(MySqlTransaction {
-            inner,
-            use_prepared_statements: self.pool.use_prepared_statements,
-            db_name: self.db_name,
-            labels: &self.labels,
-        })
+        .await;
+        let connection_requires_discard = transaction_connection_poisoned
+            || connection_result_requires_discard(operation.value(), &result);
+        if connection_requires_discard {
+            return match result {
+                Ok(_) => Err(anyhow::anyhow!(
+                    "MySQL transaction connection was left unusable by a canceled or incomplete \
+                     operation"
+                )),
+                Err(error) => Err(error),
+            };
+        }
+        operation.complete();
+        result
     }
+}
 
-    pub async fn handle_errors<R>(&mut self, r: anyhow::Result<R>) -> anyhow::Result<R> {
-        handle_errors(&mut self.conn, self.pool, async move |_| r).await
+impl<RT: Runtime> Drop for MySqlConnection<'_, RT> {
+    fn drop(&mut self) {
+        if let Some(conn) = &self.conn {
+            self.pool.cancellation.unregister(conn);
+        }
     }
 }
 
@@ -521,6 +802,7 @@ pub(crate) struct MySqlTransaction<'a> {
     use_prepared_statements: bool,
     db_name: &'a str,
     labels: &'a [StaticMetricLabel],
+    connection_poisoned: &'a mut bool,
 }
 
 impl MySqlTransaction<'_> {
@@ -531,15 +813,28 @@ impl MySqlTransaction<'_> {
         statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<Option<Row>> {
-        let future = if self.use_prepared_statements {
-            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+        let (statement, prepared_params) = if self.use_prepared_statements {
+            (
+                format_mysql_binary_protocol(self.db_name, statement)?,
+                Some(params),
+            )
+        } else {
+            (
+                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?,
+                None,
+            )
+        };
+        let operation = TransactionConnectionUse::begin(self.connection_poisoned)?;
+        let future = if let Some(params) = prepared_params {
             self.inner.exec_first(statement, Params::Positional(params))
         } else {
-            let statement =
-                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
             self.inner.query_first(statement)
         };
-        with_timeout(future).await
+        let result = with_timeout(future).await;
+        if !connection_result_requires_discard(&self.inner, &result) {
+            operation.complete();
+        }
+        result
     }
 
     /// Executes the given statement and drops the result.
@@ -548,15 +843,28 @@ impl MySqlTransaction<'_> {
         statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<()> {
-        let future = if self.use_prepared_statements {
-            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+        let (statement, prepared_params) = if self.use_prepared_statements {
+            (
+                format_mysql_binary_protocol(self.db_name, statement)?,
+                Some(params),
+            )
+        } else {
+            (
+                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?,
+                None,
+            )
+        };
+        let operation = TransactionConnectionUse::begin(self.connection_poisoned)?;
+        let future = if let Some(params) = prepared_params {
             self.inner.exec_drop(statement, Params::Positional(params))
         } else {
-            let statement =
-                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
             self.inner.query_drop(statement)
         };
-        with_timeout(future).await
+        let result = with_timeout(future).await;
+        if !connection_result_requires_discard(&self.inner, &result) {
+            operation.complete();
+        }
+        result
     }
 
     /// Execute a SQL statement, returning the number of rows affected.
@@ -565,29 +873,65 @@ impl MySqlTransaction<'_> {
         statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<u64> {
-        let affected_rows = if self.use_prepared_statements {
-            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
-            with_timeout(self.inner.exec_iter(statement, Params::Positional(params)))
-                .await?
-                .affected_rows()
+        let (statement, prepared_params) = if self.use_prepared_statements {
+            (
+                format_mysql_binary_protocol(self.db_name, statement)?,
+                Some(params),
+            )
         } else {
-            let statement =
-                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
-            with_timeout(self.inner.query_iter(statement))
-                .await?
-                .affected_rows()
+            (
+                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?,
+                None,
+            )
         };
-        Ok(affected_rows)
+        let operation = TransactionConnectionUse::begin(self.connection_poisoned)?;
+        let result = if let Some(params) = prepared_params {
+            with_timeout(async {
+                let result = self
+                    .inner
+                    .exec_iter(statement, Params::Positional(params))
+                    .await?;
+                let affected_rows = result.affected_rows();
+                result.drop_result().await?;
+                Ok(affected_rows)
+            })
+            .await
+        } else {
+            with_timeout(async {
+                let result = self.inner.query_iter(statement).await?;
+                let affected_rows = result.affected_rows();
+                result.drop_result().await?;
+                Ok(affected_rows)
+            })
+            .await
+        };
+        if !connection_result_requires_discard(&self.inner, &result) {
+            operation.complete();
+        }
+        result
     }
 
     pub async fn commit(self) -> anyhow::Result<()> {
-        with_timeout(self.inner.commit()).await?;
-        Ok(())
+        let Self {
+            inner,
+            connection_poisoned,
+            ..
+        } = self;
+        let operation = TransactionConnectionUse::begin(connection_poisoned)?;
+        let result = with_timeout(inner.commit()).await;
+        if !result
+            .as_ref()
+            .is_err_and(|error| connection_error_requires_discard(error))
+        {
+            operation.complete();
+        }
+        result
     }
 }
 
 pub struct ConvexMySqlPool<RT: Runtime> {
     pool: Pool,
+    cancellation: MySqlCancellationController<RT>,
     use_prepared_statements: bool,
     runtime: Option<RT>,
     stats: ConnectionPoolStats,
@@ -617,7 +961,8 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
         url: &Url,
         use_prepared_statements: bool,
         require_leader: bool,
-        runtime: Option<RT>,
+        runtime: RT,
+        connection_id_topology: MySqlConnectionIdTopology,
     ) -> anyhow::Result<Self> {
         let cluster_name = derive_cluster_name(url).to_owned();
         // NOTE: the inactive_connection_ttl only applies to connections > min
@@ -678,16 +1023,39 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
                 .with_root_certs(vec![ca_file_path.into()]);
             opts = opts.ssl_opts(ssl_opts);
         }
+        let opts: Opts = opts.into();
+        let control_pool_opts = PoolOpts::new()
+            // Keep the initialized control transport for the lifetime of the
+            // cancellation lane. Replacing it could cross a server restart or
+            // backend namespace boundary where numeric connection IDs repeat.
+            .with_constraints(PoolConstraints::new(1, 1).unwrap())
+            .with_reset_connection(false);
+        let control_pool =
+            Pool::new(OptsBuilder::from_opts(opts.clone()).pool_opts(control_pool_opts));
+        let cancellation = MySqlCancellationController::new(
+            control_pool,
+            runtime.clone(),
+            *MYSQL_MAX_CONNECTIONS,
+            cluster_name.clone(),
+            connection_id_topology,
+        );
         Ok(Self {
             pool: Pool::new(opts),
+            cancellation,
             use_prepared_statements,
-            runtime,
+            runtime: Some(runtime),
             stats: new_connection_pool_stats(cluster_name.as_str()),
             cluster_name,
         })
     }
 
     pub(crate) async fn acquire_internal(&self) -> anyhow::Result<Conn> {
+        // In trusted-single-namespace mode, establish the persistent control
+        // transport first, so every data connection belongs to the same or a
+        // later server epoch. If the server changes afterward,
+        // control-generation validation fails closed. This is a no-op for the
+        // safe-default client-disconnect mode.
+        self.cancellation.initialize().await?;
         let pool_get_timer = get_connection_timer(&self.cluster_name);
         let conn = with_timeout(self.pool.get_conn())
             .trace_if_pending(func_path!()) // only trace if slow
@@ -702,8 +1070,9 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
         db_name: &'a str,
     ) -> anyhow::Result<MySqlConnection<'a, RT>> {
         let conn = self.acquire_internal().await?;
+        self.cancellation.register(&conn);
         Ok(MySqlConnection {
-            conn,
+            conn: Some(conn),
             labels: vec![
                 StaticMetricLabel::new("name", name),
                 StaticMetricLabel::new("cluster_name", self.cluster_name.clone()),
@@ -728,7 +1097,10 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         tracing::info!("Shutting down ConvexMySqlPool");
-        Ok(self.pool.clone().disconnect().await?)
+        let data_pool_result = self.pool.clone().disconnect().await;
+        let cancellation_result = self.cancellation.shutdown().await;
+        data_pool_result?;
+        cancellation_result
     }
 }
 
@@ -739,9 +1111,122 @@ impl<RT: Runtime> Drop for ConvexMySqlPool<RT> {
             return;
         };
         let pool = self.pool.clone();
+        let cancellation = self.cancellation.clone();
         runtime.spawn_background("mysql_pool_disconnect", async move {
-            let _ = pool.disconnect().await;
-            tracing::info!("ConvexMySqlPool pool successfully closed");
+            let data_pool_result = pool.disconnect().await;
+            let cancellation_result = cancellation.shutdown().await;
+            if data_pool_result.is_ok() && cancellation_result.is_ok() {
+                tracing::info!("ConvexMySqlPool pool successfully closed");
+            } else {
+                tracing::error!("ConvexMySqlPool pool shutdown failed");
+            }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::{
+        OperationControl,
+        OperationOwnership,
+        TransactionConnectionUse,
+    };
+
+    #[derive(Default)]
+    struct RecordingOperationControl {
+        cancellations: Mutex<Vec<(u64, u64)>>,
+        registrations: Mutex<Vec<u64>>,
+    }
+
+    impl OperationControl<u64, u64> for RecordingOperationControl {
+        fn cancel(&self, value: u64, reservation: u64) {
+            self.cancellations
+                .lock()
+                .unwrap()
+                .push((value, reservation));
+        }
+
+        fn register(&self, value: &u64) {
+            self.registrations.lock().unwrap().push(*value);
+        }
+    }
+
+    #[test]
+    fn incomplete_operation_drop_cancels_once_and_removes_owned_value() {
+        let control = RecordingOperationControl::default();
+        let mut value = Some(1);
+        {
+            let _ownership = OperationOwnership::new(&mut value, 10, &control);
+        }
+
+        assert_eq!(value, None);
+        assert_eq!(*control.cancellations.lock().unwrap(), vec![(1, 10)]);
+    }
+
+    #[test]
+    fn replacement_is_registered_only_when_installed_with_reservation() {
+        let control = RecordingOperationControl::default();
+        let mut value = Some(1);
+        {
+            let mut ownership = OperationOwnership::new(&mut value, 10, &control);
+
+            assert_eq!(ownership.take_for_cancellation(), Some((1, 10)));
+            assert!(ownership.value.is_none());
+            assert!(control.registrations.lock().unwrap().is_empty());
+            ownership.install(2, 20);
+            assert_eq!(*ownership.value(), 2);
+            ownership.complete();
+        }
+        assert_eq!(value, Some(2));
+        assert_eq!(*control.registrations.lock().unwrap(), vec![2]);
+        assert!(control.cancellations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_take_cannot_discard_the_same_value_twice() {
+        let control = RecordingOperationControl::default();
+        let mut value = Some(1);
+        let mut ownership = OperationOwnership::new(&mut value, 10, &control);
+
+        assert_eq!(ownership.take_for_cancellation(), Some((1, 10)));
+        assert_eq!(ownership.take_for_cancellation(), None);
+        drop(ownership);
+        assert!(control.cancellations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_replacement_reservation_leaves_ownership_empty_and_unregistered() {
+        let control = RecordingOperationControl::default();
+        let mut value = Some(1);
+        {
+            let mut ownership = OperationOwnership::new(&mut value, 10, &control);
+            assert_eq!(ownership.take_for_cancellation(), Some((1, 10)));
+            let _replacement_acquired_before_failed_reservation = 2;
+        }
+        assert_eq!(value, None);
+        assert!(control.registrations.lock().unwrap().is_empty());
+        assert!(control.cancellations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn poisoned_transaction_operation_prevents_reuse() {
+        let mut poisoned = false;
+        {
+            let _operation = TransactionConnectionUse::begin(&mut poisoned).unwrap();
+        }
+        assert!(poisoned);
+        assert!(TransactionConnectionUse::begin(&mut poisoned).is_err());
+    }
+
+    #[test]
+    fn completed_transaction_operation_allows_reuse() {
+        let mut poisoned = false;
+        TransactionConnectionUse::begin(&mut poisoned)
+            .unwrap()
+            .complete();
+        assert!(!poisoned);
+        assert!(TransactionConnectionUse::begin(&mut poisoned).is_ok());
     }
 }

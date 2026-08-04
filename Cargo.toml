@@ -1,7 +1,7 @@
 [workspace]
 members = [ "crates/*", "crates/convex/sync_types" ]
 resolver = "2"
-exclude = [ "crates/py_client", "crates/python_client_tests" ]
+exclude = [ "crates/py_client", "crates/python_client_tests", "third_party/mysql_async" ]
 
 [workspace.dependencies]
 aes = { version = "0.8.4" }
@@ -139,7 +139,7 @@ moka = { version = "0.12", features = [ "future", "sync" ] }
 multer = "3.1.0"
 must-let = { git = "https://github.com/sujayakar/must-let", rev = "5b487d78db235e396e61dd03ce261ced0eafff9d" }
 mysql = { path = "crates/mysql" }
-mysql_async = { version = "0.37.1", default-features = false, features = [ "default-rustls" ] }
+mysql_async = { path = "third_party/mysql_async", default-features = false, features = [ "default-rustls" ] }
 native-tls = { version = "0.2", features = [ "alpn", "vendored" ] }
 node_executor = { path = "crates/node_executor" }
 oauth2 = { version = "5", default-features = false, features = [ "reqwest" ] }

@@ -27,6 +27,42 @@ fn cluster_name_label(cluster_name: &str) -> StaticMetricLabel {
     StaticMetricLabel::new("cluster_name", cluster_name.to_owned())
 }
 
+register_convex_counter!(
+    MYSQL_CANCELLATION_REQUESTED_TOTAL,
+    "Number of requested MySQL connection cancellations",
+    &["cluster_name"]
+);
+pub fn log_mysql_cancellation_requested(cluster_name: &str) {
+    log_counter_with_labels(
+        &MYSQL_CANCELLATION_REQUESTED_TOTAL,
+        1,
+        vec![cluster_name_label(cluster_name)],
+    );
+}
+
+register_convex_counter!(
+    MYSQL_CANCELLATION_TERMINAL_TOTAL,
+    "Number of terminal MySQL connection cancellation outcomes",
+    &["outcome", "cluster_name"]
+);
+register_convex_histogram!(
+    MYSQL_CANCELLATION_SECONDS,
+    "Time from a MySQL connection cancellation request to its terminal outcome",
+    &["outcome", "cluster_name"]
+);
+pub fn log_mysql_cancellation_terminal(
+    cluster_name: &str,
+    outcome: &'static str,
+    elapsed: std::time::Duration,
+) {
+    let labels = vec![
+        StaticMetricLabel::new("outcome", outcome),
+        cluster_name_label(cluster_name),
+    ];
+    log_counter_with_labels(&MYSQL_CANCELLATION_TERMINAL_TOTAL, 1, labels.clone());
+    log_distribution_with_labels(&MYSQL_CANCELLATION_SECONDS, elapsed.as_secs_f64(), labels);
+}
+
 fn persistence_global_key_label(key: PersistenceGlobalKey) -> StaticMetricLabel {
     StaticMetricLabel::new("key", String::from(key))
 }

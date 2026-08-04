@@ -2,6 +2,7 @@
 #![feature(proc_macro_hygiene)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(try_blocks_heterogeneous)]
+mod cancellation;
 mod chunks;
 mod connection;
 mod document_encoding;
@@ -15,6 +16,7 @@ use std::{
     sync::Arc,
 };
 
+pub use cancellation::MySqlConnectionIdTopology;
 use common::{
     persistence::{
         Persistence,
