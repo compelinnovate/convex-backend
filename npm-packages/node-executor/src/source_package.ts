@@ -33,7 +33,13 @@ export type Package = {
   sha256: string;
 };
 
-const moduleEnvironmentSchema = z.enum(["node", "isolate"]);
+const moduleEnvironmentSchema = z.union([
+  z.enum(["node", "isolate"]),
+  z
+    .string()
+    .regex(/^node:pool:(?!default$)[a-z][a-z0-9_]{0,31}$/)
+    .transform(() => "node" as const),
+]);
 type ModuleEnvironment = z.infer<typeof moduleEnvironmentSchema>;
 const modulePathSchema = z.string().refine((modulePath) => {
   const normalizedModulePath = path.posix.normalize(modulePath);
@@ -242,19 +248,60 @@ function parseMetadataFile(contents: string): MetadataJson {
   }
 
   metadataJson.modulePaths.sort();
+  for (let index = 1; index < metadataJson.modulePaths.length; index += 1) {
+    if (
+      metadataJson.modulePaths[index - 1] === metadataJson.modulePaths[index]
+    ) {
+      throw new PackageCacheError(
+        "Source package metadata contains duplicate module paths",
+      );
+    }
+  }
 
   // Old versions didn't populate moduleEnvironments.
   if (metadataJson.moduleEnvironments === undefined) {
     metadataJson.moduleEnvironments = [];
-    for (const path of metadataJson.modulePaths) {
-      const environment = path.startsWith("actions/") ? "node" : "isolate";
-      metadataJson.moduleEnvironments.push([path, environment]);
+    for (const modulePath of metadataJson.modulePaths) {
+      if (modulePath.endsWith(".js")) {
+        const environment = modulePath.startsWith("actions/")
+          ? "node"
+          : "isolate";
+        metadataJson.moduleEnvironments.push([modulePath, environment]);
+      }
     }
   }
 
   const moduleEnvironmentsMap = new Map<string, ModuleEnvironment>();
-  for (const [path, environment] of metadataJson.moduleEnvironments) {
-    moduleEnvironmentsMap.set(path, environment);
+  for (const [modulePath, environment] of metadataJson.moduleEnvironments) {
+    if (moduleEnvironmentsMap.has(modulePath)) {
+      throw new PackageCacheError(
+        "Source package metadata contains duplicate module environments",
+      );
+    }
+    moduleEnvironmentsMap.set(modulePath, environment);
+  }
+  const modulePaths = new Set(metadataJson.modulePaths);
+  for (const modulePath of metadataJson.modulePaths) {
+    if (
+      modulePath.endsWith(".js.map") &&
+      !modulePaths.has(modulePath.slice(0, -".map".length))
+    ) {
+      throw new PackageCacheError(
+        "Source package metadata contains a source map for a missing module",
+      );
+    }
+    if (modulePath.endsWith(".js") && !moduleEnvironmentsMap.has(modulePath)) {
+      throw new PackageCacheError(
+        "Source package module is missing an environment",
+      );
+    }
+  }
+  for (const modulePath of moduleEnvironmentsMap.keys()) {
+    if (!modulePath.endsWith(".js") || !modulePaths.has(modulePath)) {
+      throw new PackageCacheError(
+        "Source package metadata contains an environment for a missing module",
+      );
+    }
   }
 
   return {

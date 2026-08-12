@@ -3666,6 +3666,7 @@ mod tests {
             source: model::modules::module_versions::ModuleSource::new(""),
             source_map: None,
             environment: ModuleEnvironment::Isolate,
+            node_pool: None,
         };
         let module_path = "test.js".parse::<CanonicalizedModulePath>().unwrap();
 

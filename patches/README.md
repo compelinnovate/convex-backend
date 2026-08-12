@@ -90,9 +90,11 @@ chain.
 ### [Backend memory resilience](backend_memory_resilience/README.md)
 
 - Purpose: account for configured and observed backend memory, reclaim optional allocator and local
-  Node state before external HTTP shedding, select bounded jemalloc in the standard backend build,
-  export a shared pressure signal for owner-specific patches, and preserve finite cgroup limits as
-  the hard boundary.
+  Node state before external HTTP shedding, reserve one full local Node hot-replacement surge
+  allowance, select bounded jemalloc in the standard backend build, export a shared pressure signal
+  for owner-specific patches, and preserve finite cgroup limits as the hard boundary. Healthy age,
+  package-count, and ordinary RSS changes use the surge process; actual cgroup pressure cancels a
+  candidate and terminates draining old generations before further shedding.
 - Prerequisites: local Node executor resilience for pressure-triggered generation retirement and
   shared-base HTTP admission for dependency-preserving external shedding. Pressure control also
   requires Linux cgroup v2 with a finite readable memory limit; explicit allocator trim requires a
@@ -123,9 +125,10 @@ chain.
 ### [Atomic Node executor source packages](atomic_node_executor_source_packages/README.md)
 
 - Purpose: publish source and external packages atomically, bound their retained filesystem and
-  stack-root lifetime without deleting active trees, and keep concurrent external-dependency builds
-  private, output-size- and time-bounded, and responsive to the local event-loop watchdog. On Unix,
-  an npm supervisor also attempts to stop its process group if the Node executor generation exits.
+  stack-root lifetime without deleting active trees, expose preparation-only acquisition for
+  candidate readiness, and keep concurrent external-dependency builds private, output-size- and
+  time-bounded, and responsive to the local event-loop watchdog. On Unix, an npm supervisor also
+  attempts to stop its process group if the Node executor generation exits.
 - Prerequisites: none.
 - Activation: automatic in the local Node executor.
 - Rollback: restore upstream only if atomic publication, active package ownership, bounded
@@ -134,12 +137,14 @@ chain.
 ### [Local Node executor resilience](local_node_executor_resilience/README.md)
 
 - Purpose: retire a selected local Node generation on request/stream timeout, transport failure,
-  a process-declared exit, repeated event-loop health failure, or backend shutdown; bound startup
+  a process-declared exit, repeated event-loop health failure, or backend shutdown; hot-replace a
+  healthy generation after RSS, imported-package, age, source, or environment changes; prepare
+  source and external packages in the candidate without invoking application code; bound startup
   probes and local response streaming; prevent child stdio from bypassing function-log handling;
-  terminate and reap only that direct child; and expose bounded lifecycle and health metrics.
-  Proactive RSS, imported-package, and age thresholds close admission while watchdog checks
-  continue, so unhealthy retirement can preempt a stuck drain. Backend memory resilience extends
-  the same mechanism with cgroup-pressure retirement. This patch also moves the local runtime to
+  terminate and reap only owned direct children; and expose bounded lifecycle and health metrics.
+  Candidate promotion and old admission closure are atomic, while already assigned old requests
+  drain within their existing action deadlines. Backend memory resilience extends the same
+  mechanism with retire-first cgroup-pressure handling. This patch also moves the local runtime to
   Node.js 24 and captures bounded
   active-request, process, diagnostic-report, and main-thread CPU-profile evidence on the first
   watchdog miss without delaying replacement. Published diagnostic artifacts are private,
@@ -147,13 +152,41 @@ chain.
   `build_deps` npm installs, require separate ownership. The atomic-package patch adds best-effort
   npm process-group containment, but Rust does not wait for descendant exit before removing a
   generation tempdir.
-- Prerequisites: none for generation recovery, RSS/package/age retirement, or diagnostics. The
+- Prerequisites: none for generation recovery, RSS/package/age hot replacement, or diagnostics. The
   atomic-package patch adds package and stack aggregate metrics to the same health protocol; backend
-  memory resilience adds cgroup-pressure retirement.
+  memory resilience adds cgroup-pressure retirement and enforced surge-capacity planning.
 - Activation: automatic in the local Node executor. Set
   `LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR` to an absolute mounted path when first-miss artifacts must
   survive container replacement.
 - Rollback: restore the previous backend image if healthy generations are retired unexpectedly.
+
+## Optional runtime routing
+
+### [Application-declared pinned local Node executor pools](pinned_local_node_executor_pools/README.md)
+
+- Status: implemented; named pools require both a source declaration and sufficient host budget.
+- Purpose: let a root Node action module require a bounded named one-process local executor pool.
+  A selected pool preserves rebuildable module-level state across ordinary action invocations and
+  hot-replaces its complete process generation when source, environment, or committed membership
+  changes. One global surge coordinator serializes temporary overlap across default and named
+  pools, coalesces routine rotations, and gives deployments bounded priority. Required pool
+  capability survives wire, durable-record, and source-archive round trips; stale requests cannot
+  replace a newer resident generation. Other actions continue through the default executor.
+- Prerequisites: local Node executor resilience supplies generation ownership and drain;
+  atomic Node source packages supply package identity and ownership; backend memory resilience must
+  reserve the configured total Node RSS budget when that patch is present.
+- Activation: first set `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` to cover the default slot,
+  every named slot, and one full surge allowance, and verify that the complete configured memory
+  budget fits the finite cgroup. Replace the backend with one advertising cutover capability
+  version 1 before using `--force-node-cutover` from the matching CLI; ordinary requests that omit
+  the option remain compatible with older CLIs. Then add `"use node"` and
+  `"use node pool:<name>"` to selected root modules. The backend validates the complete proposed
+  topology before commit and again after the client round trip. A deployment waits at most two
+  minutes for cutover capacity before commit; the force option can reclaim an unpromoted routine
+  candidate or a superseded draining old generation after an explicit interruption warning.
+- Rollback: stop using the force option, deploy source without pool declarations through the
+  compatible backend and CLI, then restore an image that does not understand the required
+  pool-bearing module environment. Roll back the CLI afterward if required.
 
 ## Scheduler, admission, and queueing
 

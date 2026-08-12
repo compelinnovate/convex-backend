@@ -55,6 +55,7 @@ declare module "@commander-js/extra-typings" {
       Opts & {
         verbose?: boolean;
         dryRun?: boolean;
+        forceNodeCutover?: boolean;
         yes?: boolean;
         typecheck: "enable" | "try" | "disable";
         typecheckComponents: boolean;
@@ -340,6 +341,10 @@ Command.prototype.addDeployOptions = function () {
     .option(
       "--dry-run",
       "Print out the generated configuration without deploying to your Convex deployment",
+    )
+    .option(
+      "--force-node-cutover",
+      "Reclaim occupied local Node cutover capacity, which can interrupt superseded actions",
     )
     .addOption(
       new Option(

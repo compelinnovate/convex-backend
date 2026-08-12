@@ -335,6 +335,13 @@ requested package. The local resilience patch exports those values as backend
 metrics. Package keys, paths, module names, and function names are not metric
 labels or lifecycle log fields.
 
+When application-declared pinned local executor pools are enabled, each pool has
+its own package cache and tempdir, and these metrics carry that pool's bounded
+`pool_name`. Named generations rotate on complete source-package identity and
+effective environment changes. Source archives also retain module pool
+metadata, but package leases and atomic publication remain request scoped; the
+pool lifecycle does not extend a filesystem lease.
+
 ## Tests
 
 `source_package.test.ts`, `errors.test.ts`, and `build_deps.test.ts` add focused

@@ -9,6 +9,7 @@ use std::{
         Component,
         PathBuf,
     },
+    str::FromStr,
 };
 
 use common::{
@@ -26,6 +27,7 @@ use database::{
     SchemaDiff,
     SerializedSchemaDiff,
 };
+use errors::ErrorMetadata;
 use serde::{
     Deserialize,
     Serialize,
@@ -54,6 +56,7 @@ use crate::{
         ModuleSource,
         SourceMap,
     },
+    source_packages::types::NodeExecutorPoolTopology,
 };
 
 /// User-specified module definition. See [`ModuleMetadata`] and associated
@@ -68,6 +71,8 @@ pub struct ModuleConfig {
     pub source_map: Option<SourceMap>,
     /// The environment is bundled to run in.
     pub environment: ModuleEnvironment,
+    /// The dedicated local Node executor pool required by this module.
+    pub node_pool: Option<NodeExecutorPoolName>,
 }
 
 /// A module definition that includes a hash instead of the source and
@@ -78,8 +83,261 @@ pub struct ModuleHashConfig {
     pub path: ModulePath,
     /// The environment is bundled to run in.
     pub environment: ModuleEnvironment,
+    /// The dedicated local Node executor pool required by this module.
+    pub node_pool: Option<NodeExecutorPoolName>,
     // This is a hash of source + source_map.
     pub sha256: Sha256Digest,
+}
+
+/// An application-declared local Node executor pool name.
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
+pub struct NodeExecutorPoolName(String);
+
+impl FromStr for NodeExecutorPoolName {
+    type Err = anyhow::Error;
+
+    fn from_str(name: &str) -> anyhow::Result<Self> {
+        let bytes = name.as_bytes();
+        let valid = !bytes.is_empty()
+            && bytes.len() <= 32
+            && bytes[0].is_ascii_lowercase()
+            && bytes
+                .iter()
+                .skip(1)
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_');
+        if !valid || name == "default" {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "InvalidNodeExecutorPoolName",
+                "Node executor pool names must match [a-z][a-z0-9_]{0,31}, and 'default' is \
+                 reserved",
+            ));
+        }
+        Ok(Self(name.to_owned()))
+    }
+}
+
+impl AsRef<str> for NodeExecutorPoolName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for NodeExecutorPoolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+pub const NODE_EXECUTOR_POOL_ENVIRONMENT_PREFIX: &str = "node:pool:";
+
+pub fn format_module_environment(
+    environment: ModuleEnvironment,
+    node_pool: Option<&NodeExecutorPoolName>,
+) -> String {
+    match node_pool {
+        Some(pool) => {
+            assert_eq!(environment, ModuleEnvironment::Node);
+            format!("{NODE_EXECUTOR_POOL_ENVIRONMENT_PREFIX}{pool}")
+        },
+        None => environment.to_string(),
+    }
+}
+
+fn parse_module_environment_and_pool_inner(
+    value: &str,
+    explicit_pool: Option<String>,
+    allow_legacy_pool_without_marker: bool,
+) -> anyhow::Result<(ModuleEnvironment, Option<NodeExecutorPoolName>)> {
+    if let Some(pool_name) = value.strip_prefix(NODE_EXECUTOR_POOL_ENVIRONMENT_PREFIX) {
+        let pool: NodeExecutorPoolName = pool_name.parse()?;
+        if let Some(explicit_pool) = explicit_pool {
+            anyhow::ensure!(
+                explicit_pool == pool.as_ref(),
+                "Node pool metadata does not match the module environment"
+            );
+        }
+        return Ok((ModuleEnvironment::Node, Some(pool)));
+    }
+
+    let environment = value.parse()?;
+    if allow_legacy_pool_without_marker
+        && environment == ModuleEnvironment::Node
+        && let Some(pool) = explicit_pool
+    {
+        return Ok((environment, Some(pool.parse()?)));
+    }
+    anyhow::ensure!(
+        explicit_pool.is_none(),
+        "Node pool metadata requires a pool-bearing Node environment"
+    );
+    Ok((environment, None))
+}
+
+/// Parse an API module environment. The required environment marker prevents
+/// an older backend from silently ignoring the optional pool field.
+pub fn parse_module_environment_and_pool(
+    value: &str,
+    explicit_pool: Option<String>,
+) -> anyhow::Result<(ModuleEnvironment, Option<NodeExecutorPoolName>)> {
+    parse_module_environment_and_pool_inner(value, explicit_pool, false)
+}
+
+/// Parse durable or archive metadata, including records written by the first
+/// pool protocol before the required environment marker was retained there.
+pub fn parse_persisted_module_environment_and_pool(
+    value: &str,
+    explicit_pool: Option<String>,
+) -> anyhow::Result<(ModuleEnvironment, Option<NodeExecutorPoolName>)> {
+    parse_module_environment_and_pool_inner(value, explicit_pool, true)
+}
+
+pub fn node_executor_pool_topology<'a>(
+    modules: impl IntoIterator<Item = &'a ModuleConfig>,
+) -> anyhow::Result<NodeExecutorPoolTopology> {
+    let mut topology = BTreeMap::new();
+    let mut default_routes = BTreeSet::new();
+    for module in modules {
+        let path = module.path.clone().canonicalize();
+        if path.is_system() || path.is_deps() {
+            anyhow::ensure!(
+                module.node_pool.is_none(),
+                ErrorMetadata::bad_request(
+                    "InvalidNodeExecutorPoolModule",
+                    "A Node executor pool can only be assigned to a Node action module",
+                )
+            );
+            continue;
+        }
+
+        let directives = bundled_node_directives(&module.source)?;
+        if path.is_http()
+            || path.is_cron()
+            || path.as_str() == "schema.js"
+            || path.as_str() == AUTH_CONFIG_FILE_NAME
+        {
+            anyhow::ensure!(
+                module.node_pool.is_none() && directives.pool.is_none(),
+                ErrorMetadata::bad_request(
+                    "InvalidNodeExecutorPoolModule",
+                    "A Node executor pool can only be assigned to a Node action module",
+                )
+            );
+            continue;
+        }
+
+        anyhow::ensure!(
+            directives.pool == module.node_pool,
+            ErrorMetadata::bad_request(
+                "NodeExecutorPoolDirectiveMismatch",
+                "The bundled Node pool directive does not match the module metadata",
+            )
+        );
+
+        let Some(pool) = &module.node_pool else {
+            if module.environment == ModuleEnvironment::Node {
+                anyhow::ensure!(
+                    default_routes.insert(path),
+                    "Node executor default topology contains a duplicate module"
+                );
+            }
+            continue;
+        };
+        if module.environment != ModuleEnvironment::Node {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "NodeExecutorPoolRequiresNode",
+                "A Node executor pool requires the Node environment",
+            ));
+        }
+        anyhow::ensure!(
+            directives.uses_node,
+            ErrorMetadata::bad_request(
+                "NodeExecutorPoolRequiresNodeDirective",
+                "A Node executor pool declaration requires a separate `use node` directive",
+            )
+        );
+        anyhow::ensure!(
+            topology.insert(path, pool.clone()).is_none(),
+            "Node executor pool topology contains a duplicate module"
+        );
+    }
+    Ok(NodeExecutorPoolTopology::new_complete(
+        topology,
+        default_routes,
+    ))
+}
+
+#[derive(Default)]
+struct BundledNodeDirectives {
+    uses_node: bool,
+    pool: Option<NodeExecutorPoolName>,
+}
+
+fn bundled_node_directives(source: &ModuleSource) -> anyhow::Result<BundledNodeDirectives> {
+    let mut directives = BundledNodeDirectives::default();
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    if bytes.starts_with(b"#!") {
+        cursor = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |newline| newline + 1);
+    }
+    loop {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let Some(&quote @ (b'\'' | b'"')) = bytes.get(cursor) else {
+            break;
+        };
+        let value_start = cursor + 1;
+        cursor = value_start;
+        while let Some(&byte) = bytes.get(cursor) {
+            if byte == b'\\' {
+                cursor = cursor.saturating_add(2);
+                continue;
+            }
+            if byte == quote {
+                break;
+            }
+            cursor += 1;
+        }
+        anyhow::ensure!(
+            bytes.get(cursor) == Some(&quote),
+            "Bundled JavaScript contains an unterminated directive"
+        );
+        let directive = &source[value_start..cursor];
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        anyhow::ensure!(
+            bytes.get(cursor) == Some(&b';'),
+            "Bundled JavaScript directive is missing its statement terminator"
+        );
+        cursor += 1;
+        if directive == "use node" {
+            directives.uses_node = true;
+            continue;
+        }
+        if !directive.starts_with("use node pool") {
+            continue;
+        }
+        let name = directive.strip_prefix("use node pool:").ok_or_else(|| {
+            ErrorMetadata::bad_request(
+                "InvalidNodeExecutorPoolDirective",
+                "A bundled Node pool directive must use `use node pool:<name>`",
+            )
+        })?;
+        anyhow::ensure!(
+            directives.pool.is_none(),
+            ErrorMetadata::bad_request(
+                "MultipleNodeExecutorPoolDirectives",
+                "A module can declare only one Node executor pool",
+            )
+        );
+        directives.pool = Some(name.parse()?);
+    }
+    Ok(directives)
 }
 
 /// This is not safe to use since convex 0.12.0, where we allow defining actions
@@ -358,5 +616,87 @@ impl CronDiff {
             updated: updated_crons.into_iter().map(|c| c.to_string()).collect(),
             deleted: deleted_crons.into_iter().map(|c| c.to_string()).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn module(source: &str, node_pool: Option<&str>) -> ModuleConfig {
+        ModuleConfig {
+            path: "consumer.js".parse().unwrap(),
+            source: ModuleSource::new(source),
+            source_map: None,
+            environment: ModuleEnvironment::Node,
+            node_pool: node_pool.map(|name| name.parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn pool_topology_requires_bundled_directive_metadata_agreement() {
+        let bundled = "\"use node\";\n\"use node pool:consumer\";\nexport const run = 1;";
+        let missing_metadata = module(bundled, None);
+        assert!(node_executor_pool_topology([&missing_metadata]).is_err());
+
+        let matching = module(bundled, Some("consumer"));
+        let topology = node_executor_pool_topology([&matching]).unwrap();
+        assert_eq!(
+            topology.get(&"consumer.js".parse().unwrap()),
+            matching.node_pool.as_ref()
+        );
+        assert_eq!(topology.default_route_count(), Some(0));
+
+        let missing_directive = module("\"use node\";\nexport const run = 1;", Some("consumer"));
+        assert!(node_executor_pool_topology([&missing_directive]).is_err());
+
+        let minified = module(
+            "\"use node\";\"use node pool:consumer\";export const run=1;",
+            Some("consumer"),
+        );
+        node_executor_pool_topology([&minified]).unwrap();
+
+        let missing_node = module(
+            "\"use node pool:consumer\";\nexport const run = 1;",
+            Some("consumer"),
+        );
+        assert!(node_executor_pool_topology([&missing_node]).is_err());
+    }
+
+    #[test]
+    fn pool_topology_accepts_bundled_hashbang() {
+        let pooled = module(
+            "#!/usr/bin/env node\n\"use node\";\n\"use node pool:consumer\";\nexport const run = \
+             1;",
+            Some("consumer"),
+        );
+        node_executor_pool_topology([&pooled]).unwrap();
+    }
+
+    #[test]
+    fn pool_topology_rejects_retained_directives_on_static_modules() {
+        for path in ["http.js", "crons.js", "schema.js", "auth.config.js"] {
+            let mut static_module =
+                module("\"use node pool:consumer\";\nexport const run = 1;", None);
+            static_module.path = path.parse().unwrap();
+            static_module.environment = ModuleEnvironment::Isolate;
+            assert!(node_executor_pool_topology([&static_module]).is_err());
+        }
+
+        let mut dependency = module("\"use node pool:consumer\";\nexport const run = 1;", None);
+        dependency.path = "_deps/chunk.js".parse().unwrap();
+        dependency.environment = ModuleEnvironment::Isolate;
+        node_executor_pool_topology([&dependency]).unwrap();
+    }
+
+    #[test]
+    fn pool_topology_counts_default_node_action_routes() {
+        let ordinary = module("\"use node\";\nexport const run = 1;", None);
+        let topology = node_executor_pool_topology([&ordinary]).unwrap();
+        assert_eq!(topology.default_route_count(), Some(1));
+        assert_eq!(
+            topology.default_routes().unwrap(),
+            &["consumer.js".parse().unwrap()].into_iter().collect()
+        );
     }
 }

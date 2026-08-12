@@ -7,6 +7,7 @@ use anyhow::Context;
 use common::{
     components::ComponentId,
     document::ParsedDocument,
+    query::Order,
     runtime::Runtime,
 };
 use database::{
@@ -108,5 +109,19 @@ impl<'a, RT: Runtime> SourcePackageModel<'a, RT> {
         }
 
         Ok(latest_source_pkg)
+    }
+
+    /// Returns the newest committed package record, including an empty package
+    /// that no module metadata references.
+    pub async fn get_latest_record(
+        &mut self,
+    ) -> anyhow::Result<Option<Arc<ParsedDocument<SourcePackage>>>> {
+        let index = SystemIndex::<SourcePackagesTable>::by_creation_time();
+        let mut query = self
+            .tx
+            .query_system(self.namespace, &index)?
+            .order(Order::Desc)
+            .build();
+        query.next().await
     }
 }

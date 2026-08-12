@@ -11,12 +11,14 @@ deterministic validation failures reach a no-runtime boundary because they need 
 
 The coordination is a two-way, process-local start barrier. For V8 actions the barrier is reached
 after the application action permit, isolate queue admission, active-JavaScript permit, and an
-eligible isolate worker are all owned. For Node actions it is reached after application admission
-and application-side request preparation, immediately before calling `NodeActions::execute`.
-Failure before `ready` drops the preparation while the job is still pending. A changed job or
-failed claim also drops the prepared execution without starting user code; existing retry behavior
-applies when the claim is definitely not visible, while an ambiguous visible claim retains
-conservative recovery.
+eligible isolate worker are all owned. With the coordinated local Node executor pools patch, Node
+actions reach it only after application preparation, routing, package preparation in the selected
+child, and exact resident-generation admission. Failure before `ready` drops the preparation while
+the job is still pending. A changed job or failed claim also drops the prepared execution without
+starting user code; existing retry behavior applies when the claim is definitely not visible,
+while an ambiguous visible claim retains conservative recovery. See
+[`scheduled_node_action_admission.md`](../pinned_local_node_executor_pools/scheduled_node_action_admission.md)
+for the generation-cutover composition.
 
 The patch does not change at-most-once recovery after `InProgress` is visible. A process can still
 fail after the claim commit and before or after the barrier release, and the scheduler still cannot
@@ -84,8 +86,9 @@ absolute deadline.
 
 Node actions use a separate application limiter and executor transport. Their preparation includes
 loading the current source package, environment, signed package URLs, and callback credentials.
-The Node process has no equivalent in-process isolate-worker handoff, so its barrier is immediately
-before `NodeActions::execute` rather than inside the child process.
+When the coordinated local Node executor pools patch is present, the barrier continues through
+router selection, exact generation admission, and the child's package-preparation endpoint before
+`/invoke`. A future remote executor would need its own admission protocol.
 
 `SCHEDULED_JOB_EXECUTION_PARALLELISM` limits source tasks, not V8 CPU slots. A value such as 64 can
 be intentional when many actions spend most of their lifetime awaiting `fetch()` or other I/O,
@@ -144,8 +147,9 @@ The patch preserves these properties:
 
 ### Two-way start barrier
 
-[`function_runner/server.rs`](../../crates/function_runner/src/server.rs) defines a paired
-controller and gate backed by two one-shot channels:
+[`common/execution_start.rs`](../../crates/common/src/execution_start.rs) defines a paired
+controller and gate backed by two one-shot channels. The function runner re-exports those types for
+compatibility:
 
 - the runtime-owned gate sends `ready` and waits for `start`;
 - the scheduler-owned controller waits for `ready` and, only after the claim, sends `start`.
@@ -235,21 +239,27 @@ existing conservative result.
 
 ### Node and invalid-action behavior
 
-A Node action performs database and package preparation and acquires the Node action application
-permit while the durable job remains pending. It signals `ready` after the complete
-`ExecuteRequest` is built and immediately before `node_actions.execute`. Dropping the controller
-releases that permit without sending the request.
+A Node action performs database preparation and acquires the Node action application permit while
+the durable job remains pending. The completed local-executor composition serializes and routes the
+request, acquires the exact compatible generation under the mutex shared with promotion, and asks
+that child to prepare the package before signaling `ready`. The resulting linear generation guard
+is retained across the durable claim and the complete `/invoke` response. Dropping the controller
+releases the guard and permit without sending `/invoke`.
 
-This boundary prevents application admission and application-side package, environment, and
-request-preparation failures from consuming the durable claim. After release,
-`NodeActions::execute` still serializes the executor request, checks executor shutdown, may acquire
-or start the local Node generation, and sends the HTTP request. The barrier cannot reserve capacity
-inside the separate Node process or prove where a startup or transport failure occurred relative to
-user code. Those failures remain on the conservative post-claim side even when the request never
-reached the child. Package URLs are also signed before `ready`; an unusually slow claim can leave
-them expired by the time the executor downloads the package, which is another conservative
-post-claim failure. Moving the protocol into the Node child would be a separate cross-process
-design.
+This boundary prevents application preparation, topology or fingerprint reconciliation, and
+generation startup failures from consuming the durable claim. Normal promotion closes old
+admission under the same generation mutex and waits for guards admitted first. Backend shutdown or
+hard generation retirement publishes unavailability and wakes a pre-start owner; failure after a
+visible claim remains conservative. The Node request deadline and service timer begin only after
+`start`. The protocol still does not make a child process immortal or provide exactly-once
+execution after the durable claim.
+
+The current `/prepare` endpoint releases its source-package lease before returning. It proves that
+the package was published in the selected child, but bounded cache enforcement can retire a
+zero-owner package before `/invoke` acquires its own lease. Preparation therefore moves the normal
+initial download and validation before the claim, but it does not by itself retain expiring package
+authority across an unbounded claim wait. The package-lifetime contract remains documented in
+[`atomic_node_executor_source_packages`](../atomic_node_executor_source_packages/README.md).
 
 A path or argument validation result that is already a deterministic developer error does not need
 an isolate or Node worker. It still waits on the gate at the application boundary so the durable
@@ -321,8 +331,9 @@ contention pressure while admitted runtime capacity is being held.
 The V8 service timer and JavaScript timeout begin after barrier release, so claim latency is not
 charged as V8 service or user execution. The application action's end-to-end elapsed time and
 outer function-runner timers do include the brief claim interval. Node executor timing starts only
-after release, while the action's outer elapsed time includes preparation and claim. This split is
-intentional and should be preserved when interpreting cron execution duration.
+after release and acknowledges that timing observation before `/invoke`, while the action's outer
+elapsed time includes preparation and claim. This split is intentional and should be preserved
+when interpreting cron execution duration.
 
 ## Interaction with capacity and queue control
 
@@ -399,7 +410,7 @@ result would violate the at-most-once boundary.
 Run the focused checks before publishing an image:
 
 ```sh
-scripts/run_cargo.sh test -p function_runner execution_start_tests
+scripts/run_cargo.sh test -p common execution_start
 scripts/run_cargo.sh test -p isolate execution_start_tests
 scripts/run_cargo.sh check -p application
 ```

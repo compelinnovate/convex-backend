@@ -46,19 +46,21 @@ export function* walkDir(
 }
 
 // Convex specific module environment.
-type ModuleEnvironment = "node" | "isolate";
+type ModuleEnvironment = "node" | "isolate" | `node:pool:${string}`;
 
 export interface Bundle {
   path: string;
   source: string;
   sourceMap?: string | undefined;
   environment: ModuleEnvironment;
+  nodePool?: string | undefined;
 }
 
 export interface BundleHash {
   path: string;
   hash: string;
   environment: ModuleEnvironment;
+  nodePool?: string | undefined;
 }
 
 type EsBuildResult = esbuild.BuildResult & {
@@ -190,6 +192,7 @@ export async function bundle({
   extraConditions = [],
   includeSourcesContent = false,
   splitting,
+  nodePoolsByEntryPoint = new Map(),
 }: {
   ctx: Context;
   dir: string;
@@ -201,6 +204,7 @@ export async function bundle({
   extraConditions?: string[];
   includeSourcesContent?: boolean;
   splitting?: boolean;
+  nodePoolsByEntryPoint?: Map<string, string>;
 }): Promise<{
   modules: Bundle[];
   externalDependencies: Map<string, string>;
@@ -239,6 +243,13 @@ export async function bundle({
   const sourceMaps = new Map();
   const modules: Bundle[] = [];
   const environment = platform === "node" ? "node" : "isolate";
+  const normalizedNodePoolsByEntryPoint = new Map(
+    [...nodePoolsByEntryPoint].map(([entryPoint, pool]) => [
+      path.resolve(entryPoint),
+      pool,
+    ]),
+  );
+  const assignedNodePoolEntryPoints = new Set<string>();
   for (const outputFile of result.outputFiles) {
     const relPath = path.relative(path.normalize("out"), outputFile.path);
     if (path.extname(relPath) === ".map") {
@@ -246,7 +257,33 @@ export async function bundle({
       continue;
     }
     const posixRelPath = relPath.split(path.sep).join(path.posix.sep);
-    modules.push({ path: posixRelPath, source: outputFile.text, environment });
+    const metafilePath = path
+      .relative(process.cwd(), outputFile.path)
+      .split(path.sep)
+      .join(path.posix.sep);
+    const entryPoint = result.metafile!.outputs[metafilePath]?.entryPoint;
+    const nodePool = entryPoint
+      ? normalizedNodePoolsByEntryPoint.get(path.resolve(entryPoint))
+      : undefined;
+    if (entryPoint !== undefined && nodePool !== undefined) {
+      assignedNodePoolEntryPoints.add(path.resolve(entryPoint));
+    }
+    modules.push({
+      path: posixRelPath,
+      source: outputFile.text,
+      environment: nodePool ? `node:pool:${nodePool}` : environment,
+      ...(nodePool === undefined ? {} : { nodePool }),
+    });
+  }
+  if (
+    assignedNodePoolEntryPoints.size !== normalizedNodePoolsByEntryPoint.size
+  ) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "fatal",
+      printedMessage:
+        "Failed to associate every declared Node executor pool with its bundled entry module.",
+    });
   }
   for (const module of modules) {
     const sourceMapPath = module.path + ".map";
@@ -499,13 +536,16 @@ export async function entryPoints(
 
 // A fallback regex in case we fail to parse the AST.
 export const useNodeDirectiveRegex = /^\s*("|')use node("|');?\s*$/;
+const nodePoolNameRegex = /^[a-z][a-z0-9_]{0,31}$/;
+const nodeDirectiveFallbackRegex =
+  /^\s*(["'])(use node(?: pool:[^"']*)?)\1;?\s*$/;
 
-function hasUseNodeDirective(ctx: Context, fpath: string): boolean {
+function readNodeDirectives(ctx: Context, fpath: string): string[] {
   // Do a quick check for the exact string. If it doesn't exist, don't
   // bother parsing.
   const source = ctx.fs.readUtf8File(fpath);
   if (source.indexOf("use node") === -1) {
-    return false;
+    return [];
   }
 
   // We parse the AST here to extract the "use node" declaration. This is more
@@ -519,27 +559,26 @@ function hasUseNodeDirective(ctx: Context, fpath: string): boolean {
       // here too.
       plugins: ["jsx", "typescript"],
     });
-    return ast.program.directives
-      .map((d) => d.value.value)
-      .includes("use node");
-  } catch (error: any) {
+    return ast.program.directives.map((d) => d.value.value);
+  } catch (error: unknown) {
     // Given that we have failed to parse, we are most likely going to fail in
     // the esbuild step, which seem to return better formatted error messages.
     // We don't throw here and fallback to regex.
-    let lineMatches = false;
+    const directives = [];
     for (const line of source.split("\n")) {
-      if (line.match(useNodeDirectiveRegex)) {
-        lineMatches = true;
-        break;
+      const match = line.match(nodeDirectiveFallbackRegex);
+      if (match?.[2]) {
+        directives.push(match[2]);
       }
     }
 
     // Log that we failed to parse in verbose node if we need this for debugging.
+    const parseError = error instanceof Error ? error.message : String(error);
     logVerbose(
-      `Failed to parse ${fpath}. Use node is set to ${lineMatches} based on regex. Parse error: ${error.toString()}.`,
+      `Failed to parse ${fpath}. Node directives are ${JSON.stringify(directives)} based on regex. Parse error: ${parseError}.`,
     );
 
-    return lineMatches;
+    return directives;
   }
 }
 
@@ -557,7 +596,41 @@ async function determineEnvironment(
 ): Promise<ModuleEnvironment> {
   const relPath = path.relative(dir, fpath);
 
-  const useNodeDirectiveFound = hasUseNodeDirective(ctx, fpath);
+  const directives = readNodeDirectives(ctx, fpath);
+  const useNodeDirectiveFound = directives.includes("use node");
+  const poolDirectives = directives.filter((directive) =>
+    directive.startsWith("use node pool"),
+  );
+  if (poolDirectives.length > 1) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "invalid filesystem data",
+      printedMessage: `Only one "use node pool:<name>" directive is allowed in ${relPath}.`,
+    });
+  }
+  const poolDirective = poolDirectives[0];
+  const nodePool = poolDirective?.startsWith("use node pool:")
+    ? poolDirective.slice("use node pool:".length)
+    : undefined;
+  if (
+    poolDirective !== undefined &&
+    (nodePool === undefined ||
+      !nodePoolNameRegex.test(nodePool) ||
+      nodePool === "default")
+  ) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "invalid filesystem data",
+      printedMessage: `Node pool names must match [a-z][a-z0-9_]{0,31}, and "default" is reserved (${relPath}).`,
+    });
+  }
+  if (nodePool !== undefined && !useNodeDirectiveFound) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "invalid filesystem data",
+      printedMessage: `"use node pool:${nodePool}" requires a separate "use node" directive in ${relPath}.`,
+    });
+  }
   if (useNodeDirectiveFound) {
     if (mustBeIsolate(relPath)) {
       return await ctx.crash({
@@ -566,7 +639,7 @@ async function determineEnvironment(
         printedMessage: `"use node" directive is not allowed for ${relPath}.`,
       });
     }
-    return "node";
+    return nodePool === undefined ? "node" : `node:pool:${nodePool}`;
   }
 
   const actionsPrefix = actionsDir + path.sep;
@@ -584,14 +657,18 @@ async function determineEnvironment(
 export async function entryPointsByEnvironment(ctx: Context, dir: string) {
   const isolate = [];
   const node = [];
+  const nodePools = new Map<string, string>();
   for (const entryPoint of await entryPoints(ctx, dir)) {
     const environment = await determineEnvironment(ctx, dir, entryPoint);
-    if (environment === "node") {
+    if (environment === "node" || environment.startsWith("node:pool:")) {
       node.push(entryPoint);
+      if (environment.startsWith("node:pool:")) {
+        nodePools.set(entryPoint, environment.slice("node:pool:".length));
+      }
     } else {
       isolate.push(entryPoint);
     }
   }
 
-  return { isolate, node };
+  return { isolate, node, nodePools };
 }

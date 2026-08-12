@@ -154,6 +154,7 @@ impl<'a, RT: Runtime> ModuleModel<'a, RT> {
                 module.source_map,
                 analyze_result,
                 module.environment,
+                module.node_pool,
             )
             .await?;
         }
@@ -227,6 +228,7 @@ impl<'a, RT: Runtime> ModuleModel<'a, RT> {
                 source: source.source,
                 source_map: source.source_map,
                 environment: metadata.environment,
+                node_pool: metadata.node_pool.clone(),
             };
             if modules.insert(path.clone(), module_config).is_some() {
                 panic!("Duplicate application module at {path:?}");
@@ -279,6 +281,7 @@ impl<'a, RT: Runtime> ModuleModel<'a, RT> {
         source_map: Option<SourceMap>,
         analyze_result: Option<AnalyzedModule>,
         environment: ModuleEnvironment,
+        node_pool: Option<crate::config::types::NodeExecutorPoolName>,
     ) -> anyhow::Result<()> {
         if !(self.tx.identity().is_admin() || self.tx.identity().is_system()) {
             anyhow::bail!(unauthorized_error("put_module"));
@@ -297,6 +300,7 @@ impl<'a, RT: Runtime> ModuleModel<'a, RT> {
             source_package_id,
             analyze_result,
             environment,
+            node_pool,
             sha256,
         )
         .await?;
@@ -310,12 +314,14 @@ impl<'a, RT: Runtime> ModuleModel<'a, RT> {
         source_package_id: SourcePackageId,
         analyze_result: Option<AnalyzedModule>,
         environment: ModuleEnvironment,
+        node_pool: Option<crate::config::types::NodeExecutorPoolName>,
         sha256: Sha256Digest,
     ) -> anyhow::Result<ResolvedDocumentId> {
         let new_metadata = ModuleMetadata {
             path: path.module_path,
             source_package_id,
             environment,
+            node_pool,
             analyze_result: analyze_result.clone(),
             sha256,
         };

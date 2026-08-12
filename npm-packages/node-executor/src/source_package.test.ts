@@ -165,6 +165,83 @@ test("concurrent package requests share one atomic source and external download"
   }
 });
 
+test("pooled Node environment markers load as Node modules", async () => {
+  const sourceZip = makeSourcePackageZip(null, 1, "node:pool:consumer");
+  const server = await startPackageServer({
+    "/source.zip": sourceZip,
+  });
+
+  try {
+    const local = await maybeDownloadAndLinkPackages(
+      makeSourceOnlyPackage(
+        `${server.baseUrl}/source.zip`,
+        sha256(sourceZip),
+        "pooled-source-package",
+      ),
+    );
+
+    expect(local.modules).toContain("actions/example.js");
+  } finally {
+    await server.close();
+  }
+});
+
+test("source package metadata rejects duplicate module environments", async () => {
+  const sourceZip = makeSourcePackageZip(null, 1, "node", [
+    ["_deps/chunk.js", "node"],
+    ["actions/example.js", "node"],
+    ["actions/example.js", "isolate"],
+  ]);
+  const server = await startPackageServer({
+    "/source.zip": sourceZip,
+  });
+
+  try {
+    await expect(
+      maybeDownloadAndLinkPackages(
+        makeSourceOnlyPackage(
+          `${server.baseUrl}/source.zip`,
+          sha256(sourceZip),
+          "duplicate-environment-source-package",
+        ),
+      ),
+    ).rejects.toThrow(
+      "Source package metadata contains duplicate module environments",
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("source package metadata rejects orphan source maps", async () => {
+  const zip = new AdmZip();
+  zip.addFile(
+    "metadata.json",
+    Buffer.from(JSON.stringify({ modulePaths: ["orphan.js.map"] })),
+  );
+  zip.addFile("modules/orphan.js.map", Buffer.from("{}"));
+  const sourceZip = zip.toBuffer();
+  const server = await startPackageServer({
+    "/source.zip": sourceZip,
+  });
+
+  try {
+    await expect(
+      maybeDownloadAndLinkPackages(
+        makeSourceOnlyPackage(
+          `${server.baseUrl}/source.zip`,
+          sha256(sourceZip),
+          "orphan-source-map-package",
+        ),
+      ),
+    ).rejects.toThrow(
+      "Source package metadata contains a source map for a missing module",
+    );
+  } finally {
+    await server.close();
+  }
+});
+
 test("prebuild initialization clears package roots from a prior runtime", async () => {
   const sourceRoot = path.join(tmpdir!, "source");
   const externalRoot = path.join(tmpdir!, "external_deps");
@@ -570,7 +647,7 @@ test("failed source cleanup still enforces external cache bounds", async () => {
   });
   const server = await startPackageServer(routes);
   const realRm = fs.promises.rm;
-  const sourceStagingPrefix = path.join(tmpdir!, "source", ".");
+  const sourceStagingPrefix = `${path.join(tmpdir!, "source")}${path.sep}.`;
   vi.spyOn(fs.promises, "rm").mockImplementation(
     async (...args: Parameters<typeof fs.promises.rm>) => {
       const [target] = args;

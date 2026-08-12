@@ -9,7 +9,10 @@ use std::{
         Arc,
         LazyLock,
     },
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use anyhow::Context;
@@ -155,7 +158,10 @@ use model::{
         SessionRequestModel,
     },
     source_packages::{
-        types::SourcePackage,
+        types::{
+            NodeExecutorPoolTopology,
+            SourcePackage,
+        },
         SourcePackageModel,
     },
     udf_config::types::UdfConfig,
@@ -250,6 +256,8 @@ use crate::{
     MutationReturn,
     QueryReturn,
 };
+
+const NODE_EXECUTOR_REQUEST_PACKAGE_URL_VALIDITY: Duration = Duration::from_secs(60);
 
 mod http_routing;
 mod metrics;
@@ -1751,6 +1759,14 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     .get_latest()
                     .await?
                     .context("no source package?")?;
+                // Deployment publication is an eager fast path. Reconcile from the
+                // same repeatable snapshot used to build the request as well, so a
+                // committed topology remains executable if its deployment caller is
+                // canceled after the database commit completes.
+                self.node_actions.reconcile_pool_topology(
+                    &source_package.node_executor_pool_topology,
+                    *tx.begin_timestamp(),
+                )?;
                 let source_maps_callback = async {
                     let mut source_maps = BTreeMap::new();
                     if let Some(source_map) = self
@@ -1789,9 +1805,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 environment_variables.extend(user_environment_variables);
 
                 // Fetch source and external_deps presigned URI first
-                let source_uri_future = self
-                    .modules_storage
-                    .signed_url(source_package.storage_key.clone(), Duration::from_secs(60));
+                let download_url_expiration =
+                    Instant::now() + NODE_EXECUTOR_REQUEST_PACKAGE_URL_VALIDITY;
+                let source_uri_future = self.modules_storage.signed_url(
+                    source_package.storage_key.clone(),
+                    NODE_EXECUTOR_REQUEST_PACKAGE_URL_VALIDITY,
+                );
                 let (source_uri, external_deps_package) = if let Some(external_deps_package_id) =
                     &source_package.external_deps_package_id
                 {
@@ -1799,9 +1818,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         .get(external_deps_package_id.clone())
                         .await?
                         .into_value();
-                    let external_uri_future = self
-                        .modules_storage
-                        .signed_url(pkg.storage_key.clone(), Duration::from_secs(60));
+                    let external_uri_future = self.modules_storage.signed_url(
+                        pkg.storage_key.clone(),
+                        NODE_EXECUTOR_REQUEST_PACKAGE_URL_VALIDITY,
+                    );
 
                     let (source_uri, external_deps_uri) =
                         tokio::try_join!(source_uri_future, external_uri_future)?;
@@ -1827,8 +1847,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                             sha256: source_package.sha256.clone(),
                         },
                         external_deps: external_deps_package,
+                        download_url_expiration,
                     },
                     source_package_id: source_package.developer_id().into(),
+                    node_executor_pool_topology: source_package.node_executor_pool_topology.clone(),
+                    topology_version: *tx.begin_timestamp(),
+                    node_pool: module.node_pool.clone(),
                     user_identity: tx.user_identity(),
                     auth_header: token_to_authorization_header(tx.authentication_token())?,
                     environment_variables,
@@ -1838,13 +1862,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     encoded_parent_trace: EncodedSpan::from_parent().0,
                 };
 
-                if let Some(start_gate) = function_execution_start {
-                    start_gate.wait().await?;
-                }
-
+                // Keep the gate attached through Node routing. Waiting here
+                // would let the scheduler commit `InProgress` before the exact
+                // resident generation is fenced against deployment promotion.
                 let node_outcome_future = self
                     .node_actions
-                    .execute(request, log_line_sender, source_maps_callback)
+                    .execute(
+                        request,
+                        log_line_sender,
+                        function_execution_start,
+                        source_maps_callback,
+                    )
                     .boxed();
                 let (mut node_outcome_result, log_lines) = run_function_and_collect_log_lines(
                     node_outcome_future,
@@ -2057,9 +2085,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 }
             }
             // Fetch source and external_deps presigned URI first
-            let source_uri_future = self
-                .modules_storage
-                .signed_url(source_package.storage_key.clone(), Duration::from_secs(60));
+            let download_url_expiration =
+                Instant::now() + NODE_EXECUTOR_REQUEST_PACKAGE_URL_VALIDITY;
+            let source_uri_future = self.modules_storage.signed_url(
+                source_package.storage_key.clone(),
+                NODE_EXECUTOR_REQUEST_PACKAGE_URL_VALIDITY,
+            );
             let mut tx = self.database.begin_system().await?;
             let (source_uri, external_deps_package) =
                 if let Some(external_deps_package_id) = source_package.external_deps_package_id {
@@ -2067,9 +2098,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         .get(external_deps_package_id)
                         .await?
                         .into_value();
-                    let external_uri_future = self
-                        .modules_storage
-                        .signed_url(pkg.storage_key.clone(), Duration::from_secs(60));
+                    let external_uri_future = self.modules_storage.signed_url(
+                        pkg.storage_key.clone(),
+                        NODE_EXECUTOR_REQUEST_PACKAGE_URL_VALIDITY,
+                    );
 
                     let (source_uri, external_deps_uri) =
                         tokio::try_join!(source_uri_future, external_uri_future)?;
@@ -2093,6 +2125,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         sha256: source_package.sha256,
                     },
                     external_deps: external_deps_package,
+                    download_url_expiration,
                 },
                 environment_variables,
             };
@@ -2209,6 +2242,123 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
 
     pub fn enable_actions(&self) -> anyhow::Result<()> {
         self.node_actions.enable()
+    }
+
+    pub fn validate_node_executor_pool_topology(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+    ) -> anyhow::Result<()> {
+        self.node_actions.validate_pool_topology(topology)
+    }
+
+    pub async fn reserve_node_executor_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        force: bool,
+    ) -> anyhow::Result<Option<node_executor::NodeExecutorCutoverReservation>> {
+        self.node_actions
+            .reserve_pool_cutover(topology, force)
+            .await
+    }
+
+    pub fn begin_node_executor_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: Timestamp,
+        reservation: &mut Option<node_executor::NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        self.node_actions
+            .begin_pool_cutover(topology, version, reservation)
+    }
+
+    pub async fn complete_node_executor_pool_cutover(
+        &self,
+        target: node_executor::NodeExecutorCutoverTarget,
+        version: Timestamp,
+        reservation: Option<node_executor::NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        self.node_actions
+            .complete_pool_cutover(target, version, reservation)
+            .await
+    }
+
+    pub fn record_node_executor_pool_cutover_post_commit_failure(&self) {
+        self.node_actions.record_pool_cutover_post_commit_failure();
+    }
+
+    pub async fn node_executor_cutover_target(
+        &self,
+        expected_topology: &NodeExecutorPoolTopology,
+        version: Timestamp,
+    ) -> anyhow::Result<node_executor::NodeExecutorCutoverTarget> {
+        // Reconstruct the target at the deployment commit. Reading latest here
+        // could combine this cutover with a later deployment or environment edit.
+        let mut tx = self
+            .database
+            .begin_with_ts(Identity::system(), version, FunctionUsageTracker::new())
+            .await?;
+        let source_package = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .get_latest_record()
+            .await?
+            .context("Committed deployment has no root source package")?;
+        anyhow::ensure!(
+            &source_package.node_executor_pool_topology == expected_topology,
+            "Committed Node executor topology changed before cutover"
+        );
+        let mut environment_variables =
+            system_env_vars(&mut tx, self.default_system_env_vars.clone()).await?;
+        environment_variables.extend(EnvironmentVariablesModel::new(&mut tx).get_all().await?);
+        let external_package = if let Some(external_id) = &source_package.external_deps_package_id {
+            Some(
+                ExternalPackagesModel::new(&mut tx)
+                    .get(external_id.clone())
+                    .await?
+                    .into_value(),
+            )
+        } else {
+            None
+        };
+        drop(tx);
+        let cutover_url_validity = self
+            .node_actions
+            .cutover_package_url_validity(expected_topology);
+        let download_url_expiration = Instant::now() + cutover_url_validity;
+        let source_uri_future = self
+            .modules_storage
+            .signed_url(source_package.storage_key.clone(), cutover_url_validity);
+        let external_uri_future = async {
+            match &external_package {
+                Some(package) => Ok(Some(
+                    self.modules_storage
+                        .signed_url(package.storage_key.clone(), cutover_url_validity)
+                        .await?,
+                )),
+                None => Ok(None),
+            }
+        };
+        let (source_uri, external_uri) = tokio::try_join!(source_uri_future, external_uri_future)?;
+        let external_deps =
+            external_package
+                .zip(external_uri)
+                .map(|(package, uri)| node_executor::Package {
+                    uri,
+                    key: package.storage_key,
+                    sha256: package.sha256,
+                });
+        Ok(node_executor::NodeExecutorCutoverTarget {
+            topology: expected_topology.clone(),
+            source_package: node_executor::SourcePackage {
+                bundled_source: node_executor::Package {
+                    uri: source_uri,
+                    key: source_package.storage_key.clone(),
+                    sha256: source_package.sha256.clone(),
+                },
+                external_deps,
+                download_url_expiration,
+            },
+            source_package_id: source_package.developer_id().into(),
+            environment_variables,
+        })
     }
 
     #[fastrace::trace]

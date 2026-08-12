@@ -17,10 +17,7 @@ use common::{
         Sha256,
         Sha256Digest,
     },
-    types::{
-        ModuleEnvironment,
-        ObjectKey,
-    },
+    types::ObjectKey,
 };
 use futures::StreamExt;
 use serde::{
@@ -47,7 +44,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     config::types::{
         deprecated_extract_environment_from_path,
+        format_module_environment,
+        node_executor_pool_topology,
+        parse_persisted_module_environment_and_pool,
         ModuleConfig,
+        NodeExecutorPoolName,
     },
     modules::module_versions::ModuleSource,
     source_packages::types::{
@@ -67,7 +68,8 @@ pub struct PackagedFile {
 #[serde(rename_all = "camelCase")]
 struct MetadataJson {
     module_paths: Vec<String>,
-    module_environments: Option<Vec<(String, ModuleEnvironment)>>,
+    module_environments: Option<Vec<(String, String)>>,
+    module_node_pools: Option<Vec<(String, String)>>,
     external_deps_storage_key: Option<String>,
 }
 
@@ -81,6 +83,7 @@ async fn write_package(
     let mut files = BTreeMap::new();
     let mut module_paths = vec![];
     let mut module_environments = Vec::new();
+    let mut module_node_pools = Vec::new();
     let mut unzipped_size_bytes: usize = 0;
     for (path, module) in package {
         let source = module.source.as_bytes();
@@ -92,7 +95,13 @@ async fn write_package(
         let builder =
             ZipEntryBuilder::new(source_path.clone(), Compression::Deflate).unix_permissions(0o644);
         module_paths.push(String::from(path.clone()));
-        module_environments.push((String::from(path.clone()), module.environment));
+        module_environments.push((
+            String::from(path.clone()),
+            format_module_environment(module.environment, module.node_pool.as_ref()),
+        ));
+        if let Some(pool) = &module.node_pool {
+            module_node_pools.push((String::from(path.clone()), pool.to_string()));
+        }
         unzipped_size_bytes += source.len();
         writer.write_entry_whole(builder, source).await?;
 
@@ -123,6 +132,7 @@ async fn write_package(
     let metadata_contents = MetadataJson {
         module_paths,
         module_environments: Some(module_environments),
+        module_node_pools: Some(module_node_pools),
         external_deps_storage_key: external_deps_storage_key.map(|key| key.to_string()),
     };
     let metadata_json = serde_json::to_vec(&metadata_contents)?;
@@ -192,7 +202,12 @@ pub async fn download_package(
         let contents = entry_reader.read_to_string_crc().await?;
 
         if path == "metadata.json" {
-            metadata_json = Some(serde_json::from_str(&contents)?);
+            anyhow::ensure!(
+                metadata_json
+                    .replace(serde_json::from_str(&contents)?)
+                    .is_none(),
+                "Source package archive contains duplicate metadata"
+            );
             continue;
         }
 
@@ -207,9 +222,15 @@ pub async fn download_package(
             anyhow::bail!("Invalid path in archive: {path}");
         };
         if is_source_map {
-            source_maps.insert(module_path, contents);
+            anyhow::ensure!(
+                source_maps.insert(module_path, contents).is_none(),
+                "Source package archive contains a duplicate source map"
+            );
         } else {
-            source.insert(module_path, contents);
+            anyhow::ensure!(
+                source.insert(module_path, contents).is_none(),
+                "Source package archive contains a duplicate module"
+            );
         }
     }
     // Drain the rest of the reader until it reaches the central directory entry,
@@ -235,27 +256,109 @@ pub async fn download_package(
         package.storage_key
     );
 
-    let mut module_environments: Option<BTreeMap<String, ModuleEnvironment>> = metadata_json
-        .module_environments
-        .map(|module_environments| module_environments.into_iter().collect());
+    let mut module_environments = match metadata_json.module_environments {
+        Some(environments) => {
+            let mut by_path = BTreeMap::new();
+            for (path, environment) in environments {
+                anyhow::ensure!(
+                    by_path.insert(path, environment).is_none(),
+                    "Source package metadata contains duplicate module environments"
+                );
+            }
+            Some(by_path)
+        },
+        None => None,
+    };
+    let mut module_node_pools = BTreeMap::new();
+    for (path, pool) in metadata_json.module_node_pools.unwrap_or_default() {
+        anyhow::ensure!(
+            module_node_pools
+                .insert(path, pool.parse::<NodeExecutorPoolName>()?)
+                .is_none(),
+            "Source package metadata contains duplicate Node pool assignments"
+        );
+    }
 
     let mut out = BTreeMap::new();
     for (path, source) in source {
         // If the module_environments is missing, we default to using the path.
         // Otherwise, the module must be present.
-        let environment = match module_environments.as_mut() {
-            Some(module_environments) => module_environments
-                .remove(&String::from(path.clone()))
-                .ok_or_else(|| anyhow::anyhow!("Missing environment for module: {path:?}")),
-            None => deprecated_extract_environment_from_path(path.clone().into()),
-        }?;
+        let (environment, node_pool) = match module_environments.as_mut() {
+            Some(module_environments) => {
+                let environment = module_environments
+                    .remove(&String::from(path.clone()))
+                    .ok_or_else(|| anyhow::anyhow!("Missing environment for module: {path:?}"))?;
+                parse_persisted_module_environment_and_pool(
+                    &environment,
+                    module_node_pools
+                        .remove(path.as_str())
+                        .map(|pool| pool.to_string()),
+                )?
+            },
+            None => (
+                deprecated_extract_environment_from_path(path.clone().into())?,
+                module_node_pools.remove(path.as_str()),
+            ),
+        };
         let config = ModuleConfig {
             path: path.clone().into(),
             source: ModuleSource::new(&source),
             source_map: source_maps.remove(&path),
             environment,
+            node_pool,
         };
         out.insert(path, config);
     }
+    anyhow::ensure!(
+        source_maps.is_empty(),
+        "Source package archive contains source maps for missing modules"
+    );
+    anyhow::ensure!(
+        module_node_pools.is_empty(),
+        "Source package metadata contains Node pool assignments for missing modules"
+    );
+    anyhow::ensure!(
+        module_environments.is_none_or(|environments| environments.is_empty()),
+        "Source package metadata contains environments for missing modules"
+    );
+    anyhow::ensure!(
+        package
+            .node_executor_pool_topology
+            .matches_archive(&node_executor_pool_topology(out.values())?),
+        "Source package archive Node pool topology does not match durable metadata"
+    );
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use common::types::ModuleEnvironment;
+
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyMetadataJson {
+        #[expect(dead_code)]
+        module_paths: Vec<String>,
+        #[expect(dead_code)]
+        module_environments: Option<Vec<(String, ModuleEnvironment)>>,
+        #[expect(dead_code)]
+        external_deps_storage_key: Option<String>,
+    }
+
+    #[test]
+    fn pooled_archive_environment_is_required_for_older_backend_rejection() {
+        let metadata = MetadataJson {
+            module_paths: vec!["consumer.js".to_owned()],
+            module_environments: Some(vec![(
+                "consumer.js".to_owned(),
+                "node:pool:consumer".to_owned(),
+            )]),
+            module_node_pools: Some(vec![("consumer.js".to_owned(), "consumer".to_owned())]),
+            external_deps_storage_key: None,
+        };
+        let encoded = serde_json::to_vec(&metadata).unwrap();
+        assert!(serde_json::from_slice::<LegacyMetadataJson>(&encoded).is_err());
+    }
 }

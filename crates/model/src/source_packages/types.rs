@@ -1,5 +1,10 @@
 use std::{
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     fmt::Formatter,
+    ops::Deref,
     str::FromStr,
 };
 
@@ -17,6 +22,7 @@ use serde::{
     Serialize,
 };
 use serde_bytes::ByteBuf;
+use sync_types::CanonicalizedModulePath;
 use value::{
     codegen_convex_serialization,
     heap_size::HeapSize,
@@ -24,7 +30,69 @@ use value::{
     sha256::Sha256Digest,
 };
 
-use crate::external_packages::types::ExternalDepsPackageId;
+use crate::{
+    config::types::NodeExecutorPoolName,
+    external_packages::types::ExternalDepsPackageId,
+};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NodeExecutorPoolTopology {
+    assignments: BTreeMap<CanonicalizedModulePath, NodeExecutorPoolName>,
+    default_route_count: Option<usize>,
+    default_routes: Option<BTreeSet<CanonicalizedModulePath>>,
+}
+
+impl NodeExecutorPoolTopology {
+    /// Construct topology read from a record that predates exact default-route
+    /// membership. New topology should use [`Self::new_complete`].
+    pub fn new(
+        assignments: BTreeMap<CanonicalizedModulePath, NodeExecutorPoolName>,
+        default_route_count: Option<usize>,
+    ) -> Self {
+        Self {
+            assignments,
+            default_route_count,
+            default_routes: None,
+        }
+    }
+
+    pub fn new_complete(
+        assignments: BTreeMap<CanonicalizedModulePath, NodeExecutorPoolName>,
+        default_routes: BTreeSet<CanonicalizedModulePath>,
+    ) -> Self {
+        Self {
+            assignments,
+            default_route_count: Some(default_routes.len()),
+            default_routes: Some(default_routes),
+        }
+    }
+
+    pub fn default_route_count(&self) -> Option<usize> {
+        self.default_route_count
+    }
+
+    pub fn default_routes(&self) -> Option<&BTreeSet<CanonicalizedModulePath>> {
+        self.default_routes.as_ref()
+    }
+
+    pub fn matches_archive(&self, archive: &Self) -> bool {
+        self.assignments == archive.assignments
+            && match &self.default_routes {
+                Some(routes) => archive.default_routes.as_ref() == Some(routes),
+                None => self
+                    .default_route_count
+                    .is_none_or(|count| archive.default_route_count == Some(count)),
+            }
+    }
+}
+
+impl Deref for NodeExecutorPoolTopology {
+    type Target = BTreeMap<CanonicalizedModulePath, NodeExecutorPoolName>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.assignments
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum NodeVersion {
@@ -108,6 +176,8 @@ pub struct SourcePackage {
     pub external_deps_package_id: Option<ExternalDepsPackageId>,
     pub package_size: PackageSize,
     pub node_version: Option<NodeVersion>,
+    /// Complete module-to-pool topology for this source package.
+    pub node_executor_pool_topology: NodeExecutorPoolTopology,
 }
 
 impl SourcePackage {
@@ -116,6 +186,7 @@ impl SourcePackage {
         // time in the hash
         self.node_version == other.node_version
             && self.external_deps_package_id == other.external_deps_package_id
+            && self.node_executor_pool_topology == other.node_executor_pool_topology
     }
 }
 
@@ -258,12 +329,31 @@ pub struct SerializedSourcePackage {
     external_package_id: Option<String>,
     package_size: Option<SerializedPackageSize>,
     node_version: Option<String>,
+    node_pool_module_paths: Option<Vec<String>>,
+    node_pool_names: Option<Vec<String>>,
+    node_pool_default_route_count: Option<i64>,
+    node_pool_default_module_paths: Option<Vec<String>>,
 }
 
 impl TryFrom<SourcePackage> for SerializedSourcePackage {
     type Error = anyhow::Error;
 
     fn try_from(value: SourcePackage) -> anyhow::Result<Self> {
+        let node_pool_default_route_count = value
+            .node_executor_pool_topology
+            .default_route_count
+            .map(i64::try_from)
+            .transpose()?;
+        let node_pool_default_module_paths = value
+            .node_executor_pool_topology
+            .default_routes
+            .map(|routes| routes.into_iter().map(String::from).collect());
+        let (node_pool_module_paths, node_pool_names) = value
+            .node_executor_pool_topology
+            .assignments
+            .into_iter()
+            .map(|(path, pool)| (String::from(path), pool.to_string()))
+            .unzip();
         Ok(SerializedSourcePackage {
             storage_key: value.storage_key.into(),
             sha256: ByteBuf::from(value.sha256.to_vec()),
@@ -272,6 +362,10 @@ impl TryFrom<SourcePackage> for SerializedSourcePackage {
                 .map(|id| DeveloperDocumentId::from(id).encode()),
             package_size: Some(value.package_size.try_into()?),
             node_version: value.node_version.map(String::from),
+            node_pool_module_paths: Some(node_pool_module_paths),
+            node_pool_names: Some(node_pool_names),
+            node_pool_default_route_count,
+            node_pool_default_module_paths,
         })
     }
 }
@@ -294,14 +388,134 @@ impl TryFrom<SerializedSourcePackage> for SourcePackage {
             None => None,
             Some(s) => Some(s.parse()?),
         };
+        let (assignments, default_route_count, default_routes) = match (
+            value.node_pool_module_paths,
+            value.node_pool_names,
+            value.node_pool_default_route_count,
+            value.node_pool_default_module_paths,
+        ) {
+            (None, None, None, None) => (BTreeMap::new(), None, None),
+            (Some(paths), Some(names), default_route_count, default_route_paths) => {
+                anyhow::ensure!(
+                    paths.len() == names.len(),
+                    "Source package Node pool topology fields have different lengths"
+                );
+                let mut topology = BTreeMap::new();
+                for (path, name) in paths.into_iter().zip(names) {
+                    anyhow::ensure!(
+                        topology.insert(path.parse()?, name.parse()?).is_none(),
+                        "Source package Node pool topology contains a duplicate module"
+                    );
+                }
+                let default_route_count = default_route_count.map(usize::try_from).transpose()?;
+                let default_routes = default_route_paths
+                    .map(|paths| {
+                        let mut routes = BTreeSet::new();
+                        for path in paths {
+                            let path = path.parse()?;
+                            anyhow::ensure!(
+                                routes.insert(path),
+                                "Source package default Node topology contains a duplicate module"
+                            );
+                        }
+                        anyhow::Ok(routes)
+                    })
+                    .transpose()?;
+                if let Some(default_routes) = &default_routes {
+                    anyhow::ensure!(
+                        default_route_count == Some(default_routes.len()),
+                        "Source package default Node topology count does not match its modules"
+                    );
+                    anyhow::ensure!(
+                        default_routes
+                            .iter()
+                            .all(|path| !topology.contains_key(path)),
+                        "Source package Node topology assigns a module to default and named pools"
+                    );
+                }
+                (topology, default_route_count, default_routes)
+            },
+            _ => anyhow::bail!("Source package Node pool topology is incomplete"),
+        };
+        let node_executor_pool_topology = NodeExecutorPoolTopology {
+            assignments,
+            default_route_count,
+            default_routes,
+        };
         Ok(Self {
             storage_key,
             sha256,
             external_deps_package_id: external_package_id,
             package_size,
             node_version,
+            node_executor_pool_topology,
         })
     }
 }
 
 codegen_convex_serialization!(SourcePackage, SerializedSourcePackage);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serialized_source_package() -> SerializedSourcePackage {
+        SerializedSourcePackage {
+            storage_key: "package.zip".to_owned(),
+            sha256: ByteBuf::from(vec![0; 32]),
+            external_package_id: None,
+            package_size: None,
+            node_version: None,
+            node_pool_module_paths: None,
+            node_pool_names: None,
+            node_pool_default_route_count: None,
+            node_pool_default_module_paths: None,
+        }
+    }
+
+    #[test]
+    fn rejects_default_route_count_without_assignment_fields() {
+        let old_package = SourcePackage::try_from(serialized_source_package()).unwrap();
+        assert_eq!(
+            old_package
+                .node_executor_pool_topology
+                .default_route_count(),
+            None
+        );
+
+        let mut incomplete = serialized_source_package();
+        incomplete.node_pool_default_route_count = Some(1);
+        assert!(SourcePackage::try_from(incomplete).is_err());
+
+        let mut original_pool_package = serialized_source_package();
+        original_pool_package.node_pool_module_paths = Some(vec![]);
+        original_pool_package.node_pool_names = Some(vec![]);
+        SourcePackage::try_from(original_pool_package).unwrap();
+    }
+
+    #[test]
+    fn exact_default_routes_round_trip_and_validate_count() {
+        let topology = NodeExecutorPoolTopology::new_complete(
+            BTreeMap::new(),
+            ["ordinary.js".parse().unwrap()].into_iter().collect(),
+        );
+        let package = SourcePackage {
+            storage_key: "package.zip".try_into().unwrap(),
+            sha256: Sha256Digest::from([0; 32]),
+            external_deps_package_id: None,
+            package_size: PackageSize::default(),
+            node_version: None,
+            node_executor_pool_topology: topology.clone(),
+        };
+        let serialized = SerializedSourcePackage::try_from(package).unwrap();
+        let round_tripped = SourcePackage::try_from(serialized).unwrap();
+        assert_eq!(round_tripped.node_executor_pool_topology, topology);
+
+        let mut invalid = serialized_source_package();
+        invalid.node_pool_module_paths = Some(vec![]);
+        invalid.node_pool_names = Some(vec![]);
+        invalid.node_pool_default_route_count = Some(0);
+        invalid.node_pool_default_module_paths = Some(vec!["ordinary.js".to_owned()]);
+        assert!(SourcePackage::try_from(invalid).is_err());
+    }
+}

@@ -4,22 +4,42 @@ import { looseObject } from "./utils.js";
 export const moduleEnvironment = z.union([
   z.literal("isolate"),
   z.literal("node"),
+  z.string().regex(/^node:pool:(?!default$)[a-z][a-z0-9_]{0,31}$/),
 ]);
 export type ModuleEnvironment = z.infer<typeof moduleEnvironment>;
+
+const nodePoolName = z.string().regex(/^(?!default$)[a-z][a-z0-9_]{0,31}$/);
+const validateModulePoolMetadata = (
+  value: { environment: ModuleEnvironment; nodePool?: string | undefined },
+  ctx: z.RefinementCtx,
+) => {
+  const environmentPool = value.environment.startsWith("node:pool:")
+    ? value.environment.slice("node:pool:".length)
+    : undefined;
+  if (value.nodePool !== undefined && environmentPool !== value.nodePool) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["nodePool"],
+      message: "Node pool metadata must match the module environment",
+    });
+  }
+};
 
 export const moduleConfig = looseObject({
   path: z.string(),
   source: z.string(),
   sourceMap: z.optional(z.string()),
   environment: moduleEnvironment,
-});
+  nodePool: z.optional(nodePoolName),
+}).superRefine(validateModulePoolMetadata);
 export type ModuleConfig = z.infer<typeof moduleConfig>;
 
 export const moduleHashConfig = looseObject({
   path: z.string(),
   environment: moduleEnvironment,
+  nodePool: z.optional(nodePoolName),
   sha256: z.string(),
-});
+}).superRefine(validateModulePoolMetadata);
 export type ModuleHashConfig = z.infer<typeof moduleHashConfig>;
 
 export const nodeDependency = looseObject({

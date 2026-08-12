@@ -1,10 +1,12 @@
 # Backend Memory Resilience
 
-Status: the maintained backend patch selects bounded jemalloc for the standard local backend build,
-accounts for configured and observed memory, reclaims optional allocator and local Node state before
-external admission shedding, exports a shared pressure signal for downstream owner-specific patches,
-and preserves the finite cgroup limit as the hard boundary. Pressure controls are disabled by
-default. Enabling reclamation, allocator trim, or shedding requires Linux; enabling a controller
+Status: the maintained backend patch selects bounded jemalloc for the standard
+local backend build, accounts for configured and observed memory, reserves one
+full local Node hot-replacement surge allowance, reclaims optional allocator and
+local Node state before external admission shedding, exports a shared pressure
+signal for downstream owner-specific patches, and preserves the finite cgroup
+limit as the hard boundary. Pressure controls are disabled by default. Enabling
+reclamation, allocator trim, or shedding requires Linux; enabling a controller
 also requires a readable, finite cgroup v2 memory limit.
 
 ## Problem
@@ -21,13 +23,27 @@ reclamation and external HTTP shedding, allocator trim, and the shared pressure 
 the maintained local Node generation-retirement patch with a pressure response and exposes the
 signal to later owner-specific patches.
 
+When application-declared local Node executor pools are available, startup
+memory feasibility reserves `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
+Deploy and startup validation separately require the default steady slot, every
+named steady slot, and one global surge slot to fit within that total:
+
+```text
+(2 + distinct named pool count) * LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
+```
+
+The allowance includes lazy steady slots and the lazy surge slot when they have
+not started a child. It reserves the complete configured generation allowance,
+not the normally smaller RSS of a fresh process. Every pool observes the same
+pressure signal and applies the same grace and RSS floor independently.
+
 Backend memory resilience is carried as an ordered adoption composition after
 [`local_node_executor_resilience`](../local_node_executor_resilience/README.md), whose generation
-fencing and graceful retirement it reuses, and
+fencing, hot replacement, and immediate unhealthy retirement it reuses, and
 [`shared_base_http_admission`](../shared_base_http_admission/README.md), whose dependency-aware HTTP
 gate it extends. The primary `runtime: add backend memory resilience` commit introduces the memory
 controller and owner responses. The later `node-executor: capture first-miss wedge diagnostics`
-commit supplies continued watchdog checks and health-failure preemption while proactive retirement
+commit supplies continued watchdog checks and health-failure preemption while an old generation
 drains. The `runtime: harden backend memory pressure` integration commit supplies effective
 cgroup discovery, concurrent control sampling during trim, strict parser and configuration handling,
 and corrected Node pressure-grace transitions. The later
@@ -171,17 +187,46 @@ policy in the patch that owns the cache.
 
 ## Local Node reclamation
 
-The local Node watchdog observes the same pressure signal. After continuous pressure for
-`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS`, default 60 seconds, it gracefully retires the
-current generation only when a successful direct-child RSS sample is at or above
-`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`, default 2 GiB. The pressure RSS floor must be
-positive and strictly below the ordinary RSS retirement threshold.
+The local Node watchdog observes the same pressure signal. After continuous
+pressure for `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS`, default 60
+seconds, it immediately retires the current generation only when a successful
+direct-child RSS sample is at or above
+`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`, default 2 GiB. The pressure
+RSS floor must be positive and strictly below the ordinary RSS replacement
+threshold.
 
-The ordinary RSS limit remains the first proactive decision, followed by cgroup pressure, imported
-package count, and generation age. Missing RSS telemetry, a smaller child, a shorter pressure
-interval, or a cleared signal cannot trigger pressure retirement. The ordered composition preserves
-generation fencing, admission close, active-request drain, health-failure preemption, direct-child
-termination, and reaping. The new bounded retirement reason is `cgroup_pressure`.
+Trigger policy distinguishes ordinary generation maintenance from actual
+cgroup pressure:
+
+- age and imported-package limits use hot replacement;
+- the ordinary direct-child RSS limit uses hot replacement while cgroup
+  headroom is healthy;
+- a qualifying current generation under sustained cgroup pressure closes
+  admission and begins termination and reaping without starting a candidate;
+- pressure cancels every unpromoted candidate; and
+- pressure immediately terminates old generations already draining after hot
+  promotion.
+
+When the pinned-pool patch is present, the shared signal also terminates a
+removed pool whose topology cleanup is holding the global surge slot. Cleanup
+retains that slot until direct-child reaping is confirmed.
+
+Candidate cancellation and old-generation termination remove transient process
+overlap before external admission shedding. Their surge allowance remains
+occupied until direct-child reaping is confirmed. Pressure clearing does not
+restore a canceled candidate; a later healthy controller decision can enqueue
+a new replacement.
+
+The ordinary RSS limit remains the first proactive decision while headroom is
+healthy. While the pressure signal is active, healthy RSS, package-count, and
+age replacement waits instead of creating another candidate. A qualifying
+current generation then uses `cgroup_pressure`; if the signal clears first,
+ordinary replacement decisions resume. Missing RSS telemetry, a smaller child,
+a shorter pressure interval, or a cleared signal cannot trigger
+current-generation pressure retirement. The ordered composition preserves
+generation fencing, candidate ownership, admission closure, health-failure
+preemption, direct-child termination, and reaping. The bounded pressure
+retirement reason is `cgroup_pressure`.
 
 ## Observability
 
@@ -201,7 +246,9 @@ The patch extends the existing bounded memory families with:
 - `local_node_executor_memory_pressure_active_info`,
   `local_node_executor_memory_pressure_rss_threshold_bytes`, and
   `local_node_executor_memory_pressure_grace_seconds`; and
-- `cgroup_pressure` in the existing Node retirement and decision families.
+- `cgroup_pressure` in the existing Node retirement and decision families,
+  plus `pressure_canceled` candidate outcomes and pressure-forced draining-child
+  termination in the existing replacement and child-termination families.
 
 Allocator labels form the closed set `jemalloc`, `glibc`, and `system`. The jemalloc configuration
 components are `narenas`, `dirty_decay_ms`, `abort_on_invalid_configuration`,
@@ -217,6 +264,23 @@ outcome. Signed result gauges retain the latest completed sample, so consumers m
 with a counter increment in the observation window. Arena and allocator availability gauges
 distinguish measured zero from unsupported or failed telemetry.
 
+## Considered alternatives
+
+Retire-first behavior was rejected for healthy age, package-count, and ordinary
+RSS maintenance because it creates an avoidable action outage. It remains the
+correct response to actual sustained cgroup pressure: starting another process
+would consume the headroom the controller is trying to recover.
+
+Reserving only expected fresh-process RSS was rejected because package
+preparation and concurrent work can grow the candidate before the old child is
+reaped. Startup feasibility reserves one complete
+`LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES` allowance for the global surge slot.
+
+Randomized age thresholds were not added. Age is a soft trigger, the global
+coordinator queues and coalesces simultaneous rotations, and completed
+rotations naturally move later age deadlines apart. Splay remains unnecessary
+unless measured coordinator queues show a persistent burst problem.
+
 ## Activation and verification
 
 The reclamation, allocator-trim, and external-shedding switches default to `false`. Enabling any of
@@ -226,14 +290,18 @@ headroom settings use strict nonnegative decimal parsing. Trim minimum free spac
 Node pressure RSS, and Node pressure grace must be positive. Changing the process environment
 requires a backend restart.
 
-Focused tests cover the effective jemalloc configuration, process-wide libc allocation
-interposition, hysteresis, pressure-signal publication after trim evaluation, trim cooldown and
-signed results, bounded live allocator arena counting, Node RSS and grace requirements, and
-ordinary-RSS decision priority. The dependent context patch separately tests six-entry admission,
-pressure convergence to two hot protected contexts, admission suppression, and in-flight protected
-return. Runtime verification must use emitted metrics to measure trim latency and memory changes,
-owner reclamation, Node retirement, and cgroup recovery. No fixed reclaimed-byte or latency benefit
-is assumed.
+Focused tests cover the effective jemalloc configuration, process-wide libc
+allocation interposition, hysteresis, pressure-signal publication after trim
+evaluation, trim cooldown and signed results, bounded live allocator arena
+counting, the full surge allowance in startup and topology feasibility, Node RSS
+and grace requirements, healthy-headroom ordinary-RSS hot replacement,
+candidate cancellation, draining-child termination, and pressure retirement
+priority. The dependent context patch separately tests six-entry admission,
+pressure convergence to two hot protected contexts, admission suppression, and
+in-flight protected return. Runtime verification uses emitted metrics to
+measure trim latency and memory changes, owner reclamation, Node replacement or
+retirement, surge release, and cgroup recovery. No fixed reclaimed-byte or
+latency benefit is assumed.
 
 Removing the patch restores the previous backend memory behavior. No schema or data change is
 involved, but an older image does not understand the new environment variables or emit the new

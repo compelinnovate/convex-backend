@@ -1,6 +1,7 @@
 use anyhow::Context;
 use application::{
     deploy_config::{
+        format_module_environment,
         ModuleJson,
         NodeDependencyJson,
         PushAnalytics,
@@ -132,6 +133,8 @@ pub struct ConfigJson {
     pub bundled_module_infos: Option<Vec<BundledModuleInfoJson>>,
     // Version of Node.js to use in the node executor.
     pub node_version: Option<String>,
+    #[serde(default)]
+    pub force_node_cutover: bool,
 }
 
 pub struct ConfigStats {
@@ -141,32 +144,36 @@ pub struct ConfigStats {
     pub size_v8_modules: usize,
 }
 
-static NODE_ENVIRONMENT: &str = "node";
+fn is_node_environment(environment: Option<&str>) -> bool {
+    environment
+        .is_some_and(|environment| environment == "node" || environment.starts_with("node:pool:"))
+}
+
 impl ConfigJson {
     pub fn stats(&self) -> ConfigStats {
         let num_node_modules = self
             .modules
             .iter()
-            .filter(|module| module.environment.as_deref() == Some(NODE_ENVIRONMENT))
+            .filter(|module| is_node_environment(module.environment.as_deref()))
             .count();
         let size_node_modules = self
             .modules
             .iter()
-            .filter(|module| module.environment.as_deref() == Some(NODE_ENVIRONMENT))
+            .filter(|module| is_node_environment(module.environment.as_deref()))
             .fold(0, |acc, e| {
                 acc + e.source.len() + e.source_map.as_ref().map_or(0, |sm| sm.len())
             });
         let size_v8_modules = self
             .modules
             .iter()
-            .filter(|module| module.environment.as_deref() != Some(NODE_ENVIRONMENT))
+            .filter(|module| !is_node_environment(module.environment.as_deref()))
             .fold(0, |acc, e| {
                 acc + e.source.len() + e.source_map.as_ref().map_or(0, |sm| sm.len())
             });
         let num_v8_modules = self
             .modules
             .iter()
-            .filter(|module| module.environment.as_deref() != Some(NODE_ENVIRONMENT))
+            .filter(|module| !is_node_environment(module.environment.as_deref()))
             .count();
         ConfigStats {
             num_v8_modules,
@@ -183,6 +190,7 @@ pub struct ModuleHashJson {
     path: String,
     hash: String,
     environment: Option<String>,
+    node_pool: Option<String>,
 }
 
 pub async fn get_config(
@@ -237,7 +245,11 @@ pub async fn get_config_hashes(
         .map(|m| ModuleHashJson {
             path: m.path.clone().into(),
             hash: m.sha256.as_hex(),
-            environment: Some(m.environment.to_string()),
+            environment: Some(format_module_environment(
+                m.environment,
+                m.node_pool.as_ref(),
+            )),
+            node_pool: m.node_pool.as_ref().map(ToString::to_string),
         })
         .collect();
     let config = ConvexObject::try_from(config)?;
@@ -265,7 +277,13 @@ pub async fn push_config(
 ) -> Result<impl IntoResponse, HttpResponseError> {
     push_config_handler(&st.application, request_metadata, req)
         .await
-        .map_err(|e| e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}")))?;
+        .map_err(|e| {
+            if e.short_msg() == "NodeExecutorCutoverFailedAfterCommit" {
+                e
+            } else {
+                e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
+            }
+        })?;
 
     Ok(Json(EmptyResponse {}))
 }
@@ -316,6 +334,7 @@ pub async fn push_config_handler(
             config.schema_id,
             config.node_dependencies,
             node_version,
+            config.force_node_cutover,
         )
         .await?;
     Ok((identity, analytics, metrics))

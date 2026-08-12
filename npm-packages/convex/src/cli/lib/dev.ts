@@ -138,6 +138,7 @@ export async function devAgainstDeployment(
         ...credentials,
         verbose: devOptions.verbose,
         dryRun: false,
+        forceNodeCutover: false,
         typecheck: devOptions.typecheck,
         typecheckComponents: devOptions.typecheckComponents,
         debug: false,

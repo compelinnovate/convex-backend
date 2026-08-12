@@ -67,14 +67,16 @@ use http_client::CachedHttpClient;
 use indexing::index_cache::IndexCache;
 use model::{
     initialize_application_system_tables,
+    source_packages::SourcePackageModel,
     virtual_system_mapping,
 };
 use node_executor::{
-    local::{
-        LocalNodeExecutor,
-        LocalNodeExecutorConfig,
+    routed::{
+        RoutedLocalNodeExecutor,
+        RoutedLocalNodeExecutorConfig,
     },
     NodeActions,
+    NodeExecutor,
 };
 use runtime::prod::ProdRuntime;
 use search::{
@@ -88,6 +90,7 @@ pub use sync::subscription_reconnect::SubscriptionReconnectRateLimiter;
 use tikv_jemalloc_sys as _;
 #[cfg(local_backend_jemalloc)]
 use tikv_jemallocator::Jemalloc;
+use value::TableNamespace;
 
 #[cfg(local_backend_jemalloc)]
 #[global_allocator]
@@ -271,7 +274,7 @@ pub async fn make_app(
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
     memory_reclamation: MemoryPressureSignal,
-    node_executor_config: LocalNodeExecutorConfig,
+    node_executor_config: RoutedLocalNodeExecutorConfig,
 ) -> anyhow::Result<LocalAppState> {
     let key_broker = config.key_broker()?;
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
@@ -296,6 +299,17 @@ pub async fn make_app(
     )
     .await?;
     initialize_application_system_tables(&database).await?;
+    let (committed_pool_topology, committed_pool_topology_version) = {
+        let mut tx = database.begin_system().await?;
+        let topology = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .get_latest()
+            .await?
+            .map(|package| package.node_executor_pool_topology.clone())
+            .unwrap_or_default();
+        let version = tx.into_token()?.ts();
+        (topology, version)
+    };
+    node_executor_config.validate_pool_topology(&committed_pool_topology)?;
     let application_storage = Application::initialize_storage(
         runtime.clone(),
         &database,
@@ -319,7 +333,9 @@ pub async fn make_app(
         class: DeploymentClass::S16,
     };
     let node_executor =
-        Arc::new(LocalNodeExecutor::new_with_configuration(node_executor_config).await?);
+        Arc::new(RoutedLocalNodeExecutor::new_with_configuration(node_executor_config).await?);
+    node_executor
+        .reconcile_pool_topology(&committed_pool_topology, committed_pool_topology_version)?;
     let node_actions = NodeActions::new(
         node_executor,
         config.convex_origin_url()?,
