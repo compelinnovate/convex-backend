@@ -6,8 +6,10 @@ use metrics::{
     log_distribution,
     log_distribution_with_labels,
     log_gauge,
+    log_gauge_with_labels,
     register_convex_counter,
     register_convex_gauge,
+    register_convex_gauge_evictable,
     register_convex_histogram,
     StaticMetricLabel,
     StatusTimer,
@@ -122,65 +124,90 @@ pub fn log_external_deps_size_bytes_total(pkg_size: PackageSize) {
     );
 }
 
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_GENERATION_PRESENT_INFO,
-    "Whether a local Node executor generation is currently available"
+    "Whether a local Node executor generation is currently available",
+    &["pool_name"]
 );
-pub fn set_local_node_generation_present(present: bool) {
-    log_gauge(
+pub fn set_local_node_generation_present(pool_name: &str, present: bool) {
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_GENERATION_PRESENT_INFO,
         if present { 1.0 } else { 0.0 },
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
     );
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_GENERATION_STARTS_TOTAL,
-    "Number of local Node executor generations started"
+    "Number of local Node executor generations started",
+    &["pool_name"]
 );
-pub fn log_local_node_generation_start() {
-    log_counter(&LOCAL_NODE_EXECUTOR_GENERATION_STARTS_TOTAL, 1);
+pub fn log_local_node_generation_start(pool_name: &str) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_GENERATION_STARTS_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_CHILD_STARTS_TOTAL,
-    "Number of local Node executor server child processes started"
+    "Number of local Node executor server child processes started",
+    &["pool_name"]
 );
-pub fn log_local_node_child_start() {
-    log_counter(&LOCAL_NODE_EXECUTOR_CHILD_STARTS_TOTAL, 1);
+pub fn log_local_node_child_start(pool_name: &str) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_CHILD_STARTS_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_CHILD_EXITS_TOTAL,
     "Number of local Node executor server child-process exits",
-    &["class"]
+    &["pool_name", "class"]
 );
-pub fn log_local_node_child_exit(exit_class: &'static str) {
+pub fn log_local_node_child_exit(pool_name: &str, exit_class: &'static str) {
     log_counter_with_labels(
         &LOCAL_NODE_EXECUTOR_CHILD_EXITS_TOTAL,
         1,
-        vec![StaticMetricLabel::new("class", exit_class)],
+        vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+            StaticMetricLabel::new("class", exit_class),
+        ],
     );
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_GENERATION_RETIREMENTS_TOTAL,
     "Number of local Node executor generations retired",
-    &["reason"]
+    &["pool_name", "reason"]
 );
-pub fn log_local_node_generation_retirement(reason: &'static str) {
+pub fn log_local_node_generation_retirement(pool_name: &str, reason: &'static str) {
     log_counter_with_labels(
         &LOCAL_NODE_EXECUTOR_GENERATION_RETIREMENTS_TOTAL,
         1,
-        vec![StaticMetricLabel::new("reason", reason)],
+        vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+            StaticMetricLabel::new("reason", reason),
+        ],
     );
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_RETIREMENT_DIAGNOSTICS_TOTAL,
     "Bounded diagnostic context for local Node executor generation retirement",
-    &["reason", "request_kind", "phase", "transport_error_kind"]
+    &[
+        "pool_name",
+        "reason",
+        "request_kind",
+        "phase",
+        "transport_error_kind"
+    ]
 );
 pub fn log_local_node_retirement_diagnostics(
+    pool_name: &str,
     reason: &'static str,
     request_kind: &'static str,
     phase: &'static str,
@@ -190,6 +217,7 @@ pub fn log_local_node_retirement_diagnostics(
         &LOCAL_NODE_EXECUTOR_RETIREMENT_DIAGNOSTICS_TOTAL,
         1,
         vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
             StaticMetricLabel::new("reason", reason),
             StaticMetricLabel::new("request_kind", request_kind),
             StaticMetricLabel::new("phase", phase),
@@ -201,8 +229,7 @@ pub fn log_local_node_retirement_diagnostics(
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_FIRST_MISS_DIAGNOSTICS_TOTAL,
     "Outcomes of first-watchdog-miss local Node executor diagnostics",
-    &["operation", "outcome"],
-    Duration::MAX,
+    &["pool_name", "operation", "outcome"],
 );
 
 macro_rules! first_miss_diagnostic_outcomes {
@@ -256,6 +283,7 @@ first_miss_diagnostic_outcomes! {
 }
 
 fn log_local_node_first_miss_diagnostic_counter(
+    pool_name: &str,
     outcome: FirstMissDiagnosticOutcome,
     increment: u64,
 ) {
@@ -264,26 +292,31 @@ fn log_local_node_first_miss_diagnostic_counter(
         &LOCAL_NODE_EXECUTOR_FIRST_MISS_DIAGNOSTICS_TOTAL,
         increment,
         vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
             StaticMetricLabel::new("operation", operation),
             StaticMetricLabel::new("outcome", outcome),
         ],
     );
 }
 
-pub(crate) fn initialize_local_node_first_miss_diagnostic_counters() {
+pub(crate) fn initialize_local_node_first_miss_diagnostic_counters(pool_name: &str) {
     for &outcome in FirstMissDiagnosticOutcome::ALL {
-        log_local_node_first_miss_diagnostic_counter(outcome, 0);
+        log_local_node_first_miss_diagnostic_counter(pool_name, outcome, 0);
     }
 }
 
-pub(crate) fn log_local_node_first_miss_diagnostic(outcome: FirstMissDiagnosticOutcome) {
-    log_local_node_first_miss_diagnostic_counter(outcome, 1);
+pub(crate) fn log_local_node_first_miss_diagnostic(
+    pool_name: &str,
+    outcome: FirstMissDiagnosticOutcome,
+) {
+    log_local_node_first_miss_diagnostic_counter(pool_name, outcome, 1);
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_CHILD_TERMINATIONS_TOTAL,
     "Completed supervisor termination of retired local Node executor children",
     &[
+        "pool_name",
         "reason",
         "state_before",
         "supervisor_kill_requested",
@@ -291,6 +324,7 @@ register_convex_counter!(
     ]
 );
 pub fn log_local_node_child_termination(
+    pool_name: &str,
     reason: &'static str,
     state_before: &'static str,
     supervisor_kill_requested: bool,
@@ -300,6 +334,7 @@ pub fn log_local_node_child_termination(
         &LOCAL_NODE_EXECUTOR_CHILD_TERMINATIONS_TOTAL,
         1,
         vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
             StaticMetricLabel::new("reason", reason),
             StaticMetricLabel::new("state_before", state_before),
             StaticMetricLabel::new(
@@ -318,64 +353,78 @@ pub fn log_local_node_child_termination(
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_REPLACEMENT_OUTCOMES_TOTAL,
     "Outcomes of local Node executor replacement attempts",
-    &["outcome"]
+    &["pool_name", "outcome"]
 );
-pub fn log_local_node_replacement_outcome(outcome: &'static str) {
+pub fn log_local_node_replacement_outcome(pool_name: &str, outcome: &'static str) {
     log_counter_with_labels(
         &LOCAL_NODE_EXECUTOR_REPLACEMENT_OUTCOMES_TOTAL,
         1,
-        vec![StaticMetricLabel::new("outcome", outcome)],
+        vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+            StaticMetricLabel::new("outcome", outcome),
+        ],
     );
 }
 
 register_convex_histogram!(
     LOCAL_NODE_EXECUTOR_REPLACEMENT_SECONDS,
-    "Time to start a replacement local Node executor after the next invocation"
+    "Time to start a replacement local Node executor after the next invocation",
+    &["pool_name"]
 );
-pub fn log_local_node_replacement_time(elapsed: Duration) {
-    log_distribution(
+pub fn log_local_node_replacement_time(pool_name: &str, elapsed: Duration) {
+    log_distribution_with_labels(
         &LOCAL_NODE_EXECUTOR_REPLACEMENT_SECONDS,
         elapsed.as_secs_f64(),
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
     );
 }
 
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_GENERATION_AGE_SECONDS,
-    "Age of the current local Node executor generation"
+    "Age of the current local Node executor generation",
+    &["pool_name"]
 );
-pub fn set_local_node_generation_age(age: Duration) {
-    log_gauge(
+pub fn set_local_node_generation_age(pool_name: &str, age: Duration) {
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_GENERATION_AGE_SECONDS,
         age.as_secs_f64(),
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
     );
 }
 
 register_convex_gauge!(
     LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES,
-    "Configured V8 old-space allowance for the local Node executor child"
+    "Configured V8 old-space allowance for the local Node executor child",
+    &["pool_name"]
 );
 register_convex_gauge!(
     LOCAL_NODE_EXECUTOR_RSS_RETIREMENT_THRESHOLD_BYTES,
-    "Configured RSS threshold for graceful local Node executor generation retirement"
+    "Configured RSS threshold for graceful local Node executor generation retirement",
+    &["pool_name"]
 );
 register_convex_gauge!(
     LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_RSS_THRESHOLD_BYTES,
-    "Configured direct-child RSS threshold for retirement during sustained cgroup memory pressure"
+    "Configured direct-child RSS threshold for retirement during sustained cgroup memory pressure",
+    &["pool_name"]
 );
 register_convex_gauge!(
     LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECONDS,
-    "Configured cgroup memory-pressure duration before local Node executor retirement"
+    "Configured cgroup memory-pressure duration before local Node executor retirement",
+    &["pool_name"]
 );
 register_convex_gauge!(
     LOCAL_NODE_EXECUTOR_AGE_RETIREMENT_THRESHOLD_SECONDS,
-    "Configured age threshold for graceful local Node executor generation retirement"
+    "Configured age threshold for graceful local Node executor generation retirement",
+    &["pool_name"]
 );
 register_convex_gauge!(
     LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
     "Configured lifetime imported source-package threshold for graceful local Node executor \
-     generation retirement"
+     generation retirement",
+    &["pool_name"]
 );
 pub fn set_local_node_memory_configuration(
+    pool_name: &str,
     old_space_limit_bytes: u64,
     rss_threshold_bytes: u64,
     memory_pressure_rss_threshold_bytes: u64,
@@ -383,95 +432,117 @@ pub fn set_local_node_memory_configuration(
     age_threshold: Duration,
     package_threshold: u64,
 ) {
-    log_gauge(
+    let labels = || vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())];
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES,
         old_space_limit_bytes as f64,
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_RSS_RETIREMENT_THRESHOLD_BYTES,
         rss_threshold_bytes as f64,
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_RSS_THRESHOLD_BYTES,
         memory_pressure_rss_threshold_bytes as f64,
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECONDS,
         memory_pressure_grace.as_secs_f64(),
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_AGE_RETIREMENT_THRESHOLD_SECONDS,
         age_threshold.as_secs_f64(),
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
         package_threshold as f64,
+        labels(),
     );
 }
 
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_ACTIVE_INFO,
-    "Whether the current local Node executor generation observes cgroup memory pressure"
+    "Whether the current local Node executor generation observes cgroup memory pressure",
+    &["pool_name"]
 );
-pub fn set_local_node_memory_pressure_active(active: bool) {
-    log_gauge(
+pub fn set_local_node_memory_pressure_active(pool_name: &str, active: bool) {
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_ACTIVE_INFO,
         if active { 1.0 } else { 0.0 },
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
     );
 }
 
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_CHILD_RSS_BYTES,
-    "Resident memory of the current local Node executor child"
+    "Resident memory of the current local Node executor child",
+    &["pool_name"]
 );
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO,
-    "Whether the latest local Node executor child RSS sample succeeded"
+    "Whether the latest local Node executor child RSS sample succeeded",
+    &["pool_name"]
 );
-pub fn set_local_node_child_rss(rss: Option<u64>) {
+pub fn set_local_node_child_rss(pool_name: &str, rss: Option<u64>) {
+    let labels = || vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())];
     match rss {
         Some(rss) => {
-            log_gauge(&LOCAL_NODE_EXECUTOR_CHILD_RSS_BYTES, rss as f64);
-            log_gauge(&LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO, 1.0);
+            log_gauge_with_labels(&LOCAL_NODE_EXECUTOR_CHILD_RSS_BYTES, rss as f64, labels());
+            log_gauge_with_labels(&LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO, 1.0, labels());
         },
-        None => log_gauge(&LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO, 0.0),
+        None => log_gauge_with_labels(&LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO, 0.0, labels()),
     }
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_CHILD_RSS_SAMPLES_TOTAL,
     "Local Node executor direct-child RSS sampling outcomes",
-    &["outcome"]
+    &["pool_name", "outcome"]
 );
-pub fn log_local_node_child_rss_sample(outcome: &'static str) {
+pub fn log_local_node_child_rss_sample(pool_name: &str, outcome: &'static str) {
     log_counter_with_labels(
         &LOCAL_NODE_EXECUTOR_CHILD_RSS_SAMPLES_TOTAL,
         1,
-        vec![StaticMetricLabel::new("outcome", outcome)],
+        vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+            StaticMetricLabel::new("outcome", outcome),
+        ],
     );
 }
 
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_GENERATION_DRAINING_INFO,
-    "Whether the current local Node executor generation has stopped accepting new requests"
+    "Whether a local Node executor generation is in graceful drain",
+    &["pool_name"]
 );
-pub fn set_local_node_generation_draining(draining: bool) {
-    log_gauge(
+pub fn set_local_node_generation_draining(pool_name: &str, draining: bool) {
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_GENERATION_DRAINING_INFO,
         if draining { 1.0 } else { 0.0 },
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
     );
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_RETIREMENT_DECISIONS_TOTAL,
     "Local Node executor generation retirement decisions",
-    &["reason", "decision"]
+    &["pool_name", "reason", "decision"]
 );
-pub fn log_local_node_retirement_decision(reason: &'static str, decision: &'static str) {
+pub fn log_local_node_retirement_decision(
+    pool_name: &str,
+    reason: &'static str,
+    decision: &'static str,
+) {
     log_counter_with_labels(
         &LOCAL_NODE_EXECUTOR_RETIREMENT_DECISIONS_TOTAL,
         1,
         vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
             StaticMetricLabel::new("reason", reason),
             StaticMetricLabel::new("decision", decision),
         ],
@@ -481,104 +552,130 @@ pub fn log_local_node_retirement_decision(reason: &'static str, decision: &'stat
 register_convex_histogram!(
     LOCAL_NODE_EXECUTOR_HEALTH_CHECK_SECONDS,
     "Duration of local Node executor health checks",
-    &["phase", "outcome"]
+    &["pool_name", "phase", "outcome"]
 );
-pub fn log_local_node_health_check(elapsed: Duration, phase: &'static str, success: bool) {
+pub fn log_local_node_health_check(
+    pool_name: &str,
+    elapsed: Duration,
+    phase: &'static str,
+    success: bool,
+) {
     log_distribution_with_labels(
         &LOCAL_NODE_EXECUTOR_HEALTH_CHECK_SECONDS,
         elapsed.as_secs_f64(),
         vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
             StaticMetricLabel::new("phase", phase),
             StaticMetricLabel::new("outcome", if success { "success" } else { "failure" }),
         ],
     );
 }
 
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_CONSECUTIVE_HEALTH_MISSES,
-    "Consecutive failed health checks for the current local Node executor generation"
+    "Consecutive failed health checks for the current local Node executor generation",
+    &["pool_name"]
 );
-pub fn set_local_node_consecutive_health_misses(misses: u32) {
-    log_gauge(
+pub fn set_local_node_consecutive_health_misses(pool_name: &str, misses: u32) {
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_CONSECUTIVE_HEALTH_MISSES,
         misses as f64,
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
     );
 }
 
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_WAITING_REQUESTS,
-    "Current requests waiting for a local Node executor generation"
+    "Current requests waiting for a local Node executor generation",
+    &["pool_name"]
 );
-pub fn set_local_node_waiting_requests(waiting: usize) {
-    log_gauge(&LOCAL_NODE_EXECUTOR_WAITING_REQUESTS, waiting as f64);
-}
-pub fn increment_local_node_waiting_requests() {
-    LOCAL_NODE_EXECUTOR_WAITING_REQUESTS.inc();
-}
-pub fn decrement_local_node_waiting_requests() {
-    LOCAL_NODE_EXECUTOR_WAITING_REQUESTS.dec();
+pub fn set_local_node_waiting_requests(pool_name: &str, waiting: usize) {
+    log_gauge_with_labels(
+        &LOCAL_NODE_EXECUTOR_WAITING_REQUESTS,
+        waiting as f64,
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_REQUEST_STARTS_TOTAL,
-    "Number of local Node executor requests started"
+    "Number of local Node executor requests started",
+    &["pool_name"]
 );
-pub fn log_local_node_request_start() {
-    log_counter(&LOCAL_NODE_EXECUTOR_REQUEST_STARTS_TOTAL, 1);
-    LOCAL_NODE_EXECUTOR_ACTIVE_REQUESTS.inc();
+pub fn log_local_node_request_start(pool_name: &str) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_REQUEST_STARTS_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_REQUEST_COMPLETIONS_TOTAL,
     "Number of local Node executor requests completed",
-    &["outcome"]
+    &["pool_name", "outcome"]
 );
-pub fn log_local_node_request_completion(outcome: &'static str) {
-    LOCAL_NODE_EXECUTOR_ACTIVE_REQUESTS.dec();
+pub fn log_local_node_request_completion(pool_name: &str, outcome: &'static str) {
     log_counter_with_labels(
         &LOCAL_NODE_EXECUTOR_REQUEST_COMPLETIONS_TOTAL,
         1,
-        vec![StaticMetricLabel::new("outcome", outcome)],
+        vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+            StaticMetricLabel::new("outcome", outcome),
+        ],
     );
 }
 
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_ACTIVE_REQUESTS,
-    "Current requests assigned to local Node executor generations"
+    "Current requests assigned to local Node executor generations",
+    &["pool_name"]
 );
-pub fn set_local_node_active_requests(active: usize) {
-    log_gauge(&LOCAL_NODE_EXECUTOR_ACTIVE_REQUESTS, active as f64);
+pub fn set_local_node_active_requests(pool_name: &str, active: usize) {
+    log_gauge_with_labels(
+        &LOCAL_NODE_EXECUTOR_ACTIVE_REQUESTS,
+        active as f64,
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
 }
 
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_RETAINED_SOURCE_PACKAGES_INFO,
-    "Retained dynamic source packages in the current local Node executor generation"
+    "Retained dynamic source packages in the current local Node executor generation",
+    &["pool_name"]
 );
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_IMPORTED_SOURCE_PACKAGES_INFO,
-    "Lifetime-unique imported source-package roots in the current local Node executor generation"
+    "Lifetime-unique imported source-package roots in the current local Node executor generation",
+    &["pool_name"]
 );
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_RETAINED_SOURCE_PACKAGE_BYTES,
-    "Retained dynamic source-package bytes in the current local Node executor generation"
+    "Retained dynamic source-package bytes in the current local Node executor generation",
+    &["pool_name"]
 );
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_ACTIVE_SOURCE_PACKAGE_OWNERS_INFO,
-    "Active source-package owners in the current local Node executor generation"
+    "Active source-package owners in the current local Node executor generation",
+    &["pool_name"]
 );
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_RETAINED_EXTERNAL_PACKAGES_INFO,
-    "Retained dynamic external packages in the current local Node executor generation"
+    "Retained dynamic external packages in the current local Node executor generation",
+    &["pool_name"]
 );
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_RETAINED_EXTERNAL_PACKAGE_BYTES,
-    "Retained dynamic external-package bytes in the current local Node executor generation"
+    "Retained dynamic external-package bytes in the current local Node executor generation",
+    &["pool_name"]
 );
-register_convex_gauge!(
+register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_REGISTERED_STACK_ROOTS_INFO,
-    "Registered source-package stack roots in the current local Node executor generation"
+    "Registered source-package stack roots in the current local Node executor generation",
+    &["pool_name"]
 );
 pub fn set_local_node_package_state(
+    pool_name: &str,
     imported_source_packages: u64,
     source_packages: u64,
     source_bytes: u64,
@@ -587,42 +684,51 @@ pub fn set_local_node_package_state(
     external_bytes: u64,
     stack_roots: u64,
 ) {
-    log_gauge(
+    let labels = || vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())];
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_IMPORTED_SOURCE_PACKAGES_INFO,
         imported_source_packages as f64,
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_RETAINED_SOURCE_PACKAGES_INFO,
         source_packages as f64,
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_RETAINED_SOURCE_PACKAGE_BYTES,
         source_bytes as f64,
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_ACTIVE_SOURCE_PACKAGE_OWNERS_INFO,
         active_source_owners as f64,
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_RETAINED_EXTERNAL_PACKAGES_INFO,
         external_packages as f64,
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_RETAINED_EXTERNAL_PACKAGE_BYTES,
         external_bytes as f64,
+        labels(),
     );
-    log_gauge(
+    log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_REGISTERED_STACK_ROOTS_INFO,
         stack_roots as f64,
+        labels(),
     );
 }
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_PACKAGE_EVENTS_TOTAL,
     "Local Node executor package-cache events",
-    &["package_kind", "operation"]
+    &["pool_name", "package_kind", "operation"]
 );
 pub fn log_local_node_package_events(
+    pool_name: &str,
     package_kind: &'static str,
     operation: &'static str,
     count: u64,
@@ -634,6 +740,7 @@ pub fn log_local_node_package_events(
         &LOCAL_NODE_EXECUTOR_PACKAGE_EVENTS_TOTAL,
         count,
         vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
             StaticMetricLabel::new("package_kind", package_kind),
             StaticMetricLabel::new("operation", operation),
         ],
@@ -642,34 +749,287 @@ pub fn log_local_node_package_events(
 
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_STACK_FORMAT_INVOCATIONS_TOTAL,
-    "Stack-format invocations in the local Node executor"
+    "Stack-format invocations in the local Node executor",
+    &["pool_name"]
 );
 register_convex_counter!(
     LOCAL_NODE_EXECUTOR_STACK_FORMAT_FRAMES_TOTAL,
-    "Stack frames processed in the local Node executor"
+    "Stack frames processed in the local Node executor",
+    &["pool_name"]
 );
 register_convex_histogram!(
     LOCAL_NODE_EXECUTOR_STACK_FORMAT_SECONDS,
-    "Stack-format time accumulated between successful local Node executor health observations"
+    "Stack-format time accumulated between successful local Node executor health observations",
+    &["pool_name"]
 );
-pub fn log_local_node_stack_format_deltas(invocations: u64, frames: u64, duration_ms: f64) {
+pub fn log_local_node_stack_format_deltas(
+    pool_name: &str,
+    invocations: u64,
+    frames: u64,
+    duration_ms: f64,
+) {
     assert!(
         duration_ms.is_finite() && duration_ms >= 0.0,
         "Local Node executor stack-format duration delta is invalid"
     );
     if invocations > 0 {
-        log_counter(
+        log_counter_with_labels(
             &LOCAL_NODE_EXECUTOR_STACK_FORMAT_INVOCATIONS_TOTAL,
             invocations,
+            vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
         );
     }
     if frames > 0 {
-        log_counter(&LOCAL_NODE_EXECUTOR_STACK_FORMAT_FRAMES_TOTAL, frames);
+        log_counter_with_labels(
+            &LOCAL_NODE_EXECUTOR_STACK_FORMAT_FRAMES_TOTAL,
+            frames,
+            vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+        );
     }
     // A zero observation is measured idle stack-format work, not a missing
     // metric family. Record every successful-observation interval.
-    log_distribution(
+    log_distribution_with_labels(
         &LOCAL_NODE_EXECUTOR_STACK_FORMAT_SECONDS,
         duration_ms / 1000.0,
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
     );
+}
+
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_POOL_CONFIGURED_INFO,
+    "Whether a local Node executor pool is configured",
+    &["pool_name"]
+);
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_POOL_ROUTES_INFO,
+    "Number of application modules assigned to a local Node executor pool",
+    &["pool_name"]
+);
+pub fn set_local_node_pool_configuration(pool_name: &str, routes: Option<usize>) {
+    let labels = || vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())];
+    log_gauge_with_labels(&LOCAL_NODE_EXECUTOR_POOL_CONFIGURED_INFO, 1.0, labels());
+    match routes {
+        Some(routes) => log_gauge_with_labels(
+            &LOCAL_NODE_EXECUTOR_POOL_ROUTES_INFO,
+            routes as f64,
+            labels(),
+        ),
+        None => {
+            let _ = LOCAL_NODE_EXECUTOR_POOL_ROUTES_INFO.remove_label_values(&[pool_name]);
+        },
+    }
+}
+
+pub fn clear_local_node_pool_configuration(pool_name: &str) {
+    for gauge in [
+        &*LOCAL_NODE_EXECUTOR_POOL_CONFIGURED_INFO,
+        &*LOCAL_NODE_EXECUTOR_POOL_ROUTES_INFO,
+        &*LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES,
+        &*LOCAL_NODE_EXECUTOR_RSS_RETIREMENT_THRESHOLD_BYTES,
+        &*LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_RSS_THRESHOLD_BYTES,
+        &*LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECONDS,
+        &*LOCAL_NODE_EXECUTOR_AGE_RETIREMENT_THRESHOLD_SECONDS,
+        &*LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
+    ] {
+        let _ = gauge.remove_label_values(&[pool_name]);
+    }
+}
+
+register_convex_counter!(
+    LOCAL_NODE_EXECUTOR_TOPOLOGY_PUBLICATIONS_TOTAL,
+    "Outcomes of local Node executor topology publications",
+    &["outcome"]
+);
+pub fn log_local_node_topology_publication(outcome: &'static str) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_TOPOLOGY_PUBLICATIONS_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("outcome", outcome)],
+    );
+}
+
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_CONFIGURED_NAMED_POOLS_INFO,
+    "Current number of configured named local Node executor pools"
+);
+pub fn set_local_node_configured_named_pools(count: usize) {
+    log_gauge(
+        &LOCAL_NODE_EXECUTOR_CONFIGURED_NAMED_POOLS_INFO,
+        count as f64,
+    );
+}
+
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_SURGE_SLOT_INFO,
+    "Current phase of the application-wide local Node executor surge slot",
+    &["phase"]
+);
+pub fn set_local_node_surge_phase(phase: &'static str) {
+    for candidate in ["unused", "reservation", "candidate", "draining"] {
+        log_gauge_with_labels(
+            &LOCAL_NODE_EXECUTOR_SURGE_SLOT_INFO,
+            f64::from(candidate == phase),
+            vec![StaticMetricLabel::new("phase", candidate)],
+        );
+    }
+}
+
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_SURGE_QUEUE_INFO,
+    "Queued application-wide local Node executor surge transitions",
+    &["priority"]
+);
+pub fn set_local_node_surge_queue(priority: &'static str, count: usize) {
+    log_gauge_with_labels(
+        &LOCAL_NODE_EXECUTOR_SURGE_QUEUE_INFO,
+        count as f64,
+        vec![StaticMetricLabel::new("priority", priority)],
+    );
+}
+
+register_convex_histogram!(
+    LOCAL_NODE_EXECUTOR_SURGE_WAIT_SECONDS,
+    "Time spent waiting for the application-wide local Node executor surge slot",
+    &["priority", "outcome"]
+);
+pub fn log_local_node_surge_wait(priority: &'static str, elapsed: Duration, outcome: &'static str) {
+    log_distribution_with_labels(
+        &LOCAL_NODE_EXECUTOR_SURGE_WAIT_SECONDS,
+        elapsed.as_secs_f64(),
+        vec![
+            StaticMetricLabel::new("priority", priority),
+            StaticMetricLabel::new("outcome", outcome),
+        ],
+    );
+}
+
+register_convex_counter!(
+    LOCAL_NODE_EXECUTOR_DEPLOYMENT_CUTOVER_EVENTS_TOTAL,
+    "Bounded application-wide local Node executor deployment cutover events",
+    &["event"]
+);
+pub fn log_local_node_deployment_cutover_event(event: &'static str) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_DEPLOYMENT_CUTOVER_EVENTS_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("event", event)],
+    );
+}
+
+register_convex_gauge_evictable!(
+    LOCAL_NODE_EXECUTOR_CANDIDATE_PRESENT_INFO,
+    "Whether a local Node executor candidate is present",
+    &["pool_name"]
+);
+pub fn set_local_node_candidate_present(pool_name: &str, present: bool) {
+    log_gauge_with_labels(
+        &LOCAL_NODE_EXECUTOR_CANDIDATE_PRESENT_INFO,
+        f64::from(present),
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
+}
+
+register_convex_histogram!(
+    LOCAL_NODE_EXECUTOR_CANDIDATE_PREPARATION_SECONDS,
+    "Time spent preparing a local Node executor candidate",
+    &["pool_name", "outcome"]
+);
+pub fn log_local_node_candidate_preparation(
+    pool_name: &str,
+    elapsed: Duration,
+    outcome: &'static str,
+) {
+    log_distribution_with_labels(
+        &LOCAL_NODE_EXECUTOR_CANDIDATE_PREPARATION_SECONDS,
+        elapsed.as_secs_f64(),
+        vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+            StaticMetricLabel::new("outcome", outcome),
+        ],
+    );
+}
+
+register_convex_counter!(
+    LOCAL_NODE_EXECUTOR_ROUTE_REQUESTS_TOTAL,
+    "Number of requests routed to local Node executor pools",
+    &["pool_name", "request_kind"]
+);
+pub fn log_local_node_route_request(pool_name: &str, request_kind: &'static str) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_ROUTE_REQUESTS_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+            StaticMetricLabel::new("request_kind", request_kind),
+        ],
+    );
+}
+
+register_convex_counter!(
+    LOCAL_NODE_EXECUTOR_FINGERPRINT_TRANSITIONS_TOTAL,
+    "Outcomes of local Node executor resident-fingerprint transitions",
+    &["pool_name", "outcome"]
+);
+
+#[derive(Clone, Copy)]
+pub(crate) enum FingerprintTransitionOutcome {
+    StartupFailed,
+    ReplacementReady,
+    Joined,
+    RetirementFailed,
+}
+
+impl FingerprintTransitionOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StartupFailed => "startup_failed",
+            Self::ReplacementReady => "replacement_ready",
+            Self::Joined => "joined",
+            Self::RetirementFailed => "retirement_failed",
+        }
+    }
+}
+
+pub(crate) fn log_local_node_fingerprint_transition(
+    pool_name: &str,
+    outcome: FingerprintTransitionOutcome,
+) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_FINGERPRINT_TRANSITIONS_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+            StaticMetricLabel::new("outcome", outcome.as_str()),
+        ],
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_pool_configuration_removes_label_sets() {
+        let pool_name = "metrics_removal_test";
+        set_local_node_pool_configuration(pool_name, Some(3));
+        set_local_node_memory_configuration(
+            pool_name,
+            1,
+            2,
+            3,
+            Duration::from_secs(4),
+            Duration::from_secs(5),
+            6,
+        );
+        clear_local_node_pool_configuration(pool_name);
+        assert!(LOCAL_NODE_EXECUTOR_POOL_CONFIGURED_INFO
+            .remove_label_values(&[pool_name])
+            .is_err());
+        assert!(LOCAL_NODE_EXECUTOR_POOL_ROUTES_INFO
+            .remove_label_values(&[pool_name])
+            .is_err());
+        assert!(LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES
+            .remove_label_values(&[pool_name])
+            .is_err());
+    }
 }

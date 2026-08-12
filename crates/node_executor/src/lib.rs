@@ -10,6 +10,7 @@ mod executor;
 pub mod local;
 mod metrics;
 pub mod noop;
+pub mod routed;
 pub mod source_package;
 
 pub use crate::executor::{
@@ -24,6 +25,8 @@ pub use crate::executor::{
     NodeActionOutcome,
     NodeActions,
     NodeExecutor,
+    NodeExecutorCutoverReservation,
+    NodeExecutorCutoverTarget,
     Package,
     SourcePackage,
     ARGS_TOO_LARGE_RESPONSE_MESSAGE,

@@ -5,6 +5,12 @@ use cmd_util::env::{
     config_service,
     config_tool,
 };
+#[cfg(not(target_os = "linux"))]
+use common::knobs::{
+    LOCAL_BACKEND_MALLOC_TRIM_ENABLED,
+    LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED,
+    LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED,
+};
 use common::{
     errors::MainError,
     http::ConvexHttpService,
@@ -20,16 +26,11 @@ use common::{
     types::MemberId,
     version::SERVER_VERSION_STR,
 };
-#[cfg(not(target_os = "linux"))]
-use common::knobs::{
-    LOCAL_BACKEND_MALLOC_TRIM_ENABLED,
-    LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED,
-    LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED,
-};
 use db_connection::{
     connect_persistence,
     ConnectPersistenceFlags,
 };
+use function_runner::in_process_function_runner::InProcessFunctionRunner;
 use futures::{
     future::{
         self,
@@ -37,7 +38,6 @@ use futures::{
     },
     FutureExt,
 };
-use function_runner::in_process_function_runner::InProcessFunctionRunner;
 use keybroker::{
     DeploymentSecret,
     KeyBroker,
@@ -56,7 +56,7 @@ use local_backend::{
     router::router,
     HttpActionRouteMapper,
 };
-use node_executor::local::LocalNodeExecutor;
+use node_executor::routed::RoutedLocalNodeExecutorConfig;
 use runtime::prod::ProdRuntime;
 use tokio::{
     signal::{
@@ -180,7 +180,6 @@ async fn run_server_inner(
     // controller, or /preempt endpoint.
     let (preempt_tx, preempt_rx) = oneshot::channel();
     let preempt_signal = ShutdownSignal::new(preempt_tx);
-
     #[cfg(target_os = "linux")]
     let (external_request_shedding, memory_reclamation) = {
         memory_metrics::validate_startup_budget()?;
@@ -210,7 +209,7 @@ async fn run_server_inner(
     };
 
     InProcessFunctionRunner::<ProdRuntime>::preflight_context_cache_configuration()?;
-    let node_executor_config = LocalNodeExecutor::preflight_configuration(
+    let node_executor_config = RoutedLocalNodeExecutorConfig::preflight_configuration(
         *NODE_ACTION_USER_TIMEOUT + Duration::from_secs(5),
         memory_reclamation.clone(),
     )?;

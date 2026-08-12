@@ -453,6 +453,24 @@ pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(||
     value
 });
 
+/// Total planning allowance for all local Node executor process slots. A
+/// deployment needs one default slot, one slot for each distinct dedicated
+/// pool, and one complete hot-replacement surge slot. The value must cover the
+/// default steady slot and the surge slot even when both are still lazy.
+pub static LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let value = env_config_usize_strict(
+        "LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES",
+        LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
+            .checked_mul(2)
+            .expect("Default local Node executor RSS budget overflow"),
+    );
+    assert!(
+        value > 0,
+        "LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES must be greater than zero"
+    );
+    value
+});
+
 /// Maximum age of a local Node executor generation before graceful retirement.
 /// A finite age bounds retained ESM identities even when RSS remains low.
 pub static LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE: LazyLock<Duration> = LazyLock::new(|| {

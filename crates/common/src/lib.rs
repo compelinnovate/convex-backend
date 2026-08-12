@@ -28,6 +28,7 @@ pub mod document_index_keys;
 pub mod erased_slot;
 pub mod errors;
 pub mod execution_context;
+pub mod execution_start;
 pub mod ext;
 pub mod fastrace_helpers;
 pub mod floating_point;

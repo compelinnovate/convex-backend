@@ -106,10 +106,13 @@ use model::{
     },
     config::types::{
         deprecated_extract_environment_from_path,
+        node_executor_pool_topology,
+        parse_module_environment_and_pool as parse_required_module_environment_and_pool,
         ConfigFile,
         ConfigMetadata,
         ModuleConfig,
         ModuleHashConfig,
+        NodeExecutorPoolName,
     },
     deployment_audit_log::{
         developer_index_config::DeveloperIndexConfig,
@@ -128,6 +131,7 @@ use model::{
     },
     source_packages::{
         types::{
+            NodeExecutorPoolTopology,
             NodeVersion,
             NodeVersionDiff,
             SourcePackage,
@@ -145,6 +149,7 @@ use sync_types::{
     CanonicalizedModulePath,
     ModulePath,
 };
+use tokio::sync::oneshot;
 use udf::{
     environment::system_env_var_overrides,
     EvaluateAppDefinitionsResult,
@@ -193,6 +198,91 @@ struct EvaluatedPushContents {
 }
 
 impl<RT: Runtime> Application<RT> {
+    async fn complete_node_executor_pool_cutover_after_commit(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: Timestamp,
+        mut reservation: Option<node_executor::NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        let runner = self.runner();
+        let topology = topology.clone();
+        if runner
+            .begin_node_executor_pool_cutover(&topology, version, &mut reservation)
+            .is_err()
+        {
+            runner.record_node_executor_pool_cutover_post_commit_failure();
+            tracing::error!(
+                commit_timestamp = %version,
+                lifecycle_context = "deployment_cutover",
+                outcome = "start_failed",
+                "Failed to claim committed Node executor cutover"
+            );
+            anyhow::bail!(ErrorMetadata::overloaded(
+                "NodeExecutorCutoverFailedAfterCommit",
+                format!(
+                    "Deployment committed at {version}, but Node executor cutover did not \
+                     complete."
+                ),
+            ));
+        }
+        let (result_sender, result_receiver) = oneshot::channel();
+        let cutover_runner = runner.clone();
+        self.runtime
+            .spawn("node_executor_cutover_after_commit", async move {
+                // Move the reservation into a detached runtime owner before
+                // the first post-commit await. Caller cancellation must not
+                // return capacity while this committed version is unresolved.
+                let result = async {
+                    let target = cutover_runner
+                        .node_executor_cutover_target(&topology, version)
+                        .await
+                        .map_err(|_| "target_failed")?;
+                    cutover_runner
+                        .complete_node_executor_pool_cutover(target, version, reservation)
+                        .await
+                        .map_err(|_| "runtime_failed")
+                }
+                .await;
+                if let Err(outcome) = result {
+                    if outcome != "runtime_failed" {
+                        cutover_runner.record_node_executor_pool_cutover_post_commit_failure();
+                    }
+                    tracing::error!(
+                        commit_timestamp = %version,
+                        lifecycle_context = "deployment_cutover",
+                        outcome,
+                        "Committed Node executor cutover failed"
+                    );
+                }
+                let _ = result_sender.send(result);
+            })
+            .detach();
+
+        let result = match result_receiver.await {
+            Ok(result) => result,
+            Err(_) => {
+                runner.record_node_executor_pool_cutover_post_commit_failure();
+                Err("task_failed")
+            },
+        };
+        if result.is_err() {
+            tracing::error!(
+                commit_timestamp = %version,
+                lifecycle_context = "deployment_cutover",
+                outcome = "post_commit_failed",
+                "Committed Node executor cutover did not complete"
+            );
+            anyhow::bail!(ErrorMetadata::overloaded(
+                "NodeExecutorCutoverFailedAfterCommit",
+                format!(
+                    "Deployment committed at {version}, but Node executor cutover did not \
+                     complete."
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     #[fastrace::trace]
     pub async fn start_push(&self, config: &ProjectConfig) -> anyhow::Result<StartPushResult> {
         let EvaluatedPushContents {
@@ -825,14 +915,48 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
         mut start_push: StartPushResponse,
         message: Option<PushMessage>,
+        force_node_cutover: bool,
     ) -> anyhow::Result<(FinishPushDiff, Timestamp)> {
         // Download all source packages. We can remove this once we don't store source
         // in the database.
         let mut downloaded_source_packages = BTreeMap::new();
-        for (definition_path, source_package) in &start_push.component_definition_packages {
+        for (definition_path, source_package) in &mut start_push.component_definition_packages {
             let package = download_package(self.modules_storage().clone(), source_package).await?;
+            if !definition_path.is_root() {
+                anyhow::ensure!(
+                    package.values().all(|module| {
+                        module.environment == ModuleEnvironment::Isolate
+                            && module.node_pool.is_none()
+                    }),
+                    ErrorMetadata::bad_request(
+                        "InvalidComponentModuleEnvironment",
+                        "Components do not support Node modules",
+                    )
+                );
+            }
+            // `StartPushResponse` crosses a client round trip before this point.
+            // Rebuild complete topology metadata from the archive so a client
+            // that omits a newly added optional field cannot weaken the commit.
+            source_package.node_executor_pool_topology =
+                node_executor_pool_topology(package.values())?;
             downloaded_source_packages.insert(definition_path.clone(), package);
         }
+        let committed_pool_topology = start_push
+            .component_definition_packages
+            .get(&ComponentDefinitionPath::root())
+            .context("No source package for the root component")?
+            .node_executor_pool_topology
+            .clone();
+        // The response crossed a client round trip after start-push
+        // validation. Validate the archive-normalized topology again so the
+        // durable commit cannot exceed this runtime's pool capability or
+        // configured process budget.
+        self.runner()
+            .validate_node_executor_pool_topology(&committed_pool_topology)?;
+        let cutover_reservation = self
+            .runner()
+            .reserve_node_executor_pool_cutover(&committed_pool_topology, force_node_cutover)
+            .await?;
 
         // TODO(ENG-7533): Strip out exports from the `StartPushResponse` since we don't
         // want to actually store it in the database. Remove this path once
@@ -974,6 +1098,13 @@ impl<RT: Runtime> Application<RT> {
                 }
             })?;
 
+        self.complete_node_executor_pool_cutover_after_commit(
+            &committed_pool_topology,
+            ts,
+            cutover_reservation,
+        )
+        .await?;
+
         Ok((diff, ts))
     }
 
@@ -988,6 +1119,7 @@ impl<RT: Runtime> Application<RT> {
         schema_id: Option<String>,
         node_dependencies: Option<Vec<NodeDependencyJson>>,
         node_version: Option<NodeVersion>,
+        force_node_cutover: bool,
     ) -> anyhow::Result<(PushAnalytics, PushMetrics)> {
         let begin_build_external_deps = Instant::now();
         // Upload external node dependencies separately
@@ -1008,6 +1140,7 @@ impl<RT: Runtime> Application<RT> {
         let source_package = self
             .upload_package(&modules, external_deps_id_and_pkg, node_version)
             .await?;
+        let committed_pool_topology = source_package.node_executor_pool_topology.clone();
         let end_upload_source_package = Instant::now();
         // Verify that we have not exceeded the max zipped or unzipped file size
         let combined_pkg_size = source_package.package_size + external_deps_pkg_size;
@@ -1038,12 +1171,17 @@ impl<RT: Runtime> Application<RT> {
             )
             .await?;
         let end_analyze = Instant::now();
+        let cutover_reservation = self
+            .runner()
+            .reserve_node_executor_pool_cutover(&committed_pool_topology, force_node_cutover)
+            .await?;
         let (
             ConfigMetadataAndSchema {
                 config_metadata,
                 schema,
             },
             occ_stats,
+            commit_ts,
         ) = self
             .apply_config_with_retries(
                 identity.clone(),
@@ -1059,6 +1197,13 @@ impl<RT: Runtime> Application<RT> {
                 },
             )
             .await?;
+
+        self.complete_node_executor_pool_cutover_after_commit(
+            &committed_pool_topology,
+            commit_ts,
+            cutover_reservation,
+        )
+        .await?;
 
         Ok((
             PushAnalytics {
@@ -1457,14 +1602,26 @@ impl TryFrom<AppDefinitionConfigJson> for AppDefinitionConfig {
     type Error = anyhow::Error;
 
     fn try_from(value: AppDefinitionConfigJson) -> Result<Self, Self::Error> {
+        let definition: Option<ModuleConfig> =
+            value.definition.map(TryInto::try_into).transpose()?;
+        let schema: Option<ModuleConfig> = value.schema.map(TryInto::try_into).transpose()?;
+        for module in definition.iter().chain(schema.iter()) {
+            anyhow::ensure!(
+                module.environment == ModuleEnvironment::Isolate && module.node_pool.is_none(),
+                ErrorMetadata::bad_request(
+                    "InvalidStaticModuleEnvironment",
+                    "Application definition and schema modules must use the isolate environment",
+                )
+            );
+        }
         Ok(Self {
-            definition: value.definition.map(TryInto::try_into).transpose()?,
+            definition,
             dependencies: value
                 .dependencies
                 .into_iter()
                 .map(|s| s.parse())
                 .collect::<anyhow::Result<_>>()?,
-            schema: value.schema.map(TryInto::try_into).transpose()?,
+            schema,
             changed_runtime_modules: value
                 .changed_modules
                 .into_iter()
@@ -1495,12 +1652,17 @@ impl TryFrom<ComponentDefinitionConfigJson> for ComponentDefinitionConfig {
     type Error = anyhow::Error;
 
     fn try_from(value: ComponentDefinitionConfigJson) -> Result<Self, Self::Error> {
+        let definition: ModuleConfig = value.definition.try_into()?;
+        let schema: Option<ModuleConfig> = value.schema.map(TryInto::try_into).transpose()?;
         let functions: Vec<ModuleConfig> = value
             .functions
             .into_iter()
             .map(TryInto::try_into)
             .collect::<anyhow::Result<_>>()?;
-        for module in &functions {
+        for module in std::iter::once(&definition)
+            .chain(schema.iter())
+            .chain(&functions)
+        {
             match module.environment {
                 ModuleEnvironment::Node => {
                     anyhow::bail!(ErrorMetadata::bad_request(
@@ -1517,13 +1679,13 @@ impl TryFrom<ComponentDefinitionConfigJson> for ComponentDefinitionConfig {
         }
         Ok(Self {
             definition_path: value.definition_path.parse()?,
-            definition: value.definition.try_into()?,
+            definition,
             dependencies: value
                 .dependencies
                 .into_iter()
                 .map(|s| s.parse())
                 .collect::<anyhow::Result<_>>()?,
-            schema: value.schema.map(TryInto::try_into).transpose()?,
+            schema,
             functions,
             udf_server_version: value.udf_server_version.parse()?,
         })
@@ -1538,6 +1700,7 @@ pub struct ModuleJson {
     pub source: String,
     pub source_map: Option<SourceMap>,
     pub environment: Option<String>,
+    pub node_pool: Option<String>,
 }
 
 /// API level structure for representing module hashes as Json (for unchanged
@@ -1547,6 +1710,7 @@ pub struct ModuleJson {
 pub struct ModuleHashJson {
     pub path: String,
     pub environment: Option<String>,
+    pub node_pool: Option<String>,
     pub sha256: String,
 }
 
@@ -1557,13 +1721,15 @@ impl From<ModuleConfig> for ModuleJson {
             source,
             source_map,
             environment,
+            node_pool,
         }: ModuleConfig,
     ) -> ModuleJson {
         ModuleJson {
             path: path.into(),
             source: source.to_string(),
             source_map,
-            environment: Some(environment.to_string()),
+            environment: Some(format_module_environment(environment, node_pool.as_ref())),
+            node_pool: node_pool.map(|pool| pool.to_string()),
         }
     }
 }
@@ -1577,13 +1743,17 @@ impl TryFrom<ModuleJson> for ModuleConfig {
             source,
             source_map,
             environment,
+            node_pool,
         }: ModuleJson,
     ) -> anyhow::Result<ModuleConfig> {
+        let (environment, node_pool) =
+            parse_module_environment_and_pool(&environment, node_pool, &path)?;
         Ok(ModuleConfig {
             path: parse_module_path(&path)?,
             source: ModuleSource::new(&source),
             source_map,
-            environment: parse_module_environment(&environment, &path)?,
+            environment,
+            node_pool,
         })
     }
 }
@@ -1595,6 +1765,7 @@ impl TryFrom<ModuleHashJson> for ModuleHashConfig {
         ModuleHashJson {
             path,
             environment,
+            node_pool,
             sha256,
         }: ModuleHashJson,
     ) -> anyhow::Result<ModuleHashConfig> {
@@ -1603,11 +1774,36 @@ impl TryFrom<ModuleHashJson> for ModuleHashConfig {
             .try_into()
             .ok()
             .context("sha256 not 32 bytes")?;
+        let (environment, node_pool) =
+            parse_module_environment_and_pool(&environment, node_pool, &path)?;
         Ok(ModuleHashConfig {
             path: parse_module_path(&path)?,
-            environment: parse_module_environment(&environment, &path)?,
+            environment,
+            node_pool,
             sha256: Sha256Digest::from(sha256_array),
         })
+    }
+}
+
+pub use model::config::types::format_module_environment;
+
+fn parse_module_environment_and_pool(
+    environment: &Option<String>,
+    node_pool: Option<String>,
+    path: &String,
+) -> anyhow::Result<(ModuleEnvironment, Option<NodeExecutorPoolName>)> {
+    match environment {
+        Some(value) => parse_required_module_environment_and_pool(value, node_pool),
+        None => {
+            anyhow::ensure!(
+                node_pool.is_none(),
+                "Node pool metadata requires an explicit module environment"
+            );
+            Ok((
+                deprecated_extract_environment_from_path(path.clone())?,
+                None,
+            ))
+        },
     }
 }
 
@@ -1615,11 +1811,7 @@ pub fn parse_module_environment(
     environment: &Option<String>,
     path: &String,
 ) -> anyhow::Result<ModuleEnvironment> {
-    Ok(match environment {
-        Some(s) => s.parse()?,
-        // Default to using the path for backwards compatibility
-        None => deprecated_extract_environment_from_path(path.clone())?,
-    })
+    Ok(parse_module_environment_and_pool(environment, None, path)?.0)
 }
 
 pub fn parse_module_path(path: &str) -> anyhow::Result<ModulePath> {
@@ -1696,6 +1888,76 @@ impl From<SchemaStatus> for SchemaStatusJson {
             SchemaStatus::RaceDetected => SchemaStatusJson::RaceDetected,
             SchemaStatus::Complete => SchemaStatusJson::Complete,
         }
+    }
+}
+
+#[cfg(test)]
+mod node_pool_tests {
+    use super::*;
+
+    fn module(environment: Option<&str>, node_pool: Option<&str>) -> ModuleJson {
+        ModuleJson {
+            path: "consumer.js".to_owned(),
+            source: "export const run = 1;".to_owned(),
+            source_map: None,
+            environment: environment.map(str::to_owned),
+            node_pool: node_pool.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn pooled_node_environment_is_required_and_round_trips() {
+        let config: ModuleConfig = module(Some("node:pool:consumer"), Some("consumer"))
+            .try_into()
+            .unwrap();
+        assert_eq!(config.environment, ModuleEnvironment::Node);
+        assert_eq!(config.node_pool.as_ref().unwrap().as_ref(), "consumer");
+
+        let json: ModuleJson = config.into();
+        assert_eq!(json.environment.as_deref(), Some("node:pool:consumer"));
+        assert_eq!(json.node_pool.as_deref(), Some("consumer"));
+    }
+
+    #[test]
+    fn rejects_optional_pool_without_required_environment_marker() {
+        assert!(ModuleConfig::try_from(module(Some("node"), Some("consumer"))).is_err());
+        assert!(
+            ModuleConfig::try_from(module(Some("node:pool:consumer"), Some("different"))).is_err()
+        );
+        assert!(
+            ModuleConfig::try_from(module(Some("node:pool:default"), Some("default"))).is_err()
+        );
+    }
+
+    fn app_definition(module: ModuleJson) -> AppDefinitionConfigJson {
+        AppDefinitionConfigJson {
+            definition: Some(module),
+            dependencies: vec![],
+            schema: None,
+            changed_modules: vec![],
+            unchanged_module_hashes: vec![],
+            udf_server_version: "1.0.0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn rejects_node_pool_on_application_definition() {
+        let definition = module(Some("node:pool:consumer"), Some("consumer"));
+        assert!(AppDefinitionConfig::try_from(app_definition(definition)).is_err());
+    }
+
+    #[test]
+    fn rejects_node_pool_on_component_definition() {
+        let definition = module(Some("node:pool:consumer"), Some("consumer"));
+        let component = ComponentDefinitionConfigJson {
+            definition_path: "component".to_owned(),
+            definition,
+            dependencies: vec![],
+            schema: None,
+            functions: vec![],
+            udf_server_version: "1.0.0".to_owned(),
+        };
+        assert!(ComponentDefinitionConfig::try_from(component).is_err());
     }
 }
 

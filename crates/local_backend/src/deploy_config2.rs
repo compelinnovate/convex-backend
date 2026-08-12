@@ -118,6 +118,7 @@ impl TryFrom<StartPushResponse> for SerializedStartPushResponse {
                 .collect::<anyhow::Result<_>>()?,
             app: value.app.try_into()?,
             schema_change: value.schema_change.try_into()?,
+            node_executor_cutover_protocol_version: Some(1),
         })
     }
 }
@@ -184,6 +185,8 @@ pub struct SerializedStartPushResponse {
 
     // Schema changes.
     schema_change: SerializedSchemaChange,
+
+    node_executor_cutover_protocol_version: Option<u32>,
 }
 
 impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
@@ -416,6 +419,8 @@ pub struct FinishPushRequest {
     start_push: SerializedStartPushResponse,
     pub dry_run: bool,
     pub message: Option<String>,
+    #[serde(default)]
+    pub force_node_cutover: bool,
 }
 
 /// Internal version that returns the commit timestamp for use by conductor
@@ -432,6 +437,15 @@ pub async fn finish_push_internal(
     .await?;
     identity.require_operation(keybroker::DeploymentOp::Deploy)?;
 
+    if req.force_node_cutover && !req.dry_run {
+        anyhow::ensure!(
+            req.start_push.node_executor_cutover_protocol_version == Some(1),
+            ErrorMetadata::bad_request(
+                "NodeExecutorCutoverProtocolUnsupported",
+                "This backend does not advertise forced Node executor cutover protocol version 1",
+            )
+        );
+    }
     let start_push = StartPushResponse::try_from(req.start_push)?;
     let message = req.message.map(PushMessage::try_from).transpose()?;
 
@@ -445,9 +459,21 @@ pub async fn finish_push_internal(
 
     let (resp, ts) = st
         .application
-        .finish_push(identity, request_metadata, start_push, message)
+        .finish_push(
+            identity,
+            request_metadata,
+            start_push,
+            message,
+            req.force_node_cutover,
+        )
         .await
-        .map_err(|e| e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}")))?;
+        .map_err(|e| {
+            if e.short_msg() == "NodeExecutorCutoverFailedAfterCommit" {
+                e
+            } else {
+                e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
+            }
+        })?;
     Ok((SerializedFinishPushDiff::try_from(resp)?, Some(ts)))
 }
 
