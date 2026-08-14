@@ -311,17 +311,7 @@ impl<RT: Runtime> Application<RT> {
             .load_indexes_into_memory(btreeset! { SCHEMAS_TABLE.clone() })
             .await?;
 
-        // TODO(ENG-7533): Clean up exports from the start push response when we've
-        // updated clients to use `functions` directly.
-        for (path, definition) in evaluated_components.iter_mut() {
-            // We don't need to include exports for the root since we don't use codegen
-            // for the app's `api` object.
-            if path.is_root() {
-                continue;
-            }
-            anyhow::ensure!(definition.definition.exports.is_empty());
-            definition.definition.exports = file_based_exports(&definition.functions)?;
-        }
+        add_file_based_exports_to_analysis(&mut evaluated_components)?;
 
         let resp = StartPushResponse {
             environment_variables: user_environment_variables,
@@ -420,7 +410,7 @@ impl<RT: Runtime> Application<RT> {
                 .collect(),
         )?;
         let ctx = if config.for_codegen {
-            TypecheckContext::new_for_codegen(&evaluated_components, &initializer_evaluator)
+            TypecheckContext::new_for_codegen(&evaluated_components, &initializer_evaluator)?
         } else {
             TypecheckContext::new(&evaluated_components, &initializer_evaluator)
         };
@@ -475,6 +465,9 @@ impl<RT: Runtime> Application<RT> {
         evaluated_components: &BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
     ) -> anyhow::Result<SchemaChange> {
         let mut tx = self.begin(Identity::system()).await?;
+        // Reuse the canonical preparation logic, but keep every schema, index,
+        // and component-namespace write inside this uncommitted transaction.
+        // Schema and backfill workers can only observe the committed metadata.
         let schema_change = ComponentConfigModel::new(&mut tx)
             .start_component_schema_changes(app, evaluated_components, false)
             .await?;
@@ -654,15 +647,24 @@ impl<RT: Runtime> Application<RT> {
     ) -> anyhow::Result<EvaluatePushResponse> {
         let EvaluatedPushContents {
             app,
-            evaluated_components,
+            mut evaluated_components,
             ..
         } = self.evaluate_push_contents(config).await?;
 
         let schema_change = self
             .handle_schema_change_read_only(&app, &evaluated_components)
             .await?;
+        let analysis = if config.include_analysis {
+            add_file_based_exports_to_analysis(&mut evaluated_components)?;
+            Some(evaluated_components)
+        } else {
+            None
+        };
 
-        Ok(EvaluatePushResponse { schema_change })
+        Ok(EvaluatePushResponse {
+            analysis,
+            schema_change,
+        })
     }
 
     /// Predict, without side effects, the schema validation and index
@@ -1305,12 +1307,10 @@ fn validate_env_var_declarations(
 
 /// Convex code push is a multiphase process.
 ///
-/// Clients that want to push code send this message to the backend. They use
-/// a resulting [StartPushResponse] to complete codegen and optionally
-/// complete the code push.
-///
-/// They also might decide to not do a complete push (e.g. just getting the
-/// analyze results to use for codegen).
+/// Deploying clients send this message to `start_push`, then use the resulting
+/// [StartPushResponse] for code generation and to complete the push. Clients
+/// that only need schema diffs or code generation analysis send the same
+/// message to `evaluate_push`, which does not start the multiphase push.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct StartPushRequest {
@@ -1328,10 +1328,17 @@ pub struct StartPushRequest {
     #[serde(default)]
     pub dry_run: bool,
 
-    /// Indicates that this request is only for codegen and isn't initiating a
-    /// full mutiphase push.
+    /// Indicates standalone component codegen, where the CLI uses a synthetic
+    /// root that cannot provide the component's required environment bindings.
+    /// Older clients send this request to `start_push`, so that path also
+    /// avoids committing index changes when this is set.
     #[serde(default)]
     pub for_codegen: bool,
+
+    /// Requests evaluated module and component analysis from `evaluate_push`.
+    /// `start_push` already returns this analysis regardless of this field.
+    #[serde(default)]
+    pub include_analysis: bool,
 }
 
 impl StartPushRequest {
@@ -1367,6 +1374,7 @@ impl StartPushRequest {
             node_version,
             dry_run: self.dry_run,
             for_codegen: self.for_codegen,
+            include_analysis: self.include_analysis,
         })
     }
 }
@@ -1397,6 +1405,7 @@ pub struct StartPushResult {
 
 #[derive(Debug)]
 pub struct EvaluatePushResponse {
+    pub analysis: Option<BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>>,
     pub schema_change: SchemaChange,
 }
 
@@ -1573,6 +1582,22 @@ async fn predict_component_schema<RT: Runtime>(
         tables,
         indexes,
     })
+}
+
+fn add_file_based_exports_to_analysis(
+    analysis: &mut BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
+) -> anyhow::Result<()> {
+    // TODO(ENG-7533): Stop adding exports to analysis after clients use
+    // `functions` directly for code generation.
+    for (path, definition) in analysis {
+        // The app's `api` object does not use these generated exports.
+        if path.is_root() {
+            continue;
+        }
+        anyhow::ensure!(definition.definition.exports.is_empty());
+        definition.definition.exports = file_based_exports(&definition.functions)?;
+    }
+    Ok(())
 }
 
 impl From<NodeDependencyJson> for NodeDependency {

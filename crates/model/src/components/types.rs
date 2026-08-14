@@ -53,12 +53,15 @@ pub struct ProjectConfig {
 
     pub dry_run: bool,
 
-    /// When true, relax typechecks that don't affect the codegen output. The
-    /// CLI sets this for standalone component codegen (`convex codegen
-    /// --component-dir ...`), where it wraps the target component in a
-    /// synthetic root app that can't provide bindings for the child's required
-    /// env vars.
+    /// When true, allow the component directly mounted by the synthetic root
+    /// app to leave its required environment variables unbound. The CLI sets
+    /// this only for standalone component codegen (`convex codegen
+    /// --component-dir ...`).
     pub for_codegen: bool,
+
+    /// Include evaluated module and component analysis in an `evaluate_push`
+    /// response. Deployment preflight only needs the schema diff.
+    pub include_analysis: bool,
 }
 
 #[derive(Debug)]
