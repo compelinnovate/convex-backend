@@ -82,7 +82,7 @@ pub trait InitializerEvaluator: Send + Sync {
 pub struct TypecheckContext<'a> {
     evaluated_definitions: &'a BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
     initializer_evaluator: &'a dyn InitializerEvaluator,
-    validate_env_vars: bool,
+    unbound_env_component_path: Option<ComponentPath>,
 }
 
 impl<'a> TypecheckContext<'a> {
@@ -93,21 +93,33 @@ impl<'a> TypecheckContext<'a> {
         Self {
             evaluated_definitions: definitions,
             initializer_evaluator,
-            validate_env_vars: true,
+            unbound_env_component_path: None,
         }
     }
 
     pub fn new_for_codegen(
         definitions: &'a BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
         initializer_evaluator: &'a dyn InitializerEvaluator,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let root = definitions
+            .get(&ComponentDefinitionPath::root())
+            .ok_or_else(|| {
+                ErrorMetadata::bad_request("TypecheckError", "Root component definition not found")
+            })?;
+        let [target] = root.definition.child_components.as_slice() else {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "TypecheckError",
+                "Standalone component codegen requires a synthetic root with exactly one child \
+                 component",
+            ));
+        };
+        Ok(Self {
             evaluated_definitions: definitions,
             initializer_evaluator,
-            // When doing isolate codegen for a component, a shell root component is used which
-            // doesn't have env vars defined.
-            validate_env_vars: false,
-        }
+            // Standalone component codegen mounts the target below a synthetic root
+            // that cannot supply its environment bindings.
+            unbound_env_component_path: Some(ComponentPath::root().push(target.name.clone())),
+        })
     }
 
     #[fastrace::trace]
@@ -150,13 +162,18 @@ impl<'a> TypecheckContext<'a> {
                 )
             })?;
 
+        // Only the component mounted directly under the synthetic root lacks
+        // bindings. Components instantiated by that target must remain strict.
+        let allow_unbound_env_vars =
+            self.unbound_env_component_path.as_ref() == Some(&component_path);
+
         let mut builder = CheckedComponentBuilder::check_args(
             &definition_path,
             &component_path,
             evaluated,
             args,
             env,
-            self.validate_env_vars,
+            allow_unbound_env_vars,
         )?;
 
         // Pre-compute the HTTP mount path for each child component by name.
@@ -239,6 +256,9 @@ impl<'a> TypecheckContext<'a> {
                             .env
                             .get(&parent_id)
                             .cloned()
+                            // Preserve a structurally valid binding through the
+                            // target when only its synthetic-root binding is unknown.
+                            .or_else(|| allow_unbound_env_vars.then(|| binding.clone()))
                             .map(|resolved| (child_key, resolved))
                     },
                 })
@@ -429,7 +449,7 @@ impl<'a> CheckedComponentBuilder<'a> {
         evaluated: &'a EvaluatedComponentDefinition,
         args: BTreeMap<Identifier, Resource>,
         env: BTreeMap<Identifier, EnvBinding>,
-        validate_env_vars: bool,
+        allow_unbound_env_vars: bool,
     ) -> anyhow::Result<Self> {
         match &evaluated.definition.definition_type {
             ComponentDefinitionType::App => {
@@ -457,7 +477,7 @@ impl<'a> CheckedComponentBuilder<'a> {
                 ));
             }
         }
-        if !component_path.is_root() && validate_env_vars {
+        if !component_path.is_root() && !allow_unbound_env_vars {
             for (env_name, validator) in env_validators {
                 if !validator.optional && !env.contains_key(env_name) {
                     anyhow::bail!(ErrorMetadata::bad_request(
@@ -730,7 +750,6 @@ impl CheckedHttpRoutes {
             .unwrap_or(true)
             && self.mounts.is_empty()
     }
-
 }
 
 mod json {
@@ -928,3 +947,189 @@ pub use self::json::{
     SerializedCheckedComponent,
     SerializedResourceTree,
 };
+
+#[cfg(test)]
+mod tests {
+    use common::{
+        bootstrap_model::components::definition::{
+            ComponentDefinitionMetadata,
+            ComponentDefinitionType,
+            ComponentInstantiation,
+            EnvVarValidator,
+        },
+        runtime::UnixTimestamp,
+        schemas::validator::Validator,
+    };
+    use semver::Version;
+
+    use super::*;
+    use crate::udf_config::types::UdfConfig;
+
+    struct UnusedInitializerEvaluator;
+
+    #[async_trait]
+    impl InitializerEvaluator for UnusedInitializerEvaluator {
+        async fn evaluate(
+            &self,
+            _path: ComponentDefinitionPath,
+            _args: BTreeMap<Identifier, Resource>,
+            _name: ComponentName,
+        ) -> anyhow::Result<BTreeMap<Identifier, Resource>> {
+            unreachable!("test component instantiations provide their arguments")
+        }
+    }
+
+    fn instantiation(
+        name: &str,
+        path: &str,
+        env: BTreeMap<Identifier, EnvBinding>,
+    ) -> ComponentInstantiation {
+        ComponentInstantiation {
+            name: name.parse().unwrap(),
+            path: path.parse().unwrap(),
+            args: Some(BTreeMap::new()),
+            env,
+        }
+    }
+
+    fn evaluated_component(
+        path: ComponentDefinitionPath,
+        definition_type: ComponentDefinitionType,
+        child_components: Vec<ComponentInstantiation>,
+        required_env_vars: &[&str],
+    ) -> EvaluatedComponentDefinition {
+        EvaluatedComponentDefinition {
+            definition: ComponentDefinitionMetadata {
+                path,
+                definition_type,
+                child_components,
+                http_mounts: BTreeMap::new(),
+                http_prefix: None,
+                exports: BTreeMap::new(),
+                env_vars: required_env_vars
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.parse().unwrap(),
+                            EnvVarValidator {
+                                validator: Validator::String,
+                                optional: false,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            schema: None,
+            functions: BTreeMap::new(),
+            udf_config: UdfConfig {
+                server_version: Version::new(1, 0, 0),
+                import_phase_rng_seed: [0; 32],
+                import_phase_unix_timestamp: UnixTimestamp::from_nanos(0),
+            },
+        }
+    }
+
+    fn codegen_definitions(
+        nested_env: Option<BTreeMap<Identifier, EnvBinding>>,
+    ) -> BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition> {
+        let root_path = ComponentDefinitionPath::root();
+        let target_path: ComponentDefinitionPath = "target".parse().unwrap();
+        let nested_path: ComponentDefinitionPath = "nested".parse().unwrap();
+
+        let root = evaluated_component(
+            root_path.clone(),
+            ComponentDefinitionType::App,
+            vec![instantiation("target", "target", BTreeMap::new())],
+            &[],
+        );
+        let include_nested = nested_env.is_some();
+        let target_children = nested_env
+            .map(|env| vec![instantiation("nested", "nested", env)])
+            .unwrap_or_default();
+        let target = evaluated_component(
+            target_path.clone(),
+            ComponentDefinitionType::ChildComponent {
+                name: "targetDefinition".parse().unwrap(),
+                args: BTreeMap::new(),
+            },
+            target_children,
+            &["TARGET_ENV"],
+        );
+
+        let mut definitions = BTreeMap::from([(root_path, root), (target_path, target)]);
+        if include_nested {
+            let nested = evaluated_component(
+                nested_path.clone(),
+                ComponentDefinitionType::ChildComponent {
+                    name: "nestedDefinition".parse().unwrap(),
+                    args: BTreeMap::new(),
+                },
+                vec![],
+                &["NESTED_ENV"],
+            );
+            definitions.insert(nested_path, nested);
+        }
+        definitions
+    }
+
+    #[tokio::test]
+    async fn codegen_allows_unbound_env_on_synthetic_root_child() {
+        let definitions = codegen_definitions(None);
+        let context =
+            TypecheckContext::new_for_codegen(&definitions, &UnusedInitializerEvaluator).unwrap();
+
+        context.instantiate_root().await.unwrap();
+    }
+
+    #[test]
+    fn codegen_rejects_non_synthetic_root_shape() {
+        let mut definitions = codegen_definitions(None);
+        let root = definitions
+            .get_mut(&ComponentDefinitionPath::root())
+            .unwrap();
+        root.definition.child_components.push(instantiation(
+            "anotherTarget",
+            "target",
+            BTreeMap::new(),
+        ));
+
+        let error = TypecheckContext::new_for_codegen(&definitions, &UnusedInitializerEvaluator)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("synthetic root with exactly one child"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_validation_rejects_unbound_env_on_root_child() {
+        let definitions = codegen_definitions(None);
+        let context = TypecheckContext::new(&definitions, &UnusedInitializerEvaluator);
+
+        let error = context.instantiate_root().await.unwrap_err().to_string();
+        assert!(error.contains("missing required env var"));
+        assert!(error.contains("TARGET_ENV"));
+    }
+
+    #[tokio::test]
+    async fn codegen_rejects_unbound_required_env_on_nested_component() {
+        let definitions = codegen_definitions(Some(BTreeMap::new()));
+        let context =
+            TypecheckContext::new_for_codegen(&definitions, &UnusedInitializerEvaluator).unwrap();
+
+        let error = context.instantiate_root().await.unwrap_err().to_string();
+        assert!(error.contains("missing required env var"));
+        assert!(error.contains("NESTED_ENV"));
+    }
+
+    #[tokio::test]
+    async fn codegen_preserves_symbolic_env_binding_through_unbound_target() {
+        let definitions = codegen_definitions(Some(BTreeMap::from([(
+            "NESTED_ENV".parse().unwrap(),
+            EnvBinding::EnvVar("TARGET_ENV".parse().unwrap()),
+        )])));
+        let context =
+            TypecheckContext::new_for_codegen(&definitions, &UnusedInitializerEvaluator).unwrap();
+
+        context.instantiate_root().await.unwrap();
+    }
+}

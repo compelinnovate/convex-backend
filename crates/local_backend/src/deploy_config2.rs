@@ -194,6 +194,15 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
 
     fn try_from(value: EvaluatePushResponse) -> Result<Self, Self::Error> {
         Ok(Self {
+            analysis: value
+                .analysis
+                .map(|analysis| {
+                    analysis
+                        .into_iter()
+                        .map(|(k, v)| Ok((String::from(k), v.try_into()?)))
+                        .collect::<anyhow::Result<_>>()
+                })
+                .transpose()?,
             schema_change: value.schema_change.try_into()?,
         })
     }
@@ -202,6 +211,8 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SerializedEvaluatePushResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    analysis: Option<BTreeMap<String, SerializedEvaluatedComponentDefinition>>,
     schema_change: SerializedSchemaChange,
 }
 
@@ -330,10 +341,10 @@ pub async fn start_push(
     )?))
 }
 
-// This endpoint is similar to `start_push`, but it doesn’t save the schema (so
-// it won’t start schema validation/index backfill). It can be used to determine
-// what will be the effects of a large push without starting work that can take
-// a long time on large instances.
+// This endpoint is similar to `start_push`, but it does not commit schema or
+// index preparation, so it cannot start schema validation or index backfills.
+// It always returns the schema diff and includes code generation analysis only
+// when requested.
 pub async fn evaluate_push(
     MtState(st): MtState<LocalAppState>,
     Json(req): Json<StartPushRequest>,
