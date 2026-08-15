@@ -36,6 +36,10 @@ use common::{
         DATABASE_UDF_SYSTEM_TIMEOUT,
         DATABASE_UDF_USER_TIMEOUT,
     },
+    query_analysis_admission::{
+        QueryAnalysisAdmission,
+        QueryAnalysisPermit,
+    },
     query_journal::QueryJournal,
     runtime::Runtime,
     types::{
@@ -103,11 +107,6 @@ use smallvec::{
 use sync_types::{
     types::SerializedArgs,
     QueryWorkloadClass,
-};
-use tokio::sync::{
-    OwnedSemaphorePermit,
-    Semaphore,
-    TryAcquireError,
 };
 use udf::{
     validation::{
@@ -205,36 +204,35 @@ struct DegradableQueryLeaderAdmission {
 }
 
 struct DegradableQueryLeaderAdmissionInner {
-    semaphore: Arc<Semaphore>,
+    admission: QueryAnalysisAdmission,
     permits_in_use: AtomicUsize,
 }
 
 struct DegradableQueryLeaderPermit {
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<QueryAnalysisPermit>,
     admission: Arc<DegradableQueryLeaderAdmissionInner>,
 }
 
 impl DegradableQueryLeaderAdmission {
+    #[cfg(test)]
     fn new(capacity: usize) -> Self {
-        initialize_degradable_leader_metrics(capacity);
+        Self::from_shared(QueryAnalysisAdmission::new(capacity))
+    }
+
+    fn from_shared(admission: QueryAnalysisAdmission) -> Self {
+        initialize_degradable_leader_metrics(admission.capacity());
         Self {
             inner: Arc::new(DegradableQueryLeaderAdmissionInner {
-                semaphore: Arc::new(Semaphore::new(capacity)),
+                admission,
                 permits_in_use: AtomicUsize::new(0),
             }),
         }
     }
 
     fn try_acquire(&self) -> anyhow::Result<DegradableQueryLeaderPermit> {
-        let permit = match self.inner.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                log_degradable_leader_admission(DegradableLeaderAdmissionOutcome::Deferred);
-                return Err(ErrorMetadata::degradable_query_capacity().into());
-            },
-            Err(TryAcquireError::Closed) => {
-                panic!("degradable query leader admission semaphore unexpectedly closed")
-            },
+        let Some(permit) = self.inner.admission.try_acquire_degradable() else {
+            log_degradable_leader_admission(DegradableLeaderAdmissionOutcome::Deferred);
+            return Err(ErrorMetadata::degradable_query_capacity().into());
         };
         self.inner.permits_in_use.fetch_add(1, Ordering::SeqCst);
         increment_degradable_leader_permits_in_use();
@@ -242,6 +240,11 @@ impl DegradableQueryLeaderAdmission {
             permit: Some(permit),
             admission: self.inner.clone(),
         })
+    }
+
+    #[cfg(test)]
+    fn has_available_permit(&self) -> bool {
+        self.inner.admission.try_acquire_degradable().is_some()
     }
 }
 
@@ -460,7 +463,7 @@ impl<RT: Runtime> CacheManager<RT> {
         udf_execution: FunctionExecutionLog<RT>,
         audit_log_client: AuditLogClient,
         cache: QueryCache,
-        degradable_query_leader_capacity: Option<usize>,
+        query_analysis_admission: Option<QueryAnalysisAdmission>,
     ) -> Self {
         // each `CacheManager` (for a different deployment) gets its own tenant
         // ID within `Cache`, which has a _global_ size-limit
@@ -473,8 +476,8 @@ impl<RT: Runtime> CacheManager<RT> {
             audit_log_client,
             tenant_id,
             cache,
-            degradable_query_leader_admission: degradable_query_leader_capacity
-                .map(DegradableQueryLeaderAdmission::new),
+            degradable_query_leader_admission: query_analysis_admission
+                .map(DegradableQueryLeaderAdmission::from_shared),
         }
     }
 
@@ -1620,7 +1623,7 @@ mod tests {
             ),
             Some(CachePlan::Operation(CacheOp::Ready { .. }, _))
         ));
-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+        assert!(admission.has_available_permit());
 
         let waiting_cache = QueryCache::new(usize::MAX);
         let normal_leader = plan(
@@ -1643,7 +1646,7 @@ mod tests {
             ),
             Some(CachePlan::Operation(CacheOp::Wait { .. }, _))
         ));
-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+        assert!(admission.has_available_permit());
         let CachePlan::Operation(
             CacheOp::Go {
                 waiting_entry_id: Some(waiting_entry_id),
@@ -1706,7 +1709,7 @@ mod tests {
             ),
             Some(CachePlan::Operation(CacheOp::Wait { .. }, _))
         ));
-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+        assert!(admission.has_available_permit());
 
         let CachePlan::Operation(
             CacheOp::Go {
@@ -1719,6 +1722,24 @@ mod tests {
             panic!("normal miss did not publish during recheck race")
         };
         cache.remove_waiting(&stored_key, waiting_entry_id);
+    }
+
+    #[tokio::test]
+    async fn analysis_reservations_reduce_degradable_admission() {
+        let shared_admission = QueryAnalysisAdmission::new(2);
+        let degradable_admission =
+            DegradableQueryLeaderAdmission::from_shared(shared_admission.clone());
+        let analysis = shared_admission.acquire_analysis().await;
+        let degradable = degradable_admission.try_acquire().unwrap();
+
+        let Err(error) = degradable_admission.try_acquire() else {
+            panic!("analysis did not borrow from degradable capacity")
+        };
+        assert!(error.is_degradable_query_capacity());
+
+        drop(analysis);
+        assert!(degradable_admission.try_acquire().is_ok());
+        drop(degradable);
     }
 
     #[test]
@@ -1761,9 +1782,9 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(ready_admission.inner.semaphore.available_permits(), 0);
+        assert!(!ready_admission.has_available_permit());
         drop(ready_duplicate);
-        assert_eq!(ready_admission.inner.semaphore.available_permits(), 1);
+        assert!(ready_admission.has_available_permit());
 
         let waiting_cache = QueryCache::new(usize::MAX);
         let normal_leader = plan_at_ts(
@@ -1815,9 +1836,9 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(waiting_admission.inner.semaphore.available_permits(), 0);
+        assert!(!waiting_admission.has_available_permit());
         drop(waiting_duplicate);
-        assert_eq!(waiting_admission.inner.semaphore.available_permits(), 1);
+        assert!(waiting_admission.has_available_permit());
 
         let CachePlan::Operation(
             CacheOp::Go {
@@ -1868,11 +1889,11 @@ mod tests {
         else {
             panic!("admitted degradable miss was not a cache leader")
         };
-        assert_eq!(admission.inner.semaphore.available_permits(), 0);
+        assert!(!admission.has_available_permit());
 
         let guard = WaitingEntryGuard::new(Some(*waiting_entry_id), &stored_key, cache.clone());
         drop(op);
-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+        assert!(admission.has_available_permit());
         drop(guard);
         assert!(cache.inner.lock().cache.is_empty());
     }
@@ -1917,7 +1938,7 @@ mod tests {
 
         drop(op);
         guard.complete(smallvec![stored_key.clone()], cache_result(&key));
-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
+        assert!(admission.has_available_permit());
         assert!(matches!(
             cache.inner.lock().cache.get(&stored_key),
             Some(CacheEntry::Ready(_))

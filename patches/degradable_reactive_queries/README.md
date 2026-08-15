@@ -7,9 +7,11 @@ suppression telemetry and follows the previous execution path. The matching `con
 negotiates lifecycle version 1, validates active and cleared pressure events, and exposes one
 epoch-scoped retry request. A downstream frontend can keep successful subscriptions mounted,
 present pressure as visible staleness, and use the explicit cleared event as its catch-up boundary. An
-HTTP-action extension and an isolate queue lane remain separate optional designs. Optional
-active-JavaScript service floors let the leader cap exceed active execution capacity while
-preserving protected and degradable progress.
+HTTP-action extension and an isolate queue lane remain separate optional designs. The later
+[`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) integration lets isolate
+module analysis fairly borrow from the same configured capacity without changing this client
+protocol. Optional active-JavaScript service floors let the leader cap exceed active execution
+capacity while preserving protected and degradable progress.
 
 This patch lets a cooperating sync client declare that its root reactive
 queries may become temporarily stale during overload. The backend places only
@@ -554,11 +556,15 @@ permit acquisition finishes. Requests that remain queued retain queue expiry
 and delay accounting. These mechanics are detailed in
 [`active_javascript_admission.md`](active_javascript_admission.md).
 
+With deployment-analysis pacing applied, each active isolate module attempt
+consumes one permit from the root-work gate. Analysis remains protected at the
+active-JavaScript gate; it does not claim degradable or dependency status.
+
 This model is intentionally finite. One admitted query can perform expensive
-work or separately scheduled fan-out. The cap bounds admitted roots, not every
-possible descendant. Existing transaction limits, action caps, dependency
-reserve, CPU execution permits, and hard queue age continue to enforce their
-own boundaries.
+work or separately scheduled fan-out. The cap bounds admitted roots plus
+isolate analysis attempts, not every possible descendant. Existing transaction
+limits, action caps, dependency reserve, CPU execution permits, and hard queue
+age continue to enforce their own boundaries.
 
 ## Configuration and capacity sizing
 
@@ -576,6 +582,12 @@ may retain that declaration for bounded telemetry, but root executions use the
 normal class, no separate queue lane, and no pressure response. When present,
 the value must contain only ASCII decimal digits and must be strictly positive.
 Malformed, empty, signed, zero, overflowed, or inconsistent values fail startup.
+
+In the final maintained stack this value is the size of the elastic gate shared
+with isolate module analysis. Degradable leaders retain immediate admission;
+analysis waits fairly. With no active analysis, the complete configured value
+remains available to degradable leaders, so the integration adds no permanently
+reserved capacity.
 
 For the standard in-process self-hosted runner, startup requires the cap to be
 strictly below:
@@ -756,11 +768,12 @@ creating a parallel ancestry mechanism. Operators not carrying an equivalent
 dependency patch still gain a finite degradable root cap, but cannot claim the
 dependency-liveness and descendant-override guarantees described here.
 
-[`isolate_queue_control/README.md`](../isolate_queue_control/README.md) remains independent. This
-slice does not add a degradable lane even when lane-aware queue control is
-enabled; the leader cap reserves capacity and the existing queue policy remains
-unchanged. A later lane extension must not change Connect parsing, leader
-admission, cache bypass, or client pressure semantics.
+[`isolate_queue_control/README.md`](../isolate_queue_control/README.md) remains independently
+adoptable. This slice does not add a degradable lane even when lane-aware queue control is enabled;
+the cap reserves capacity and the existing query policy remains unchanged. The ordered
+[`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) patch composes the two
+admission models without changing Connect parsing, leader admission, cache bypass, client pressure
+semantics, or isolate queue selection.
 
 [`cancellation_safe_database_context_reuse/README.md`](../cancellation_safe_database_context_reuse/README.md)
 and [`context_reuse_observability/README.md`](../context_reuse_observability/README.md) are
@@ -772,8 +785,10 @@ pressure semantics. Measure and roll back the features independently.
 
 This patch directly addresses the reactive recomputation wave that can follow a
 configuration push. Degradable clients absorb part of that wave as temporary
-staleness. The deployment analysis and configuration mutation themselves remain
-in their existing backend class.
+staleness. Deployment analysis retains its backend-derived scheduler class. In
+the later pacing integration, each isolate module attempt also waits fairly for
+one permit from the elastic gate before queue admission. Configuration
+evaluation and mutation do not use that gate.
 
 A dedicated control-plane lane is an optional extension implemented by the
 separate [`isolate_queue_control/README.md`](../isolate_queue_control/README.md) patch. It
@@ -781,6 +796,13 @@ uses backend-owned request variants, finite capacity, and tests across module
 analysis, evaluation, schema updates, and application traffic. Client metadata
 must never claim that class. The degradable-client patch does not depend on such
 a lane and should not encode deployment paths as application allowlists.
+
+The pacing integration makes analysis replace degradable demand at the
+root-work gate. Analysis uses protected active-JavaScript admission and shares
+the protected floor with other normal work; it has no dedicated worker or
+active permit reservation. See its owning essay for the source-level CPU
+evidence, liveness argument, worked capacity example, and controlled
+validation.
 
 Context reuse and bounded query-context prewarming are also complementary.
 They can lower module-evaluation CPU and improve warm service time. They do not
@@ -823,6 +845,8 @@ The query path should expose at least:
   `decision={effective,suppressed_disabled}`;
 - degradable leader admission by `outcome={admitted,deferred}`;
 - current degradable leader permits in use and the configured capacity;
+- when deployment-analysis pacing is applied, current analysis reservations,
+  configured shared capacity, and analysis capacity wait;
 - typed temporary deferrals returned to sync workers;
 - pressure transitions emitted by closed pressure kind and lifecycle state;
 - bounded pending-query-count observations;
@@ -981,16 +1005,21 @@ resubscription sequence per query.
 7. Exercise an ordinary function deployment while representative reactive and
    worker traffic is present. Verify bounded degradable work and continued
    mutation, action, worker, and deployment progress.
-8. Adjust one cap at a time from measured behavior. Do not simultaneously raise
+8. When carrying deployment-analysis pacing, verify that analysis reservations
+   displace degradable permits. In the standard one-application-runner process,
+   verify that their sum stays within the configured cap.
+9. Adjust one cap at a time from measured behavior. Do not simultaneously raise
    general queue delay or query concurrency.
-9. Adopt degradable HTTP-action admission separately, starting with proxy
+10. Adopt degradable HTTP-action admission separately, starting with proxy
    header enforcement and one lower-importance route class.
 
 The fastest client-side rollback is to omit `queryWorkloadClass`. Existing
 connections must reconnect under a newly constructed client for the change to
 take effect. The fastest backend rollback is to unset the degradable leader cap
-and restart. Either rollback leaves data, schemas, subscriptions, and existing
-normal admission unchanged.
+and restart. When deployment-analysis pacing is applied, unsetting the cap also
+restores unpaced analysis; restoring the prior backend image is the isolated
+pacing rollback. Either rollback leaves data, schemas, subscriptions, and
+existing normal admission unchanged.
 
 If a lifecycle-capable client retains an active epoch during a backend rollback,
 reconnection resets the connection-local epoch. The frontend also bounds its

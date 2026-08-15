@@ -22,6 +22,7 @@ use common::{
     errors::JsError,
     execution_context::ExecutionContext,
     log_lines::LogLine,
+    query_analysis_admission::QueryAnalysisAdmission,
     runtime::{
         Runtime,
         UnixTimestamp,
@@ -107,6 +108,7 @@ pub trait FunctionRunner<RT: Runtime>: Send + Sync + 'static {
         udf_config: UdfConfig,
         modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+        query_analysis_admission: Option<QueryAnalysisAdmission>,
     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>>;
 
     async fn evaluate_app_definitions(

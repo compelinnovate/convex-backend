@@ -233,6 +233,82 @@ use crate::{
 
 const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
 
+struct AnalysisCapacityReservation {
+    _permit: QueryAnalysisPermit,
+}
+
+impl AnalysisCapacityReservation {
+    fn new(permit: QueryAnalysisPermit) -> Self {
+        metrics::increment_analysis_capacity_reservations_in_use();
+        Self { _permit: permit }
+    }
+}
+
+impl Drop for AnalysisCapacityReservation {
+    fn drop(&mut self) {
+        // Keep the permit unavailable until after occupancy accounting is
+        // decremented so a replacement cannot make the gauge exceed capacity.
+        metrics::decrement_analysis_capacity_reservations_in_use();
+    }
+}
+
+struct AnalyzeResponse {
+    result: anyhow::Result<Result<AnalyzedModule, JsError>>,
+    _capacity_reservation: Option<AnalysisCapacityReservation>,
+}
+
+impl AnalyzeResponse {
+    fn into_result(self) -> anyhow::Result<Result<AnalyzedModule, JsError>> {
+        // Keep admission through response receipt, then release it before the
+        // caller can classify the result and enter retry backoff.
+        let Self {
+            result,
+            _capacity_reservation,
+        } = self;
+        drop(_capacity_reservation);
+        result
+    }
+}
+
+/// Owns analysis admission until the queued attempt produces its response.
+///
+/// The reservation moves into the response payload so caller cancellation
+/// cannot release shared capacity while a dispatched worker is still running.
+pub struct AnalyzeResponseSender {
+    sender: oneshot::Sender<AnalyzeResponse>,
+    capacity_reservation: Option<AnalysisCapacityReservation>,
+}
+
+impl AnalyzeResponseSender {
+    fn new(
+        sender: oneshot::Sender<AnalyzeResponse>,
+        capacity_reservation: Option<AnalysisCapacityReservation>,
+    ) -> Self {
+        Self {
+            sender,
+            capacity_reservation,
+        }
+    }
+
+    pub fn send(self, result: anyhow::Result<Result<AnalyzedModule, JsError>>) {
+        // A failed send drops this payload here, after the worker or scheduler
+        // has finished owning the request, rather than at caller cancellation.
+        let response = AnalyzeResponse {
+            result,
+            _capacity_reservation: self.capacity_reservation,
+        };
+        let _ = self.sender.send(response);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    async fn closed(&mut self) {
+        self.sender.closed().await;
+    }
+}
+
 pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
 pub const PAUSE_REQUEST: &str = "pause_request";
 pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
@@ -1124,7 +1200,8 @@ pub enum RequestType<RT: Runtime> {
         modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
         to_analyze: CanonicalizedModulePath,
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
-        response: oneshot::Sender<anyhow::Result<Result<AnalyzedModule, JsError>>>,
+        // This sender owns shared admission across queueing and execution.
+        response: AnalyzeResponseSender,
     },
     EvaluateSchema {
         schema_bundle: ModuleSource,
@@ -1263,7 +1340,7 @@ impl<RT: Runtime> Request<RT> {
                 let _ = response.send(Err(error));
             },
             RequestType::Analyze { response, .. } => {
-                let _ = response.send(Err(error));
+                response.send(Err(error));
             },
             RequestType::EvaluateSchema { response, .. } => {
                 let _ = response.send(Err(error));
@@ -1753,6 +1830,7 @@ impl<RT: Runtime> IsolateClient<RT> {
         modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
         instance_name: String,
+        query_analysis_admission: Option<QueryAnalysisAdmission>,
     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
         anyhow::ensure!(
             modules
@@ -1760,6 +1838,9 @@ impl<RT: Runtime> IsolateClient<RT> {
                 .all(|m| m.environment == ModuleEnvironment::Isolate),
             "Can only analyze Isolate modules"
         );
+        if query_analysis_admission.is_some() {
+            metrics::initialize_analysis_reservation_metrics();
+        }
         let to_analyze: Vec<_> = modules
             .keys()
             .filter(|path| !path.is_deps())
@@ -1785,20 +1866,36 @@ impl<RT: Runtime> IsolateClient<RT> {
                 let mut attempt = 1;
                 const MAX_ATTEMPTS: u32 = 3;
                 loop {
-                    let (tx, rx) = oneshot::channel();
-                    let request = RequestType::Analyze {
-                        modules: modules.clone(),
-                        to_analyze: to_analyze.clone(),
-                        response: tx,
-                        udf_config: udf_config.clone(),
-                        environment_variables: environment_variables.clone(),
+                    let response = {
+                        let capacity_reservation =
+                            if let Some(admission) = &query_analysis_admission {
+                                let timer = metrics::analysis_capacity_wait_timer();
+                                let permit = admission.acquire_analysis().await;
+                                drop(timer);
+                                Some(AnalysisCapacityReservation::new(permit))
+                            } else {
+                                None
+                            };
+                        let (tx, rx) = oneshot::channel();
+                        let request = RequestType::Analyze {
+                            modules: modules.clone(),
+                            to_analyze: to_analyze.clone(),
+                            // Transfer admission to the queued request. The response
+                            // returns it only after this attempt has stopped running.
+                            response: AnalyzeResponseSender::new(tx, capacity_reservation),
+                            udf_config: udf_config.clone(),
+                            environment_variables: environment_variables.clone(),
+                        };
+                        self.send_request(Request::new(
+                            instance_name.clone(),
+                            request,
+                            EncodedSpan::from_parent(),
+                        ))?;
+                        IsolateClient::<RT>::receive_response(rx)
+                            .await?
+                            .into_result()
                     };
-                    self.send_request(Request::new(
-                        instance_name.clone(),
-                        request,
-                        EncodedSpan::from_parent(),
-                    ))?;
-                    match IsolateClient::<RT>::receive_response(rx).await? {
+                    match response {
                         Ok(outcome) => return Ok((to_analyze, outcome)),
                         Err(e)
                             if attempt < MAX_ATTEMPTS
@@ -3141,9 +3238,11 @@ mod tests {
             ComponentId,
             ComponentName,
         },
+        errors::JsError,
         fastrace_helpers::EncodedSpan,
         knobs::CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
         pause::PauseClient,
+        query_analysis_admission::QueryAnalysisAdmission,
         runtime::{
             shutdown_and_join,
             Runtime,
@@ -3158,6 +3257,14 @@ mod tests {
     };
     use errors::ErrorMetadataAnyhowExt as _;
     use futures::future::FusedFuture;
+    use model::{
+        config::types::ModuleConfig,
+        modules::module_versions::{
+            AnalyzedModule,
+            ModuleSource,
+        },
+        udf_config::types::UdfConfig,
+    };
     use parking_lot::Mutex;
     use runtime::prod::ProdRuntime;
     use semver::Version;
@@ -3178,12 +3285,14 @@ mod tests {
         wait_for_external_permit,
         worker_rejection_reason,
         ActiveRequestCounts,
-		CancelExecutionOnDrop,
+        AnalyzeResponseSender,
+        CancelExecutionOnDrop,
         CancellationSignal,
         ConcurrencyPermitPhase,
         ExternalPermitWaitOutcome,
         IdleWorkerInfo,
         IdleWorkerState,
+        IsolateClient,
         IsolateConfig,
         IsolateWorker,
         IsolateWorkerHandle,
@@ -3219,6 +3328,8 @@ mod tests {
     };
 
     const SCHEDULER_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    type AnalyzeTestResult = anyhow::Result<Result<AnalyzedModule, JsError>>;
 
     #[derive(Clone)]
     struct SchedulerTestRuntime {
@@ -3282,9 +3393,17 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct AnalyzeTestControl {
+        started: mpsc::UnboundedSender<CanonicalizedModulePath>,
+        completions:
+            Arc<Mutex<BTreeMap<CanonicalizedModulePath, oneshot::Receiver<AnalyzeTestResult>>>>,
+    }
+
+    #[derive(Clone)]
     struct TestIsolateWorker {
         rt: SchedulerTestRuntime,
         config: IsolateConfig,
+        analyze_test_control: Option<AnalyzeTestControl>,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -3302,7 +3421,7 @@ mod tests {
                 active_request_guard,
             }) = requests.recv().await
             {
-                let (id, started, completion, response, fail_worker) = match request.inner {
+                match request.inner {
                     RequestType::Test {
                         id,
                         can_block_on_descendant: _,
@@ -3313,15 +3432,39 @@ mod tests {
                         started,
                         completion,
                         response,
-                    } => (id, started, completion, response, fail_worker),
+                    } => {
+                        let _ = started.send(id);
+                        if fail_worker {
+                            return;
+                        }
+                        let _ = completion.await;
+                        let _ = response.send(Ok(()));
+                    },
+                    RequestType::Analyze {
+                        to_analyze,
+                        response,
+                        ..
+                    } => {
+                        let control = self
+                            .analyze_test_control
+                            .as_ref()
+                            .expect("fake worker received an unconfigured analysis request");
+                        control
+                            .started
+                            .send(to_analyze.clone())
+                            .expect("analysis test stopped before worker dispatch");
+                        let completion = control
+                            .completions
+                            .lock()
+                            .remove(&to_analyze)
+                            .expect("analysis test did not configure this module");
+                        let result = completion
+                            .await
+                            .expect("analysis test dropped terminal result");
+                        response.send(result);
+                    },
                     _ => panic!("fake worker received a production request"),
-                };
-                let _ = started.send(id);
-                if fail_worker {
-                    return;
                 }
-                let _ = completion.await;
-                let _ = response.send(Ok(()));
                 drop(permit);
                 drop(active_request_guard);
                 if done
@@ -3351,6 +3494,55 @@ mod tests {
 
         fn rt(&self) -> &SchedulerTestRuntime {
             &self.rt
+        }
+    }
+
+    fn analysis_test_client(
+        rt: SchedulerTestRuntime,
+        max_workers: usize,
+        completions: BTreeMap<CanonicalizedModulePath, oneshot::Receiver<AnalyzeTestResult>>,
+    ) -> (
+        IsolateClient<SchedulerTestRuntime>,
+        mpsc::UnboundedReceiver<CanonicalizedModulePath>,
+    ) {
+        let (started_sender, started) = mpsc::unbounded_channel();
+        let worker = TestIsolateWorker {
+            rt: rt.clone(),
+            config: IsolateConfig::new(
+                "analysis_reservation_test",
+                ConcurrencyLimiter::unlimited(),
+            ),
+            analyze_test_control: Some(AnalyzeTestControl {
+                started: started_sender,
+                completions: Arc::new(Mutex::new(completions)),
+            }),
+        };
+        let client = IsolateClient::new(rt, 100, max_workers, worker)
+            .expect("failed to construct analysis test client");
+        (client, started)
+    }
+
+    fn analysis_module(path: &str) -> (CanonicalizedModulePath, ModuleConfig) {
+        let path = path
+            .parse::<ModulePath>()
+            .expect("invalid test module path");
+        (
+            path.clone().canonicalize(),
+            ModuleConfig {
+                path,
+                source: ModuleSource::new(""),
+                source_map: None,
+                environment: ModuleEnvironment::Isolate,
+                node_pool: None,
+            },
+        )
+    }
+
+    fn analysis_udf_config() -> UdfConfig {
+        UdfConfig {
+            server_version: Version::new(1, 0, 0),
+            import_phase_rng_seed: [0; 32],
+            import_phase_unix_timestamp: UnixTimestamp::from_nanos(0),
         }
     }
 
@@ -3491,7 +3683,7 @@ mod tests {
                 modules: Arc::new(BTreeMap::new()),
                 to_analyze: module_path,
                 environment_variables: BTreeMap::new(),
-                response: analyze_response,
+                response: AnalyzeResponseSender::new(analyze_response, None),
             },
             RequestType::EvaluateSchema {
                 schema_bundle: model::modules::module_versions::ModuleSource::new(""),
@@ -3821,6 +4013,166 @@ mod tests {
     }
 
     #[test]
+    fn analysis_reservation_outlives_post_dispatch_caller_drop() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("analysis_reservation_caller_drop_test", async move {
+            let (path, module) = analysis_module("cancel.js");
+            let (completion, completion_receiver) = oneshot::channel();
+            let (client, mut started) = analysis_test_client(
+                scheduler_rt,
+                4,
+                BTreeMap::from([(path.clone(), completion_receiver)]),
+            );
+            let admission = QueryAnalysisAdmission::new(1);
+            let analyze_client = client.clone();
+            let analyze_admission = admission.clone();
+            let analyze_task = tokio::spawn(async move {
+                analyze_client
+                    .analyze(
+                        analysis_udf_config(),
+                        BTreeMap::from([(path.clone(), module)]),
+                        BTreeMap::new(),
+                        "deployment".to_string(),
+                        Some(analyze_admission),
+                    )
+                    .await
+            });
+
+            tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, started.recv())
+                .await
+                .expect("analysis request did not reach the worker")
+                .expect("analysis worker start channel closed");
+            analyze_task.abort();
+            assert!(analyze_task
+                .await
+                .expect_err("canceled analysis task unexpectedly completed")
+                .is_cancelled());
+            assert!(
+                admission.try_acquire_degradable().is_none(),
+                "caller cancellation released capacity while analysis was still running"
+            );
+
+            completion
+                .send(Ok(Ok(AnalyzedModule::default())))
+                .expect("analysis worker stopped before completion");
+            let restored = tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, async {
+                loop {
+                    if let Some(permit) = admission.try_acquire_degradable() {
+                        break permit;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("analysis completion did not restore shared capacity");
+            drop(restored);
+            client
+                .shutdown()
+                .await
+                .expect("analysis client shutdown failed");
+        });
+    }
+
+    #[test]
+    fn sibling_analysis_reservation_survives_developer_error_cancellation() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on(
+            "analysis_reservation_sibling_cancellation_test",
+            async move {
+                let (error_path, error_module) = analysis_module("error.js");
+                let (slow_path, slow_module) = analysis_module("slow.js");
+                let (error_completion, error_receiver) = oneshot::channel();
+                let (slow_completion, slow_receiver) = oneshot::channel();
+                let (client, mut started) = analysis_test_client(
+                    scheduler_rt,
+                    4,
+                    BTreeMap::from([
+                        (error_path.clone(), error_receiver),
+                        (slow_path.clone(), slow_receiver),
+                    ]),
+                );
+                let admission = QueryAnalysisAdmission::new(2);
+                let analyze_client = client.clone();
+                let analyze_admission = admission.clone();
+                let task_error_path = error_path.clone();
+                let task_slow_path = slow_path.clone();
+                let analyze_task = tokio::spawn(async move {
+                    analyze_client
+                        .analyze(
+                            analysis_udf_config(),
+                            BTreeMap::from([
+                                (task_error_path, error_module),
+                                (task_slow_path, slow_module),
+                            ]),
+                            BTreeMap::new(),
+                            "deployment".to_string(),
+                            Some(analyze_admission),
+                        )
+                        .await
+                });
+
+                let mut started_paths = Vec::new();
+                for _ in 0..2 {
+                    started_paths.push(
+                        tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, started.recv())
+                            .await
+                            .expect("analysis request did not reach the worker")
+                            .expect("analysis worker start channel closed"),
+                    );
+                }
+                assert!(started_paths.contains(&error_path));
+                assert!(started_paths.contains(&slow_path));
+
+                error_completion
+                    .send(Ok(Err(JsError::from_message(
+                        "expected analysis failure".to_string(),
+                    ))))
+                    .expect("error analysis worker stopped before completion");
+                let result = analyze_task
+                    .await
+                    .expect("analysis task failed")
+                    .expect("analysis returned a system error");
+                assert!(
+                    result.is_err(),
+                    "analysis unexpectedly ignored developer error"
+                );
+
+                let replacement = admission
+                    .try_acquire_degradable()
+                    .expect("completed error attempt did not restore its capacity");
+                assert!(
+                    admission.try_acquire_degradable().is_none(),
+                    "sibling cancellation released capacity while its worker was still running"
+                );
+
+                slow_completion
+                    .send(Ok(Ok(AnalyzedModule::default())))
+                    .expect("slow analysis worker stopped before completion");
+                let restored = tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, async {
+                    loop {
+                        if let Some(permit) = admission.try_acquire_degradable() {
+                            break permit;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("canceled sibling completion did not restore shared capacity");
+                drop(restored);
+                drop(replacement);
+                client
+                    .shutdown()
+                    .await
+                    .expect("analysis client shutdown failed");
+            },
+        );
+    }
+
+    #[test]
     fn dependency_and_descendant_capability_are_independent() {
         assert_eq!(properties(false, false, false).as_label(), "independent");
         assert_eq!(
@@ -4123,6 +4475,7 @@ mod tests {
             TestIsolateWorker {
                 rt: scheduler_rt.clone(),
                 config: IsolateConfig::new("scheduler_test", ConcurrencyLimiter::unlimited()),
+                analyze_test_control: None,
             },
             1,
             1,

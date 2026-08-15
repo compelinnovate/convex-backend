@@ -234,6 +234,40 @@ retaining an isolate worker may raise occupancy above that base. Nested Node
 actions receive the same treatment at the Node action limit because their
 parent retains a permit from that limit.
 
+`APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is an optional elastic
+capacity sized below the application query and isolate shared-base limits.
+Degradable root query cache-miss leaders use immediate admission: when no permit
+is available, the sync protocol keeps their previous values and returns typed
+temporary pressure. Isolate module analysis fairly waits for one permit per
+module attempt before entering the isolate queue. Analysis therefore borrows
+from the same capacity instead of adding its configured fan-out on top of every
+admitted degradable leader:
+
+```text
+degradable query leaders + isolate analysis attempts <= configured cap
+```
+
+For example, with a cap of 24 and `ANALYZE_CONCURRENCY=4`, four active module
+analyses leave at most 20 permits for degradable leaders. With no analysis, all
+24 remain available to degradable leaders. Normal queries, mutations, actions,
+query dependencies, and Node module analysis do not use this gate. The bound is
+on root query leaders and analysis attempts, not on every dependency a query
+tree can spawn.
+
+`ANALYZE_CONCURRENCY` is a per-call limit. `N` concurrent analysis calls can
+collectively reach `min(24, N * 4)` in this example. Continuous queued analysis
+can use the complete elastic gate and keep new degradable leaders in typed
+deferral. The separate active-JavaScript class minimums described below provide
+execution liveness after degradable leaders are admitted; they do not change
+this root-work gate.
+
+The analysis wait is fair with existing permit holders and queued analysis
+attempts. It does not reserve an isolate worker, borrow dependency overflow, or
+guarantee progress while all underlying execution resources remain occupied.
+Unset the knob to preserve the original unpaced analysis behavior. See
+[`patches/deployment_analysis_pacing/README.md`](../../patches/deployment_analysis_pacing/README.md)
+for sizing, telemetry, and rollout guidance.
+
 ## Isolate worker and queue knobs
 
 `MAX_ISOLATE_WORKERS` is the total number of isolate workers assigned requests

@@ -96,7 +96,7 @@ register_convex_gauge!(
 );
 register_convex_gauge!(
     DEGRADABLE_QUERY_LEADER_CAPACITY_INFO,
-    "Configured degradable query cache-miss leader capacity"
+    "Configured capacity shared by degradable query leaders and isolate module analysis"
 );
 register_convex_counter!(
     DEGRADABLE_QUERY_CACHE_RECHECK_TOTAL,

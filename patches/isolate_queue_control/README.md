@@ -373,6 +373,12 @@ Each post-admission analysis or evaluation retry is a new queue entry with a new
 patch does not combine existing bounded attempts into one larger budget or change
 `ANALYZE_CONCURRENCY`.
 
+The ordered [`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) integration
+adds a pre-queue gate only for isolate module analysis. Each module attempt fairly borrows one
+permit from the configured degradable-query capacity and releases it before retry backoff. This
+reduces analysis arrivals under elastic query load but does not alter this lane's classification,
+capacity, deadline, FIFO selection, or evaluation-request behavior.
+
 Analysis and evaluation requests carry one-shot response senders but no UDF cancellation signal.
 After selection and before worker allocation, the scheduler checks whether a control-plane caller
 has disappeared. It also watches response closure while acquiring the initial active-JavaScript
@@ -380,7 +386,10 @@ permit, canceling that permit wait when the caller disappears. A closed caller i
 reason `caller_dropped` without incrementing active-worker accounting. Cancellation is lazy while
 queued: a canceled entry can remain counted until selection or hard expiry, but the lane cap and
 deadline bound retained state. If the caller drops after the final pre-dispatch check, evaluation
-can still begin and response delivery fails normally.
+or analysis can still begin and response delivery fails normally. When deployment-analysis pacing
+is active, the queued analysis response sender owns its shared-capacity reservation. A discarded
+request releases it; a dispatched request retains it until the analysis attempt produces its
+terminal result even when its caller has disappeared.
 
 The longer deadline does not guarantee deployment success. A request can still approach hard
 expiry when shared-base workers, active-JavaScript permits, or CPU remain saturated, or fail at an
@@ -389,8 +398,9 @@ analysis duration, active permits, host CPU, deployment endpoint status, and ret
 
 ### Deferred shared-base reservation
 
-The initial patch does not reserve a worker. Consider carving one worker from shared base only if
-repeated measurements show all of the following:
+The initial patch does not reserve a worker. First apply the work-conserving analysis pacing
+integration when its degradable-query prerequisite is available. Consider carving one worker from
+shared base only if repeated measurements then show all of the following:
 
 - an admitted control-plane request approaches its hard deadline;
 - non-dependency runtime work continuously occupies shared base;
@@ -415,7 +425,9 @@ borrowing, preemption, or dynamic-priority protocol without separate evidence an
    metrics.
 5. Run an ordinary push under representative traffic. Verify FIFO dispatch, no adaptive shedding,
    no dependency-reserve use, finite expiry, and unchanged ordinary deadlines.
-6. Observe repeated normal and busy pushes before considering a worker reservation or larger cap.
+6. When carrying deployment-analysis pacing, verify that analysis reservations displace
+   degradable permits and pace queue arrivals.
+7. Observe repeated normal and busy pushes before considering a worker reservation or larger cap.
 
 Rollback sets `ISOLATE_CONTROL_PLANE_LANE_ENABLED=false` and restarts the backend. The lane-aware
 ordinary/dependency/action policy remains active, and no schema or data migration is required.
@@ -465,6 +477,12 @@ The HTTP admission patch protects callback re-entry at the outer service gate.
 Its reserve and waiter queue are independent of isolate queue capacity. A
 request can pass HTTP admission and still wait at an application gate or in the
 isolate queue. Size each stage from its own occupancy and wait metrics.
+
+The degradable reactive-query patch supplies a finite application-scoped root
+query gate. The separate deployment-analysis pacing integration lets isolate
+module analysis fairly borrow that elastic capacity before this queue. It is
+work-conserving and does not add a queue lane, scheduler eligibility rule, or
+worker reservation.
 
 The unified context-reuse patch reduces repeated V8 context initialization for
 eligible modules and can therefore change isolate service time, queue sojourn,
