@@ -123,6 +123,33 @@ pub fn log_pool_max(name: &'static str, count: usize) {
     );
 }
 
+register_convex_gauge!(
+    ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO,
+    "Shared-capacity permits currently held by isolate module analysis"
+);
+register_convex_histogram!(
+    ISOLATE_ANALYSIS_CAPACITY_WAIT_SECONDS,
+    "Time isolate module analysis waits to borrow shared degradable-query capacity"
+);
+
+pub fn initialize_analysis_reservation_metrics() {
+    // Register without resetting reservations held by another concurrent
+    // analysis call.
+    let _ = ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO.get();
+}
+
+pub fn analysis_capacity_wait_timer() -> Timer<VMHistogram> {
+    Timer::new(&ISOLATE_ANALYSIS_CAPACITY_WAIT_SECONDS)
+}
+
+pub fn increment_analysis_capacity_reservations_in_use() {
+    ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO.inc();
+}
+
+pub fn decrement_analysis_capacity_reservations_in_use() {
+    ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO.dec();
+}
+
 fn scheduler_class_labels(
     name: &'static str,
     scheduler_class: &'static str,

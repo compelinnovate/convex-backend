@@ -56,6 +56,7 @@ pub mod persistence_helpers;
 pub mod pii;
 pub mod pool_stats;
 pub mod query;
+pub mod query_analysis_admission;
 pub mod query_journal;
 pub mod read_write_balance;
 pub mod retriable_stream;

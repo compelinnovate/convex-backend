@@ -1505,10 +1505,11 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
     )
 });
 
-/// Maximum concurrent degradable root reactive-query cache-miss leaders.
-/// Absence disables degradable admission. A configured cap leaves at least one
-/// shared-base application and isolate-worker slot. A finite active-JavaScript
-/// gate either exceeds the cap or configures class minimums.
+/// Maximum elastic capacity shared by degradable root reactive-query
+/// cache-miss leaders and isolate module analysis. Absence disables degradable
+/// admission and preserves unpaced analysis. A configured cap leaves at least
+/// one shared-base application and isolate-worker slot. A finite active-
+/// JavaScript gate either exceeds the cap or configures class minimums.
 pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
     LazyLock::new(|| {
         let capacity =

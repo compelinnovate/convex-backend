@@ -214,7 +214,10 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     environment_variables,
                 )
                 .await;
-                let _ = response.send(r);
+                // This transfers the shared reservation into the response. If
+                // the caller disappeared, failed delivery drops it here only
+                // after V8 analysis has finished.
+                response.send(r);
                 "Analyze".to_string()
             },
             RequestType::HttpAction {

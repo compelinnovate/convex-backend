@@ -23,8 +23,8 @@ The built-in patch value for the initial hard deadline is 30 seconds. The single
 continues to select the oldest eligible request, preserving FIFO among
 eligible control-plane and runtime work. A later one-worker reservation from
 shared base is deliberately excluded from the initial patch and should be
-considered only if measurements still show deployment starvation after
-ordinary query containment is active.
+considered only if measurements still show deployment starvation after the
+work-conserving analysis pacing integration is active.
 
 The classification is derived from Rust request variants. It contains no
 application module, function, component, route, deployment, client, or tenant
@@ -38,12 +38,14 @@ lane-aware isolate queue policy. It improves the chance that admitted analysis
 and evaluation work survives a short runtime burst without weakening the
 dependency liveness reserve.
 
-The patch does not guarantee that a deployment succeeds under sustained CPU
+The lane patch does not guarantee that a deployment succeeds under sustained CPU
 saturation, a full shared-base queue, a caller timeout shorter than the lane
 deadline, or a deployment failure outside the isolate scheduler. It does not
 reserve execution capacity in its initial form. Operators still need enough
 shared-base worker and active-JavaScript capacity for the request to dispatch
-and execute.
+and execute. The later
+[`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) integration reduces
+additive analysis demand before this queue without reserving a worker.
 
 ## Motivation
 
@@ -370,10 +372,13 @@ ingress until the deadline.
 Adding one event listener per response sender or redesigning queue wakeups is
 not justified for the initial patch.
 
-If the caller disappears after worker dispatch, current evaluation continues
-and its response send fails harmlessly. Active V8 cancellation would require
-separate environment and isolate-cleanliness analysis and is outside this
-patch.
+If the caller disappears after worker dispatch, current analysis or evaluation
+continues and its response send fails harmlessly. When deployment-analysis
+pacing is active, the analysis response sender owns the shared-capacity
+reservation: a discarded request releases it, while a dispatched request
+retains it until the analysis attempt produces its terminal result despite
+caller cancellation. Active V8 cancellation would require separate environment
+and isolate-cleanliness analysis and is outside this patch.
 
 ## Configuration
 
@@ -504,9 +509,12 @@ reserve sizing, action caps, per-client limits, or worker selection.
 [`degradable_reactive_queries/README.md`](../degradable_reactive_queries/README.md) is
 complementary demand containment. Its degradable query leader cap can keep a
 bounded frontend recomputation wave from consuming all shared-base workers.
-That capacity makes FIFO control-plane progress more likely without reserving a
-worker. Neither patch requires application module names, and either feature can
-be disabled independently.
+The ordered [`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) integration
+makes each isolate module analysis attempt fairly borrow from that same application-scoped gate.
+The resulting root-work invariant is
+`degradable leaders + analysis attempts <= configured cap`; no worker is kept idle. The query and
+lane patches remain independently adoptable, while the integration explicitly depends on the
+query gate. None requires application module names.
 
 Context reuse and query-context prewarming can reduce competing runtime service
 cost and leave more shared capacity available. Context reuse supports the
@@ -524,9 +532,18 @@ boundaries.
 
 ## Deferred shared-base worker reservation
 
-Do not reserve a worker in the initial patch. First combine the lane with
-ordinary query containment and measure deployments under representative busy
-traffic.
+Do not reserve a worker in the initial patch. First combine the lane with the
+work-conserving analysis pacing integration and measure deployments under
+representative busy traffic. Pacing transfers elastic capacity from degradable
+roots to analysis but deliberately does not reserve a physical worker.
+
+The fair gate also removes the need for a special rule that forces effective
+analysis concurrency to stay at one. Once an analysis future is queued, a
+released elastic permit is assigned to it before a new degradable query can
+take that permit through immediate admission. Analysis can still wait forever
+if an existing permit holder never completes, or wait again in the isolate
+scheduler after gate admission; neither case is repaired by a minimum-one
+counter outside the scheduler.
 
 Consider one statically reserved shared-base worker only when all of the
 following recur:
@@ -602,7 +619,10 @@ other's wakeup.
    reserve use, finite hard expiry, and unchanged ordinary hard deadline.
 8. Observe multiple normal deployment cycles before considering any capacity
    adjustment.
-9. Do not add the deferred worker reservation unless the evidence conditions in
+9. Apply deployment-analysis pacing when degradable admission is available and
+   verify that analysis reservations replace, rather than add to, degradable
+   occupancy.
+10. Do not add the deferred worker reservation unless the evidence conditions in
    the previous section are met.
 
 The immediate rollback is:
