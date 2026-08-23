@@ -35,8 +35,11 @@ When a Node event loop stops responding:
    the Node event loop.
 3. Rust requests one Node diagnostic report and one four-second main-thread CPU
    profile.
-4. Watchdog checks continue. Five consecutive misses retire and reap the direct
-   Node child.
+4. Watchdog checks continue. By default, five consecutive misses retire and
+   reap the direct Node child. The optional
+   [`local_node_executor_pool_admission`](../local_node_executor_pool_admission/README.md)
+   policy can replace that miss count with a per-pool event-loop
+   unresponsiveness budget.
 5. The next Node action lazily starts a clean generation.
 
 Retirement replaces only the local Node child, not the backend process. Queries,
@@ -287,7 +290,7 @@ Each active generation has one backend-owned watchdog task. The watchdog:
 - gives `GET /health` one second to complete and accepts at most 64 KiB of
   response data;
 - clears the miss count after a valid `status="ok"` response;
-- retires the selected generation after five consecutive misses;
+- by default, retires the selected generation after five consecutive misses;
 - verifies generation identity again before publishing every response
   observation;
 - treats an oversized or malformed health response, a negative stack-duration
@@ -297,11 +300,16 @@ Each active generation has one backend-owned watchdog task. The watchdog:
 - exits when the executor, generation slot, or selected generation no longer
   exists.
 
-The worst normal detection time is approximately ten seconds because each missed
-check can consume its one-second timeout before the next interval. Asynchronous
+The worst normal default detection time is approximately ten seconds because
+each missed check can consume its one-second timeout before the next interval.
+The optional pool-admission policy replaces the terminal miss count for a
+selected pool with its configured event-loop unresponsiveness budget. That
+budget also bounds the first in-flight probe from its request start. A completed
+failed probe retains that start as the interval origin, and the policy races
+the remaining budget against later watchdog intervals and probes. Asynchronous
 provider requests do not block the health handler. Synchronous work that blocks
-the event loop for approximately ten seconds is treated as a failed process and
-must not be used as an application execution strategy.
+the event loop through the applicable threshold is treated as a failed process
+and must not be used as an application execution strategy.
 
 The startup health check remains separate. Startup performs up to 50 checks at
 100 ms intervals and uses the same one-second per-check timeout before

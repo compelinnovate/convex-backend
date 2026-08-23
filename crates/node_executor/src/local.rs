@@ -54,6 +54,7 @@ use common::{
         LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
         LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE,
         LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES,
+        LOCAL_NODE_EXECUTOR_POOL_POLICIES,
     },
     log_lines::LogLine,
     memory_pressure::MemoryPressureSignal,
@@ -185,6 +186,9 @@ pub struct LocalNodeExecutorConfig {
     health_check_timeout: Duration,
     watchdog_interval: Duration,
     watchdog_failure_threshold: u32,
+    /// An operator-facing elapsed-time policy for a selected pool. `None`
+    /// preserves the existing consecutive-miss retirement behavior.
+    max_event_loop_unresponsive: Option<Duration>,
     max_old_space_size_mib: usize,
     max_rss_bytes: u64,
     memory_pressure: MemoryPressureSignal,
@@ -3113,6 +3117,11 @@ impl LocalNodeExecutorConfig {
             "Local Node executor watchdog failure threshold must be greater than zero"
         );
         anyhow::ensure!(
+            self.max_event_loop_unresponsive
+                .is_none_or(|budget| budget > Duration::ZERO),
+            "Local Node executor event-loop unresponsiveness budget must be greater than zero"
+        );
+        anyhow::ensure!(
             self.max_old_space_size_mib > 0,
             "Local Node executor old-space allowance must be greater than zero"
         );
@@ -3159,6 +3168,13 @@ impl LocalNodeExecutorConfig {
     }
 
     pub(crate) fn with_pool_name(mut self, pool_name: Arc<str>) -> Self {
+        // A named config is cloned from the default template. Replace, rather
+        // than inherit, the default pool override so every logical pool uses
+        // only the policy explicitly keyed to its own route.
+        self.max_event_loop_unresponsive = LOCAL_NODE_EXECUTOR_POOL_POLICIES
+            .get(pool_name.as_ref())
+            .and_then(|policy| policy.max_event_loop_unresponsive_seconds)
+            .map(Duration::from_secs);
         self.pool_name = pool_name;
         self
     }
@@ -4287,6 +4303,10 @@ impl LocalNodeExecutor {
             health_check_timeout: HEALTH_CHECK_TIMEOUT,
             watchdog_interval: WATCHDOG_INTERVAL,
             watchdog_failure_threshold: WATCHDOG_FAILURE_THRESHOLD,
+            max_event_loop_unresponsive: LOCAL_NODE_EXECUTOR_POOL_POLICIES
+                .get("default")
+                .and_then(|policy| policy.max_event_loop_unresponsive_seconds)
+                .map(Duration::from_secs),
             max_old_space_size_mib: *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
             max_rss_bytes: u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES)
                 .context("Local Node executor RSS threshold does not fit u64")?,
@@ -4346,6 +4366,10 @@ impl LocalNodeExecutor {
         crate::metrics::set_local_node_waiting_requests(&pool_name, 0);
         crate::metrics::set_local_node_active_requests(&pool_name, 0);
         crate::metrics::set_local_node_consecutive_health_misses(&pool_name, 0);
+        crate::metrics::set_local_node_event_loop_unresponsive_budget(
+            &pool_name,
+            executor.config.max_event_loop_unresponsive,
+        );
         crate::metrics::set_local_node_memory_pressure_active(&pool_name, false);
         crate::metrics::set_local_node_memory_configuration(
             &pool_name,
@@ -5972,6 +5996,34 @@ impl LocalNodeExecutor {
         .await;
     }
 
+    async fn retire_unhealthy_watched_generation(
+        state: &Weak<Mutex<LocalNodeExecutorState>>,
+        expected: &Weak<InnerLocalNodeExecutor>,
+    ) {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let Some(expected) = expected.upgrade() else {
+            return;
+        };
+        if Self::retire_inner_state(
+            &state,
+            &expected,
+            GenerationRetirementDiagnostics::watchdog(),
+        )
+        .await
+        .is_err()
+        {
+            // The identity-fenced slot is already absent. This detached
+            // boundary can only report the bounded cleanup failure.
+            tracing::error!(
+                pool_name = %expected.pool_name,
+                generation = expected.generation,
+                "Failed to terminate and reap unhealthy local Node executor child"
+            );
+        }
+    }
+
     async fn watch_generation_checks(
         state: Weak<Mutex<LocalNodeExecutorState>>,
         expected: Weak<InnerLocalNodeExecutor>,
@@ -5981,12 +6033,37 @@ impl LocalNodeExecutor {
         shutting_down: Arc<AtomicBool>,
     ) {
         let mut consecutive_misses = 0;
+        let mut unresponsive_since: Option<Instant> = None;
         let mut previous_package_stats = NodePackageCacheStats::default();
         let mut previous_stack_stats = NodeStackTraceStats::default();
         let latest_process_stat = Arc::new(StdMutex::new(None));
         let mut process_stat_sequence = 0u64;
+        let watched_state = state.clone();
+        let watched_generation = expected.clone();
         loop {
-            tokio::time::sleep(config.watchdog_interval).await;
+            let wait_interval = tokio::time::sleep(config.watchdog_interval);
+            tokio::pin!(wait_interval);
+            if let (Some(unresponsive_since), Some(budget)) =
+                (unresponsive_since, config.max_event_loop_unresponsive)
+            {
+                let budget_wait =
+                    tokio::time::sleep(budget.saturating_sub(unresponsive_since.elapsed()));
+                tokio::pin!(budget_wait);
+                tokio::select! {
+                    biased;
+                    _ = &mut budget_wait => {
+                        Self::retire_unhealthy_watched_generation(
+                            &watched_state,
+                            &watched_generation,
+                        )
+                        .await;
+                        return;
+                    },
+                    _ = &mut wait_interval => {},
+                }
+            } else {
+                wait_interval.await;
+            }
             let Some(state) = state.upgrade() else {
                 return;
             };
@@ -6003,17 +6080,67 @@ impl LocalNodeExecutor {
                 return;
             }
 
-            let health_check = async {
-                let started_at = Instant::now();
-                let health = InnerLocalNodeExecutor::check_server_health(
-                    &expected.client,
-                    config.health_check_timeout,
-                )
-                .await;
-                (health, started_at.elapsed())
-            };
-            let ((health, health_check_elapsed), rss) =
-                tokio::join!(health_check, read_process_rss(expected.pid),);
+            let health_check_started_at = Instant::now();
+            let mut health_check = Box::pin(InnerLocalNodeExecutor::check_server_health(
+                &expected.client,
+                config.health_check_timeout,
+            ));
+            let mut rss_check = Box::pin(read_process_rss(expected.pid));
+            let mut health_observation = None;
+            let mut rss = None;
+            // While the first health probe is pending, its start already arms
+            // the configured deadline. A successful response disarms that
+            // deadline even if the independent RSS read remains pending.
+            let mut budget_started_at = config
+                .max_event_loop_unresponsive
+                .map(|_| unresponsive_since.unwrap_or(health_check_started_at));
+            while health_observation.is_none() || rss.is_none() {
+                let remaining_budget = budget_started_at
+                    .zip(config.max_event_loop_unresponsive)
+                    .map(|(started_at, budget)| budget.saturating_sub(started_at.elapsed()));
+                let budget_wait = async move {
+                    match remaining_budget {
+                        Some(remaining_budget) => tokio::time::sleep(remaining_budget).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::pin!(budget_wait);
+                tokio::select! {
+                    // If health and the deadline become ready together, observe
+                    // health first. A successful response ends the failed
+                    // interval even when the independent RSS read is delayed.
+                    biased;
+                    health = health_check.as_mut(), if health_observation.is_none() => {
+                        let success = health.as_ref().is_some_and(|health| {
+                            health.status == "ok"
+                                && health
+                                    .valid_runtime_stats_support(
+                                        &previous_package_stats,
+                                        &previous_stack_stats,
+                                    )
+                                    == Some(expected.runtime_stats_supported)
+                        });
+                        if success {
+                            budget_started_at = None;
+                        }
+                        health_observation = Some((health, health_check_started_at.elapsed()));
+                    },
+                    _ = &mut budget_wait => {
+                        Self::retire_unhealthy_watched_generation(
+                            &watched_state,
+                            &watched_generation,
+                        )
+                        .await;
+                        return;
+                    },
+                    rss_result = rss_check.as_mut(), if rss.is_none() => {
+                        rss = Some(rss_result);
+                    },
+                }
+            }
+            let (health, health_check_elapsed) =
+                health_observation.expect("Completed Local Node health observation is missing");
+            let rss = rss.expect("Completed Local Node RSS observation is missing");
             // RSS enforcement is Linux-only. A failed or unsupported sample
             // skips only the RSS trigger for this iteration; age, package, and
             // unhealthy-generation checks remain active.
@@ -6064,6 +6191,7 @@ impl LocalNodeExecutor {
 
             let should_retire_unhealthy = if let Some(health) = health.filter(|_| success) {
                 consecutive_misses = 0;
+                unresponsive_since = None;
                 crate::metrics::set_local_node_consecutive_health_misses(&expected.pool_name, 0);
                 if expected.runtime_stats_supported {
                     Self::record_node_health_metrics(
@@ -6090,6 +6218,7 @@ impl LocalNodeExecutor {
                 false
             } else {
                 consecutive_misses += 1;
+                let unresponsive_since = *unresponsive_since.get_or_insert(health_check_started_at);
                 crate::metrics::set_local_node_consecutive_health_misses(
                     &expected.pool_name,
                     consecutive_misses,
@@ -6112,7 +6241,15 @@ impl LocalNodeExecutor {
                         &config,
                     );
                 }
-                consecutive_misses >= config.watchdog_failure_threshold
+                match config.max_event_loop_unresponsive {
+                    Some(budget) => {
+                        // Count from the start of the first failed probe, not
+                        // from its timeout. Otherwise every configured budget
+                        // would silently gain one full probe timeout.
+                        unresponsive_since.elapsed() >= budget
+                    },
+                    None => consecutive_misses >= config.watchdog_failure_threshold,
+                }
             };
 
             let retirement_reason = proactive_retirement_reason(
@@ -6130,22 +6267,8 @@ impl LocalNodeExecutor {
                 // Do not start a new graceful drain on the terminal miss. An
                 // idle drain could otherwise win the slot race and misclassify
                 // this unhealthy retirement as proactive.
-                if Self::retire_inner_state(
-                    &state,
-                    &expected,
-                    GenerationRetirementDiagnostics::watchdog(),
-                )
-                .await
-                .is_err()
-                {
-                    // The identity-fenced slot is already absent. This detached
-                    // boundary can only report the bounded cleanup failure.
-                    tracing::error!(
-                        pool_name = %expected.pool_name,
-                        generation = expected.generation,
-                        "Failed to terminate and reap unhealthy local Node executor child"
-                    );
-                }
+                Self::retire_unhealthy_watched_generation(&watched_state, &watched_generation)
+                    .await;
                 return;
             }
             if let Some(reason) = retirement_reason {
@@ -6762,6 +6885,7 @@ mod tests {
             health_check_timeout: Duration::from_millis(10),
             watchdog_interval: Duration::from_millis(10),
             watchdog_failure_threshold: 2,
+            max_event_loop_unresponsive: None,
             max_old_space_size_mib: 128,
             max_rss_bytes: 256 * MIB_BYTES,
             memory_pressure: MemoryPressureSignal::default(),
@@ -9889,6 +10013,148 @@ done
         assert_eq!(health_requests.load(Ordering::Relaxed), 4);
         assert!(state.lock().await.inner.is_none());
         assert!(generation.server_handle.lock().await.child.is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_watchdog_budget_bounds_first_hanging_probe() {
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("executor.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let health_requests = Arc::new(AtomicUsize::new(0));
+        let server_health_requests = health_requests.clone();
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            server_health_requests.fetch_add(1, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path)
+            .build()
+            .unwrap();
+        let generation = test_inner_with_client(1, client).await;
+        let state = Arc::new(Mutex::new(LocalNodeExecutorState {
+            inner: Some(generation.clone()),
+            retiring: None,
+            hot_transition: None,
+            replacement_for_generation: None,
+            next_generation: 1,
+            next_transition: 0,
+        }));
+        let mut config = test_config();
+        config.pool_name = Arc::from("planning");
+        config.health_check_timeout = Duration::from_secs(5);
+        config.watchdog_interval = Duration::from_millis(10);
+        config.watchdog_failure_threshold = 1;
+        config.max_event_loop_unresponsive = Some(Duration::from_millis(80));
+
+        let watchdog = tokio::spawn(LocalNodeExecutor::watch_generation(
+            Arc::downgrade(&state),
+            Arc::downgrade(&generation),
+            config,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while health_requests.load(Ordering::Relaxed) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Watchdog did not start the first health probe");
+        assert!(state
+            .lock()
+            .await
+            .inner
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &generation)));
+
+        tokio::time::timeout(Duration::from_secs(1), watchdog)
+            .await
+            .expect("Configured watchdog budget did not bound the first health probe")
+            .unwrap();
+        assert_eq!(health_requests.load(Ordering::Relaxed), 1);
+        assert!(state.lock().await.inner.is_none());
+        assert!(generation.server_handle.lock().await.child.is_none());
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn configured_watchdog_budget_replaces_miss_count_for_selected_pool() {
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("executor.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let health_requests = Arc::new(AtomicUsize::new(0));
+        let server_health_requests = health_requests.clone();
+        let server_task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let health_request = server_health_requests.fetch_add(1, Ordering::Relaxed) + 1;
+                if health_request > 1 {
+                    std::future::pending::<()>().await;
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path)
+            .build()
+            .unwrap();
+        let generation = test_inner_with_client(1, client).await;
+        let state = Arc::new(Mutex::new(LocalNodeExecutorState {
+            inner: Some(generation.clone()),
+            retiring: None,
+            hot_transition: None,
+            replacement_for_generation: None,
+            next_generation: 1,
+            next_transition: 0,
+        }));
+        let mut config = test_config();
+        config.pool_name = Arc::from("planning");
+        config.health_check_timeout = Duration::from_secs(5);
+        config.watchdog_interval = Duration::from_millis(10);
+        config.watchdog_failure_threshold = 1;
+        config.max_event_loop_unresponsive = Some(Duration::from_millis(80));
+
+        let watchdog = tokio::spawn(LocalNodeExecutor::watch_generation(
+            Arc::downgrade(&state),
+            Arc::downgrade(&generation),
+            config,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while health_requests.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Watchdog did not perform repeated failed probes");
+        assert!(state
+            .lock()
+            .await
+            .inner
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &generation)));
+
+        tokio::time::timeout(Duration::from_secs(1), watchdog)
+            .await
+            .expect("Configured watchdog budget did not retire the generation")
+            .unwrap();
+        assert_eq!(health_requests.load(Ordering::Relaxed), 2);
+        assert!(state.lock().await.inner.is_none());
+        assert!(generation.server_handle.lock().await.child.is_none());
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
     }
 
     #[cfg(target_os = "linux")]
