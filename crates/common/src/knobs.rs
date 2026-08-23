@@ -68,6 +68,12 @@ fn validate_usize_strict_nonzero(name: &str, value: usize) -> anyhow::Result<usi
     Ok(value)
 }
 
+fn validate_percent(name: &str, value: usize) -> anyhow::Result<usize> {
+    anyhow::ensure!(value > 0, "{name} must be greater than zero");
+    anyhow::ensure!(value <= 100, "{name} must not exceed 100");
+    Ok(value)
+}
+
 fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
     let value = match std::env::var(name) {
         Ok(var_s) => Some(parse_usize_strict(name, &var_s).unwrap_or_else(|e| panic!("{e}"))),
@@ -515,6 +521,18 @@ pub static LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES: LazyLock<usize> =
             "LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES must be greater than zero"
         );
         value
+    });
+
+/// Percentage of the aggregate isolate heap and ArrayBuffer ceilings included
+/// in the local backend startup memory feasibility budget. This changes only
+/// planning accounting; runtime limits and the cgroup hard limit are unchanged.
+/// The value must be between 1 and 100 inclusive.
+pub static LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT: LazyLock<usize> =
+    LazyLock::new(|| {
+        let value =
+            env_config_usize_strict("LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT", 100);
+        validate_percent("LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT", value)
+            .unwrap_or_else(|e| panic!("{e}"))
     });
 
 /// Reclaim optional backend memory before external admission reaches its
@@ -2675,6 +2693,14 @@ mod strict_capacity_tests {
         assert!(
             validate_usize_strict_nonzero("CAP", tokio::sync::Semaphore::MAX_PERMITS + 1).is_err()
         );
+    }
+
+    #[test]
+    fn percent_rejects_zero_and_values_above_one_hundred() {
+        assert_eq!(validate_percent("PERCENT", 1).unwrap(), 1);
+        assert_eq!(validate_percent("PERCENT", 100).unwrap(), 100);
+        assert!(validate_percent("PERCENT", 0).is_err());
+        assert!(validate_percent("PERCENT", 101).is_err());
     }
 
     #[test]
