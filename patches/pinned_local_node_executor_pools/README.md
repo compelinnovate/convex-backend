@@ -14,9 +14,12 @@ local executor pool:
 
 The declaration applies to the complete module, so every export uses the same
 pool. Modules without a pool declaration use the default local Node executor.
-The application declares required runtime isolation; the host supplies only a
-generic resource limit. There is no host module allowlist, pool-name allowlist,
-or duplicate route configuration.
+The application declares required runtime isolation; this routing patch asks
+the host only for a generic resource limit. There is no host module allowlist,
+pool-name allowlist, or duplicate route configuration. The optional
+[`local_node_executor_pool_admission`](../local_node_executor_pool_admission/README.md)
+patch can separately attach host capacity and health policy to those declared
+names without changing their routes.
 
 A named process can retain rebuildable module-level state between invocations,
 but it remains disposable. Timeouts, health failure, memory or lifetime limits,
@@ -347,8 +350,8 @@ local lifecycle protocol and does not invoke application code.
 ## Resource policy
 
 Each pool inherits the existing local executor timeout, old-space, RSS,
-pressure, age, imported-package, health, and diagnostic settings. The only
-pool-wide host policy is:
+pressure, age, imported-package, health, and diagnostic settings. In this
+routing patch, the only pool-wide host policy is:
 
 ```text
 LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES

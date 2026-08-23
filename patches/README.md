@@ -199,6 +199,19 @@ adoption contract documented in the backend essay.
   compatible backend and CLI, then restore an image that does not understand the required
   pool-bearing module environment. Roll back the CLI afterward if required.
 
+### [Local Node executor pool admission policy](local_node_executor_pool_admission/README.md)
+
+- Purpose: add optional independent-action concurrency, queue-delay observability, and
+  main-event-loop unresponsiveness budgets to the default and application-declared local Node
+  pools while preserving the application-wide Node action cap.
+- Prerequisites: application-declared pinned local Node executor pools for routing and generation
+  ownership, and scheduled-action admission for the pre-claim durable start boundary.
+- Activation: set the strict `LOCAL_NODE_EXECUTOR_POOL_POLICIES` JSON map for only the pools that
+  need an additional bound, restart the backend, and verify per-pool admission and health metrics.
+  Missing pools and fields preserve existing behavior.
+- Rollback: remove the setting and restart before restoring an earlier image. No schema, topology,
+  or durable-job migration is required.
+
 ## Scheduler, admission, and queueing
 
 ### [Dependency capacity](dependency_capacity/README.md)

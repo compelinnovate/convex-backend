@@ -56,6 +56,7 @@ use common::{
         DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY,
         ISOLATE_DEPENDENCY_WORKER_RESERVE,
         ISOLATE_MAX_USER_HEAP_SIZE,
+        LOCAL_NODE_EXECUTOR_POOL_POLICIES,
         UDF_EXECUTOR_OCC_INITIAL_BACKOFF,
         UDF_EXECUTOR_OCC_MAX_BACKOFF,
         UDF_EXECUTOR_OCC_MAX_RETRIES,
@@ -124,7 +125,10 @@ use model::{
     backend_info::BackendInfoModel,
     backend_state::BackendStateModel,
     components::handles::FunctionHandlesModel,
-    config::types::ModuleConfig,
+    config::types::{
+        ModuleConfig,
+        NodeExecutorPoolName,
+    },
     environment_variables::{
         types::{
             EnvVarName,
@@ -224,10 +228,15 @@ use self::metrics::{
     durable_action_admission_timer,
     durable_action_claim_timer,
     function_waiter_timer,
+    log_node_pool_queue_warning,
     log_occ_retries,
     log_outstanding_functions,
     log_udf_executor_result,
     mutation_timer,
+    node_pool_admission_timer,
+    set_node_pool_admission_limit,
+    set_node_pool_admission_outstanding,
+    set_node_pool_queue_warning,
     UdfExecutorResult,
 };
 use crate::{
@@ -582,6 +591,16 @@ impl<RT: Runtime> Limiter<RT> {
         rt: &'a RT,
         is_dependency: bool,
     ) -> anyhow::Result<RequestGuard<'a, RT>> {
+        let deadline = rt.monotonic_now() + self.semaphore_timeout;
+        self.acquire_permit_until(rt, is_dependency, deadline).await
+    }
+
+    async fn acquire_permit_until<'a>(
+        &'a self,
+        rt: &'a RT,
+        is_dependency: bool,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<RequestGuard<'a, RT>> {
         let mut request_guard = self.start();
         select! {
             biased;
@@ -591,7 +610,7 @@ impl<RT: Runtime> Limiter<RT> {
                 self.report_metrics();
                 future::pending::<!>().await
             } => match x {},
-            _ = rt.wait(self.semaphore_timeout) => {
+            _ = rt.wait(deadline.saturating_duration_since(rt.monotonic_now())) => {
                 log_function_wait_timeout(self.env, self.udf_type);
                 anyhow::bail!(ErrorMetadata::rate_limited(
                     "TooManyConcurrentRequests",
@@ -700,6 +719,152 @@ impl<RT: Runtime> Drop for RequestGuard<'_, RT> {
     }
 }
 
+struct NodePoolLimiter {
+    pool_name: Arc<str>,
+    max_concurrency: usize,
+    concurrency_gate: DependencyOverflowGate,
+    total_outstanding: AtomicUsize,
+    queue_warning: Option<Duration>,
+}
+
+impl NodePoolLimiter {
+    fn new(
+        pool_name: Arc<str>,
+        max_concurrency: usize,
+        dependency_reserve: usize,
+        global_capacity: usize,
+        queue_warning: Option<Duration>,
+    ) -> Self {
+        assert!(
+            max_concurrency > 0,
+            "Node pool concurrency must be positive"
+        );
+        assert!(
+            max_concurrency <= global_capacity,
+            "Node pool concurrency must not exceed global Node action concurrency"
+        );
+        // Pool permits precede the global gate, so independent holders waiting
+        // there must not consume the descendant capacity that unblocks active
+        // ancestors. The pool gate may consequently have more holders than the
+        // global hard limit; only holders that pass the later global gate run.
+        let overflow = dependency_reserve.min(global_capacity.saturating_sub(1));
+        let total_capacity = max_concurrency
+            .checked_add(overflow)
+            .expect("Node pool dependency overflow capacity overflow");
+        let limiter = Self {
+            pool_name,
+            max_concurrency,
+            concurrency_gate: DependencyOverflowGate::new(max_concurrency, total_capacity),
+            total_outstanding: AtomicUsize::new(0),
+            queue_warning,
+        };
+        set_node_pool_admission_limit(&limiter.pool_name, max_concurrency);
+        set_node_pool_queue_warning(&limiter.pool_name, queue_warning);
+        limiter.report_metrics();
+        limiter
+    }
+
+    async fn acquire<'a, RT: Runtime>(
+        &'a self,
+        rt: &'a RT,
+        is_dependency: bool,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<NodePoolRequestGuard<'a>> {
+        let mut request_guard = NodePoolRequestGuard::new(self);
+        let timer = node_pool_admission_timer(&self.pool_name);
+        // Keep the future that mutably borrows the guard in this inner scope;
+        // it must be dropped before the admitted guard is returned to the
+        // caller.
+        let acquired = {
+            let mut acquire = std::pin::pin!(request_guard.acquire_permit(is_dependency));
+            let timeout = async {
+                match deadline {
+                    Some(deadline) => {
+                        rt.wait(deadline.saturating_duration_since(rt.monotonic_now()))
+                            .await
+                    },
+                    None => future::pending().await,
+                }
+            };
+            let queue_warning = async {
+                match self.queue_warning {
+                    Some(queue_warning) => rt.wait(queue_warning).await,
+                    None => future::pending().await,
+                }
+            };
+            let mut timeout = std::pin::pin!(timeout);
+            let mut queue_warning = std::pin::pin!(queue_warning);
+            let mut warning_recorded = false;
+            loop {
+                select! {
+                    biased;
+                    () = queue_warning.as_mut(), if !warning_recorded => {
+                        log_node_pool_queue_warning(&self.pool_name);
+                        warning_recorded = true;
+                    },
+                    () = acquire.as_mut() => break true,
+                    () = timeout.as_mut() => break false,
+                }
+            }
+        };
+
+        if !acquired {
+            timer.finish_with("timeout");
+            anyhow::bail!(ErrorMetadata::rate_limited(
+                "TooManyConcurrentRequests",
+                format!(
+                    "Too many concurrent Node actions for executor pool `{}`. The pool is limited \
+                     to {} independent actions.",
+                    self.pool_name, self.max_concurrency,
+                ),
+            ));
+        }
+        timer.finish(true);
+        Ok(request_guard)
+    }
+
+    fn report_metrics(&self) {
+        let active = self.concurrency_gate.active();
+        let waiting = self
+            .total_outstanding
+            .load(Ordering::SeqCst)
+            .saturating_sub(active);
+        set_node_pool_admission_outstanding(&self.pool_name, active, waiting);
+    }
+}
+
+struct NodePoolRequestGuard<'a> {
+    limiter: &'a NodePoolLimiter,
+    permit: Option<DependencyOverflowPermit>,
+}
+
+impl<'a> NodePoolRequestGuard<'a> {
+    fn new(limiter: &'a NodePoolLimiter) -> Self {
+        limiter.total_outstanding.fetch_add(1, Ordering::SeqCst);
+        limiter.report_metrics();
+        Self {
+            limiter,
+            permit: None,
+        }
+    }
+
+    async fn acquire_permit(&mut self, is_dependency: bool) {
+        assert!(self.permit.is_none(), "Node pool permit acquired twice");
+        self.permit = Some(self.limiter.concurrency_gate.acquire(is_dependency).await);
+        self.limiter.report_metrics();
+    }
+}
+
+impl Drop for NodePoolRequestGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.limiter
+            .total_outstanding
+            .fetch_sub(1, Ordering::SeqCst);
+        self.limiter.report_metrics();
+    }
+}
+
 /// Executes UDFs for backends.
 ///
 /// This struct directly executes http and node actions. Queries, Mutations and
@@ -726,6 +891,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
     query_analysis_admission: Option<QueryAnalysisAdmission>,
     default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
     node_action_limiter: Limiter<RT>,
+    node_pool_action_limiters: BTreeMap<String, NodePoolLimiter>,
     ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
     deployment: DeploymentMetadata,
 }
@@ -777,6 +943,28 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             function_log.clone(),
             *ISOLATE_DEPENDENCY_WORKER_RESERVE,
         );
+        let node_pool_action_limiters = LOCAL_NODE_EXECUTOR_POOL_POLICIES
+            .iter()
+            .filter_map(|(pool_name, policy)| {
+                policy.max_concurrency.map(|max_concurrency| {
+                    assert!(
+                        max_concurrency <= *APPLICATION_MAX_CONCURRENT_NODE_ACTIONS,
+                        "Node pool {pool_name:?} maxConcurrency exceeds \
+                         APPLICATION_MAX_CONCURRENT_NODE_ACTIONS"
+                    );
+                    (
+                        pool_name.clone(),
+                        NodePoolLimiter::new(
+                            Arc::from(pool_name.as_str()),
+                            max_concurrency,
+                            *ISOLATE_DEPENDENCY_WORKER_RESERVE,
+                            *APPLICATION_MAX_CONCURRENT_NODE_ACTIONS,
+                            policy.queue_warning_seconds.map(Duration::from_secs),
+                        ),
+                    )
+                })
+            })
+            .collect();
 
         Self {
             runtime,
@@ -793,9 +981,18 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             query_analysis_admission,
             default_system_env_vars,
             node_action_limiter,
+            node_pool_action_limiters,
             ai_gateway_jwt_minter,
             deployment,
         }
+    }
+
+    fn node_pool_action_limiter(
+        &self,
+        pool: Option<&NodeExecutorPoolName>,
+    ) -> Option<&NodePoolLimiter> {
+        self.node_pool_action_limiters
+            .get(pool.map_or("default", |pool| pool.as_ref()))
     }
 
     /// Called with a typed caller via [`ActionCallbacks`], or with flat
@@ -1788,14 +1985,44 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 // from isolate ancestry: do not propagate it to the isolate scheduler.
                 let is_node_action_dependency =
                     node_action_gate_dependency(&caller, scheduler_dependency);
-                let _permit = if wait_for_permit {
-                    self.node_action_limiter
-                        .acquire_permit(is_node_action_dependency)
-                        .await?
-                } else {
-                    self.node_action_limiter
-                        .acquire_permit_with_timeout(&self.runtime, is_node_action_dependency)
-                        .await?
+                let admission_deadline = (!wait_for_permit).then(|| {
+                    self.runtime.monotonic_now()
+                        + *APPLICATION_FUNCTION_RUNNER_ACTION_SEMAPHORE_TIMEOUT
+                });
+                // Pool capacity precedes the backend-wide permit. A saturated
+                // dedicated pool therefore cannot consume every global Node slot
+                // while its requests wait. Every Node path uses this order, so
+                // retaining the pool permit while joining the global FIFO cannot
+                // form a permit cycle.
+                let _pool_permit = match self.node_pool_action_limiter(module.node_pool.as_ref()) {
+                    Some(limiter) => Some(
+                        limiter
+                            .acquire(&self.runtime, is_node_action_dependency, admission_deadline)
+                            .await?,
+                    ),
+                    None => None,
+                };
+                // The execution-start gate signals readiness only after the later
+                // generation reservation. Scheduled callers therefore hold both
+                // application permits across their durable claim, and dropping a
+                // pre-claim attempt releases them without invoking user code.
+                let _permit = match admission_deadline {
+                    None => {
+                        self.node_action_limiter
+                            .acquire_permit(is_node_action_dependency)
+                            .await?
+                    },
+                    Some(deadline) => {
+                        // Pool and global queueing share one absolute deadline;
+                        // composing the limits must not double the caller's wait.
+                        self.node_action_limiter
+                            .acquire_permit_until(
+                                &self.runtime,
+                                is_node_action_dependency,
+                                deadline,
+                            )
+                            .await?
+                    },
                 };
 
                 let mut environment_variables =
@@ -2907,12 +3134,27 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
 
 #[cfg(test)]
 mod tests {
-    use common::types::{
-        FunctionCaller,
-        SchedulerDependencyClass,
+    use std::{
+        sync::{
+            atomic::Ordering,
+            Arc,
+        },
+        time::Duration,
     };
 
-    use super::node_action_gate_dependency;
+    use common::{
+        runtime::Runtime,
+        types::{
+            FunctionCaller,
+            SchedulerDependencyClass,
+        },
+    };
+    use runtime::prod::ProdRuntime;
+
+    use super::{
+        node_action_gate_dependency,
+        NodePoolLimiter,
+    };
 
     #[test]
     fn nested_node_actions_use_application_overflow_without_false_isolate_ancestry() {
@@ -2931,5 +3173,105 @@ mod tests {
             &FunctionCaller::Cron,
             SchedulerDependencyClass::UnblocksAncestor,
         ));
+    }
+
+    #[test]
+    fn node_pool_limit_blocks_independent_roots_but_allows_bounded_dependency_progress(
+    ) -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        rt.block_on("node_pool_dependency_progress", async {
+            let limiter = Arc::new(NodePoolLimiter::new(Arc::from("planning"), 1, 1, 3, None));
+            let root = limiter.acquire(&rt, false, None).await?;
+            assert_eq!(limiter.concurrency_gate.active(), 1);
+
+            let mut second_root = Box::pin(limiter.acquire(&rt, false, None));
+            tokio::select! {
+                _ = &mut second_root => {
+                    panic!("Second independent root bypassed the pool limit")
+                },
+                () = rt.wait(Duration::from_millis(10)) => {},
+            }
+            assert_eq!(limiter.concurrency_gate.active(), 1);
+
+            let dependency = limiter.acquire(&rt, true, None).await?;
+            assert_eq!(limiter.concurrency_gate.active(), 2);
+            drop(dependency);
+            drop(root);
+
+            let second_root = second_root.await?;
+            assert_eq!(limiter.concurrency_gate.active(), 1);
+            drop(second_root);
+            assert_eq!(limiter.concurrency_gate.active(), 0);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn node_pool_dependency_overflow_survives_roots_queued_at_global_limit() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        rt.block_on("node_pool_dependency_progress_at_global_limit", async {
+            let limiter = NodePoolLimiter::new(Arc::from("planning"), 3, 1, 3, None);
+            // The last root represents a pool permit holder waiting for global
+            // base capacity. It must not displace the global dependency reserve.
+            let roots = futures::future::try_join_all([
+                limiter.acquire(&rt, false, None),
+                limiter.acquire(&rt, false, None),
+                limiter.acquire(&rt, false, None),
+            ])
+            .await?;
+            assert_eq!(limiter.concurrency_gate.active(), 3);
+
+            let dependency = limiter.acquire(&rt, true, None).await?;
+            assert_eq!(limiter.concurrency_gate.active(), 4);
+            drop(dependency);
+            drop(roots);
+            assert_eq!(limiter.concurrency_gate.active(), 0);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn node_pool_wait_uses_caller_absolute_deadline() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        rt.block_on("node_pool_absolute_deadline", async {
+            let limiter = NodePoolLimiter::new(Arc::from("planning"), 1, 0, 2, None);
+            let root = limiter.acquire(&rt, false, None).await?;
+            let deadline = rt.monotonic_now() + Duration::from_millis(10);
+
+            let error = match limiter.acquire(&rt, false, Some(deadline)).await {
+                Ok(_) => panic!("Saturated pool ignored the direct-call deadline"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("executor pool `planning`"));
+            assert_eq!(limiter.total_outstanding.load(Ordering::SeqCst), 1);
+            drop(root);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn canceling_node_pool_waiter_releases_queue_accounting() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        rt.block_on("node_pool_waiter_cancellation", async {
+            let limiter = NodePoolLimiter::new(Arc::from("planning"), 1, 0, 2, None);
+            let root = limiter.acquire(&rt, false, None).await?;
+            let mut waiter = Box::pin(limiter.acquire(&rt, false, None));
+            tokio::select! {
+                _ = &mut waiter => panic!("Saturated pool admitted a waiter"),
+                () = rt.wait(Duration::from_millis(10)) => {},
+            }
+            assert_eq!(limiter.total_outstanding.load(Ordering::SeqCst), 2);
+
+            drop(waiter);
+            assert_eq!(limiter.total_outstanding.load(Ordering::SeqCst), 1);
+            assert_eq!(limiter.concurrency_gate.active(), 1);
+            drop(root);
+            assert_eq!(limiter.concurrency_gate.active(), 0);
+            Ok(())
+        })
     }
 }

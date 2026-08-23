@@ -17,6 +17,7 @@ use std::{
         max,
         min,
     },
+    collections::BTreeMap,
     num::{
         NonZeroU32,
         NonZeroUsize,
@@ -25,9 +26,21 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context as _;
 use cmd_util::env::env_config;
+use serde::{
+    de::{
+        Error as _,
+        MapAccess,
+        Visitor,
+    },
+    Deserialize,
+    Deserializer,
+};
 
 use crate::fastrace_helpers::SamplingConfig;
+
+const MAX_LOCAL_NODE_EXECUTOR_POOL_POLICIES: usize = 9;
 
 fn parse_usize_strict(name: &str, value: &str) -> anyhow::Result<usize> {
     anyhow::ensure!(
@@ -2732,5 +2745,52 @@ mod strict_capacity_tests {
         assert!(validate_active_javascript_class_minimums(28, 15, 14, Some(32)).is_err());
         assert!(validate_active_javascript_class_minimums(28, 4, 14, None).is_err());
         assert!(validate_active_javascript_class_minimums(28, 4, 14, Some(8)).is_err());
+    }
+
+    #[test]
+    fn local_node_pool_policies_are_strict_and_bounded() {
+        let policies = parse_local_node_executor_pool_policies(
+            r#"{
+                "default": {"maxConcurrency": 2, "queueWarningSeconds": 5},
+                "planning": {
+                    "maxConcurrency": 1,
+                    "maxEventLoopUnresponsiveSeconds": 30
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(policies["planning"].max_concurrency, Some(1));
+        assert_eq!(policies["default"].queue_warning_seconds, Some(5));
+
+        for invalid in [
+            r#"{"planning": {}}"#,
+            r#"{"default": {"maxConcurrency": 0}}"#,
+            r#"{"Default": {"maxConcurrency": 1}}"#,
+            r#"{"planning": {"unknown": 1}}"#,
+            r#"{"planning": {"queueWarningSeconds": 5}}"#,
+            r#"{"planning": {"maxEventLoopUnresponsiveSeconds": 0}}"#,
+            r#"{"planning": {"queueWarningSeconds": 0}}"#,
+            r#"{
+                "planning": {"maxConcurrency": 1},
+                "planning": {"maxConcurrency": 2}
+            }"#,
+            r#"{
+                "pool_0": {"maxConcurrency": 1},
+                "pool_1": {"maxConcurrency": 1},
+                "pool_2": {"maxConcurrency": 1},
+                "pool_3": {"maxConcurrency": 1},
+                "pool_4": {"maxConcurrency": 1},
+                "pool_5": {"maxConcurrency": 1},
+                "pool_6": {"maxConcurrency": 1},
+                "pool_7": {"maxConcurrency": 1},
+                "pool_8": {"maxConcurrency": 1},
+                "pool_9": {"maxConcurrency": 1}
+            }"#,
+        ] {
+            assert!(
+                parse_local_node_executor_pool_policies(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 }

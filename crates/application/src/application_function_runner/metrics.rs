@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use common::types::{
     ModuleEnvironment,
     UdfType,
@@ -6,7 +8,10 @@ use metrics::{
     log_counter_with_labels,
     log_distribution,
     log_distribution_with_labels,
+    log_gauge_with_labels,
     register_convex_counter,
+    register_convex_gauge,
+    register_convex_gauge_evictable,
     register_convex_histogram,
     CancelableTimer,
     StaticMetricLabel,
@@ -191,6 +196,74 @@ pub fn function_waiter_timer(udf_type: UdfType) -> StatusTimer {
     let mut timer = StatusTimer::new(&APPLICATION_FUNCTION_RUNNER_WAIT_SECONDS);
     timer.add_label(udf_type.metric_label());
     timer
+}
+
+register_convex_gauge_evictable!(
+    APPLICATION_NODE_POOL_ADMISSION_OUTSTANDING_REQUESTS,
+    "Current Node actions admitted or waiting at an explicitly configured pool limit",
+    &["pool_name", "state"]
+);
+pub fn set_node_pool_admission_outstanding(pool_name: &str, active: usize, waiting: usize) {
+    for (state, value) in [("active", active), ("waiting", waiting)] {
+        log_gauge_with_labels(
+            &APPLICATION_NODE_POOL_ADMISSION_OUTSTANDING_REQUESTS,
+            value as f64,
+            vec![
+                StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+                StaticMetricLabel::new("state", state),
+            ],
+        );
+    }
+}
+
+register_convex_gauge!(
+    APPLICATION_NODE_POOL_ADMISSION_LIMIT_INFO,
+    "Configured independent Node action concurrency for a local executor pool",
+    &["pool_name"]
+);
+pub fn set_node_pool_admission_limit(pool_name: &str, limit: usize) {
+    log_gauge_with_labels(
+        &APPLICATION_NODE_POOL_ADMISSION_LIMIT_INFO,
+        limit as f64,
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
+}
+
+register_convex_gauge!(
+    APPLICATION_NODE_POOL_QUEUE_WARNING_SECONDS,
+    "Configured Node pool admission queue-warning duration; zero disables warnings",
+    &["pool_name"]
+);
+pub fn set_node_pool_queue_warning(pool_name: &str, queue_warning: Option<Duration>) {
+    log_gauge_with_labels(
+        &APPLICATION_NODE_POOL_QUEUE_WARNING_SECONDS,
+        queue_warning.map_or(0.0, |duration| duration.as_secs_f64()),
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
+}
+
+register_convex_histogram!(
+    APPLICATION_NODE_POOL_ADMISSION_WAIT_SECONDS,
+    "Time a Node action waited for explicitly configured pool capacity",
+    &[STATUS_LABEL[0], "pool_name"]
+);
+pub fn node_pool_admission_timer(pool_name: &str) -> CancelableTimer {
+    let mut timer = CancelableTimer::new(&APPLICATION_NODE_POOL_ADMISSION_WAIT_SECONDS);
+    timer.add_label(StaticMetricLabel::new("pool_name", pool_name.to_owned()));
+    timer
+}
+
+register_convex_counter!(
+    APPLICATION_NODE_POOL_QUEUE_WARNING_TOTAL,
+    "Node pool admission waits that reached the configured queue warning duration",
+    &["pool_name"]
+);
+pub fn log_node_pool_queue_warning(pool_name: &str) {
+    log_counter_with_labels(
+        &APPLICATION_NODE_POOL_QUEUE_WARNING_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
 }
 
 register_convex_histogram!(
