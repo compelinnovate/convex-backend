@@ -23,6 +23,16 @@ reclamation and external HTTP shedding, allocator trim, and the shared pressure 
 the maintained local Node generation-retirement patch with a pressure response and exposes the
 signal to later owner-specific patches.
 
+Startup feasibility accounts for 100% of the aggregate isolate heap and
+ArrayBuffer ceilings by default. A self-hosted operator may set
+`LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT` from 1 through 100 to
+account for a smaller aggregate fraction while retaining the original runtime
+ceilings. Cache limits, the complete Node allowance, and the native/kernel
+reserve remain fully counted. Telemetry reports the raw isolate capacity, the
+accounted isolate bytes, the selected percentage, and the resulting adjusted
+total. This planning control does not weaken the finite cgroup limit or the
+runtime memory-pressure response.
+
 When application-declared local Node executor pools are available, startup
 memory feasibility reserves `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
 Deploy and startup validation separately require the default steady slot, every

@@ -35,6 +35,7 @@ use common::{
         LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES,
         LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES,
         LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES,
+        LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT,
         LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES,
         MAX_ISOLATE_WORKERS,
         SOURCE_MAP_CACHE_MAX_SIZE_BYTES,
@@ -181,6 +182,15 @@ register_convex_gauge!(
 register_convex_gauge!(
     BACKEND_STARTUP_MEMORY_BUDGET_HEADROOM_BYTES,
     "Cgroup memory limit remaining after the configured startup memory budget"
+);
+register_convex_gauge!(
+    BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT_INFO,
+    "Percentage of aggregate isolate memory ceilings included in the startup memory budget"
+);
+register_convex_gauge!(
+    BACKEND_STARTUP_ISOLATE_MEMORY_BYTES,
+    "Aggregate isolate memory used for startup planning",
+    &["accounting_kind"]
 );
 register_convex_gauge!(
     BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED_INFO,
@@ -405,6 +415,13 @@ struct StartupMemoryBudget {
     total_bytes: u64,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct StartupIsolateMemoryAccounting {
+    raw_capacity_bytes: u64,
+    accounted_bytes: u64,
+    commit_percent: usize,
+}
+
 impl StartupMemoryBudget {
     fn new(components: Vec<MemoryBudgetComponent>) -> anyhow::Result<Self> {
         let total_bytes = components.iter().try_fold(0u64, |total, component| {
@@ -417,6 +434,24 @@ impl StartupMemoryBudget {
             total_bytes,
         })
     }
+}
+
+fn account_isolate_memory_capacity(raw_bytes: u64, commit_percent: usize) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        (1..=100).contains(&commit_percent),
+        "startup isolate memory commit percentage must be between 1 and 100"
+    );
+    let commit_percent = u64::try_from(commit_percent)?;
+    let whole = (raw_bytes / 100)
+        .checked_mul(commit_percent)
+        .context("accounted isolate memory capacity overflow")?;
+    let remainder = (raw_bytes % 100)
+        .checked_mul(commit_percent)
+        .context("accounted isolate memory capacity remainder overflow")?
+        .div_ceil(100);
+    whole
+        .checked_add(remainder)
+        .context("accounted isolate memory capacity overflow")
 }
 
 #[derive(Debug)]
@@ -1285,7 +1320,7 @@ fn skip_ascii_whitespace(bytes: &[u8], index: &mut usize) {
 }
 
 pub fn validate_startup_budget() -> anyhow::Result<()> {
-    let budget = configured_startup_budget()?;
+    let (budget, isolate_memory) = configured_startup_budget()?;
     for component in &budget.components {
         log_gauge_with_labels(
             &BACKEND_STARTUP_MEMORY_BUDGET_BYTES,
@@ -1298,6 +1333,20 @@ pub fn validate_startup_budget() -> anyhow::Result<()> {
         budget.total_bytes as f64,
         vec![StaticMetricLabel::new("component", "configured_total")],
     );
+    log_gauge(
+        &BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT_INFO,
+        isolate_memory.commit_percent as f64,
+    );
+    for (accounting_kind, bytes) in [
+        ("raw_capacity", isolate_memory.raw_capacity_bytes),
+        ("accounted", isolate_memory.accounted_bytes),
+    ] {
+        log_gauge_with_labels(
+            &BACKEND_STARTUP_ISOLATE_MEMORY_BYTES,
+            bytes as f64,
+            vec![StaticMetricLabel::new("accounting_kind", accounting_kind)],
+        );
+    }
 
     let headroom = match effective_cgroup_root()? {
         Some(root) => startup_budget_headroom(&root, &budget)?,
@@ -1312,6 +1361,9 @@ pub fn validate_startup_budget() -> anyhow::Result<()> {
             );
             tracing::info!(
                 configured_memory_budget_bytes = budget.total_bytes,
+                isolate_memory_raw_capacity_bytes = isolate_memory.raw_capacity_bytes,
+                isolate_memory_accounted_bytes = isolate_memory.accounted_bytes,
+                isolate_memory_commit_percent = isolate_memory.commit_percent,
                 memory_budget_headroom_bytes = headroom_bytes,
                 "Validated configured startup memory budget against the cgroup limit"
             );
@@ -1320,6 +1372,9 @@ pub fn validate_startup_budget() -> anyhow::Result<()> {
             log_gauge(&BACKEND_STARTUP_MEMORY_BUDGET_LIMIT_AVAILABLE_INFO, 0.0);
             tracing::info!(
                 configured_memory_budget_bytes = budget.total_bytes,
+                isolate_memory_raw_capacity_bytes = isolate_memory.raw_capacity_bytes,
+                isolate_memory_accounted_bytes = isolate_memory.accounted_bytes,
+                isolate_memory_commit_percent = isolate_memory.commit_percent,
                 "Skipped startup memory feasibility because no finite cgroup v2 limit is available"
             );
         },
@@ -1327,7 +1382,16 @@ pub fn validate_startup_budget() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn configured_startup_budget() -> anyhow::Result<StartupMemoryBudget> {
+fn configured_startup_budget(
+) -> anyhow::Result<(StartupMemoryBudget, StartupIsolateMemoryAccounting)> {
+    configured_startup_budget_with_isolate_memory_commit_percent(
+        *LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT,
+    )
+}
+
+fn configured_startup_budget_with_isolate_memory_commit_percent(
+    commit_percent: usize,
+) -> anyhow::Result<(StartupMemoryBudget, StartupIsolateMemoryAccounting)> {
     let isolate_workers =
         u64::try_from(*MAX_ISOLATE_WORKERS).context("MAX_ISOLATE_WORKERS does not fit in u64")?;
     let isolate_heap_per_worker = ISOLATE_MAX_USER_HEAP_SIZE
@@ -1339,14 +1403,27 @@ fn configured_startup_budget() -> anyhow::Result<StartupMemoryBudget> {
     let isolate_array_buffer_pool = u64::try_from(*ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE)?
         .checked_mul(isolate_workers)
         .context("configured isolate ArrayBuffer pool overflow")?;
-    StartupMemoryBudget::new(vec![
+    let accounted_isolate_heap_pool =
+        account_isolate_memory_capacity(isolate_heap_pool, commit_percent)?;
+    let accounted_isolate_array_buffer_pool =
+        account_isolate_memory_capacity(isolate_array_buffer_pool, commit_percent)?;
+    let isolate_memory = StartupIsolateMemoryAccounting {
+        raw_capacity_bytes: isolate_heap_pool
+            .checked_add(isolate_array_buffer_pool)
+            .context("configured raw isolate memory capacity overflow")?,
+        accounted_bytes: accounted_isolate_heap_pool
+            .checked_add(accounted_isolate_array_buffer_pool)
+            .context("configured accounted isolate memory capacity overflow")?,
+        commit_percent,
+    };
+    let budget = StartupMemoryBudget::new(vec![
         MemoryBudgetComponent {
             name: "isolate_heap_pool",
-            bytes: isolate_heap_pool,
+            bytes: accounted_isolate_heap_pool,
         },
         MemoryBudgetComponent {
             name: "isolate_array_buffer_pool",
-            bytes: isolate_array_buffer_pool,
+            bytes: accounted_isolate_array_buffer_pool,
         },
         MemoryBudgetComponent {
             name: "query_cache",
@@ -1383,7 +1460,8 @@ fn configured_startup_budget() -> anyhow::Result<StartupMemoryBudget> {
             name: "native_kernel_reserve",
             bytes: u64::try_from(*LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES)?,
         },
-    ])
+    ])?;
+    Ok((budget, isolate_memory))
 }
 
 fn startup_budget_headroom(
@@ -2346,7 +2424,9 @@ mod tests {
     #[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
     use super::allocator_arena_count;
     use super::{
+        account_isolate_memory_capacity,
         configured_startup_budget,
+        configured_startup_budget_with_isolate_memory_commit_percent,
         effective_cgroup_root_from,
         parse_malloc_info_arena_count,
         parse_process_status,
@@ -2754,7 +2834,7 @@ VmSwap:\t50 kB
 
     #[test]
     fn startup_budget_reserves_total_local_node_budget() {
-        let budget = configured_startup_budget().unwrap();
+        let (budget, _) = configured_startup_budget().unwrap();
         let node = budget
             .components
             .iter()
@@ -2767,8 +2847,43 @@ VmSwap:\t50 kB
     }
 
     #[test]
+    fn startup_budget_accounts_only_the_selected_isolate_capacity_fraction() {
+        let (full_budget, full_isolate_memory) =
+            configured_startup_budget_with_isolate_memory_commit_percent(100).unwrap();
+        let (partial_budget, partial_isolate_memory) =
+            configured_startup_budget_with_isolate_memory_commit_percent(75).unwrap();
+
+        assert_eq!(
+            full_isolate_memory.raw_capacity_bytes,
+            partial_isolate_memory.raw_capacity_bytes
+        );
+        assert_eq!(
+            full_isolate_memory.accounted_bytes,
+            full_isolate_memory.raw_capacity_bytes
+        );
+        assert_eq!(partial_isolate_memory.commit_percent, 75);
+        assert_eq!(
+            partial_isolate_memory.accounted_bytes,
+            account_isolate_memory_capacity(partial_isolate_memory.raw_capacity_bytes, 75).unwrap()
+        );
+        let fixed_budget = full_budget.total_bytes - full_isolate_memory.accounted_bytes;
+        assert_eq!(
+            partial_budget.total_bytes,
+            fixed_budget + partial_isolate_memory.accounted_bytes
+        );
+    }
+
+    #[test]
+    fn isolate_capacity_accounting_rounds_up_and_rejects_invalid_percentages() {
+        assert_eq!(account_isolate_memory_capacity(1, 75).unwrap(), 1);
+        assert_eq!(account_isolate_memory_capacity(101, 75).unwrap(), 76);
+        assert!(account_isolate_memory_capacity(100, 0).is_err());
+        assert!(account_isolate_memory_capacity(100, 101).is_err());
+    }
+
+    #[test]
     fn finite_cgroup_limit_covers_total_local_node_budget() {
-        let budget = configured_startup_budget().unwrap();
+        let (budget, _) = configured_startup_budget().unwrap();
         let root = TempDir::new().unwrap();
         fs::write(root.path().join("memory.current"), "0\n").unwrap();
         fs::write(

@@ -14,9 +14,11 @@ On Linux, startup checks a finite cgroup v2 `memory.max` before constructing the
 database caches, isolate pool, or local Node executor. The configured budget is
 the checked sum of:
 
-- `(ISOLATE_MAX_USER_HEAP_SIZE + ISOLATE_MAX_HEAP_EXTRA_SIZE) *
+- `LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT`, default `100`, of
+  `(ISOLATE_MAX_USER_HEAP_SIZE + ISOLATE_MAX_HEAP_EXTRA_SIZE) *
   MAX_ISOLATE_WORKERS`;
-- `ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE * MAX_ISOLATE_WORKERS`;
+- the same percentage of
+  `ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE * MAX_ISOLATE_WORKERS`;
 - `UDF_CACHE_MAX_SIZE` and `INDEX_CACHE_SIZE`;
 - `SOURCE_MAP_CACHE_MAX_SIZE_BYTES`, `FUNRUN_INDEX_CACHE_SIZE`,
   `FUNRUN_MODULE_CACHE_SIZE`, and `FUNRUN_CODE_CACHE_SIZE`;
@@ -30,6 +32,14 @@ exceeds a finite cgroup limit. It skips the feasibility failure when the cgroup
 memory controller is absent or unlimited. A malformed present controller file
 is a startup error.
 
+`LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT` accepts decimal integers
+from 1 through 100. A value below 100 permits aggregate startup overcommit for
+the isolate heap and ArrayBuffer ceilings. It does not change any per-isolate
+runtime limit, cache or Node allowance, native reserve, memory-pressure
+boundary, or cgroup limit. Operators should reduce it only when workload
+evidence supports the risk that many isolates can approach their independent
+ceilings at the same time.
+
 This calculation checks configuration feasibility; it is not current
 allocation and does not prove that every cache's weight exactly matches RSS.
 The Node budget entry is a planning allowance equal to a sampled Linux
@@ -37,10 +47,12 @@ direct-child graceful-retirement trigger, not a hard maximum. The child can
 grow between samples and while active requests drain. Short-lived descendant
 processes created while building dependencies are not sampled and remain part
 of the native and kernel reserve.
-The backend publishes each bounded component, the configured total, finite
-limit availability, and finite-limit headroom as startup memory-budget metrics.
-The periodic process, allocator, and cgroup metrics remain the source for
-actual use.
+The backend publishes each accounted component, the configured total, the
+selected isolate commit percentage, raw and accounted aggregate isolate bytes,
+finite-limit availability, and finite-limit headroom as startup memory-budget
+metrics. `isolate_memory_capacity_bytes` independently retains the raw
+per-worker and aggregate runtime ceilings. The periodic process, allocator, and
+cgroup metrics remain the source for actual use.
 
 The local Node executor also has independent lifetime controls:
 
