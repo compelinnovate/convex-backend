@@ -555,7 +555,10 @@ balanced between the two classes; resumptions precede initial starts within a
 selected class.
 
 Both minimums are `0` by default, which preserves the ordinary two-phase
-admission behavior. Positive minimums require a finite
+admission behavior. In this compatibility mode, a configured degradable leader
+cap must be strictly smaller than any configured finite
+`FUNRUN_ISOLATE_ACTIVE_THREADS`; `0` continues to mean unlimited. Positive
+minimums require a finite
 `FUNRUN_ISOLATE_ACTIVE_THREADS`, require
 `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`, and their sum cannot
 exceed the active-thread total. The degradable minimum cannot exceed the
@@ -570,3 +573,20 @@ nineteen degradable active executions after non-preemptive convergence. If
 either class is idle, the other can use all 28 permits. Use the total to
 control CPU oversubscription and select the minimums from measured progress,
 wait time, CPU headroom, and throttling.
+
+The backend publishes these bounded active-admission metric families:
+
+- `active_javascript_capacity_info{capacity_kind}`, where `capacity_kind` is
+  `total`, `protected_minimum`, or `degradable_minimum`; `total=0` means
+  unlimited;
+- `active_javascript_occupancy_info{active_javascript_class}`, which includes
+  permits that are held or granted but not yet collected;
+- `active_javascript_waiters_info{active_javascript_class,phase}`, which
+  excludes granted permits; and
+- `concurrency_permit_acquire_seconds{active_javascript_class,phase,status}`.
+
+The class labels are the fixed values `dependency`, `protected`, and
+`degradable`; phase is `initial` or `resume`, and acquisition status is
+`success` or `canceled`. See the
+[active-JavaScript admission design](../../patches/degradable_reactive_queries/active_javascript_admission.md)
+for the scheduler exposure invariant and grant policy.

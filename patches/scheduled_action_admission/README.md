@@ -73,7 +73,7 @@ Before user JavaScript can run, a V8 action crosses several independent boundari
 2. the application V8-action limiter;
 3. the isolate scheduler's bounded external queue;
 4. scheduler eligibility, including worker, per-client, and independent-action limits;
-5. the low-priority active-JavaScript permit wait; and
+5. the protected initial active-JavaScript permit wait; and
 6. assignment to an eligible isolate worker.
 
 Dependency capacity can add bounded overflow for work that releases an isolate-holding ancestor.

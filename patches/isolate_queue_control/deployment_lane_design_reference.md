@@ -243,7 +243,7 @@ oldest eligible entry across the complete buffer. That selection rule remains:
 - an older eligible ordinary request runs before a newer control-plane request;
 - an older eligible control-plane request runs before a newer ordinary request;
 - an ineligible entry can be skipped according to existing global, per-client,
-  shared-base, physical-total, and action-cap constraints;
+  shared-base, physical-total, action-cap, and exposed-active-class constraints;
 - dependency overflow remains eligibility, not unconditional priority below
   shared base.
 
@@ -334,14 +334,16 @@ own deadline until the selected request's later permit deadline. The companion
 shares queue state but does not keep admission open after the consuming
 receiver closes.
 
-The initial control-plane built-in value should be 30 seconds. Upstream now acquires
-the low-priority active-JavaScript permit before worker assignment, so this is
-an enqueue-to-active-permit budget: the original deadline bounds both queue
-residence and that permit wait. It is not a total deployment or JavaScript
-execution timeout. Existing V8, HTTP, proxy, CLI, and deployment-phase
-deadlines remain separate. Operators must keep those outer deadlines long
-enough for this admission budget plus expected execution and response time; the
-backend cannot validate remote caller or proxy timeouts at startup.
+The initial control-plane built-in value should be 30 seconds. The scheduler acquires
+the initial active-JavaScript permit before worker assignment, so this is an
+enqueue-to-active-permit budget: the original deadline bounds both queue
+residence and that permit wait. The permit uses the request's backend-owned
+class when class-aware admission is enabled and the phase-only compatibility
+policy otherwise. It is not a total deployment or JavaScript execution timeout.
+Existing V8, HTTP, proxy, CLI, and deployment-phase deadlines remain separate.
+Operators must keep those outer deadlines long enough for this admission budget
+plus expected execution and response time; the backend cannot validate remote
+caller or proxy timeouts at startup.
 
 Each post-admission analysis or evaluation retry is a new queue entry with a
 new hard deadline. The patch does not turn three bounded attempts into one
@@ -451,8 +453,8 @@ The bounded scheduler and lane telemetry includes these closed values:
 - `capacity_kind="control_plane_lane"` for the configured lane occupancy cap;
 - `config_kind="control_plane_hard_max_age_millis"` for its hard deadline;
 - rejection reasons `lane_full`, `queue_full`, `hard_expired`,
-  `caller_dropped`, `scheduler_closed`, and `no_worker` at their existing
-  ownership boundaries.
+  `caller_dropped`, `scheduler_closed`, and `delay_control_shed` at their
+  existing ownership boundaries.
 
 The enabled-state gauge is emitted on both queue policies. The control-plane
 capacity and deadline series are emitted only when the lane-aware queue is
@@ -495,11 +497,14 @@ cannot create the missing execution capacity.
 ## Interaction with other maintained patches
 
 [`README.md`](README.md) defines the combined operator contract for all four
-lanes. The control-plane feature extends the original three-lane implementation
-with one enum variant, one controller slot, one lane-local cap, and one longer
-deadline. Enabling the control-plane lane requires lane-aware queueing.
-Disabling the control-plane lane preserves lane-aware policy for dependency,
-independent-action, and ordinary requests.
+lanes. The
+[`IsolateDelayQueue` design reference](isolate_delay_queue_design_reference.md)
+defines the complete classification and execution model. The control-plane
+feature extends the original three-lane implementation with one enum variant,
+one controller slot, one lane-local cap, and one longer deadline. Enabling the
+control-plane lane requires lane-aware queueing. Disabling the control-plane
+lane preserves lane-aware policy for dependency, independent-action, and
+ordinary requests.
 
 [`dependency_capacity/README.md`](../dependency_capacity/README.md) supplies the
 shared-base and dependency-reserve worker and queue model. Control-plane work

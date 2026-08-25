@@ -44,7 +44,6 @@ use metrics::{
 use prometheus::VMHistogram;
 
 use crate::{
-    client::NO_AVAILABLE_WORKERS,
     context_cache::{
         ContextCacheClearReason,
         ReusableContextKind,
@@ -556,8 +555,6 @@ register_convex_counter!(
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum RejectedBeforeExecutionReason {
     ExpiredInQueue,
-    PerClientWorkerOverloaded,
-    WorkerPoolOverloaded,
     IsolateNotClean,
     InitialPermitTimeout,
     ExecuteQueueFull,
@@ -571,9 +568,6 @@ impl RejectedBeforeExecutionReason {
                 "Too many concurrent requests in a short period of time. Spread out your requests \
                  out over time or throttle them to avoid errors.",
             ),
-            Self::PerClientWorkerOverloaded | Self::WorkerPoolOverloaded => {
-                ErrorMetadata::rejected_before_execution("WorkerOverloaded", NO_AVAILABLE_WORKERS)
-            },
             Self::IsolateNotClean => ErrorMetadata::rejected_before_execution(
                 "IsolateNotClean",
                 "Selected isolate was not clean",
@@ -611,13 +605,12 @@ pub fn initialize_capacity_counters(name: &'static str) {
         "dependency_descendant_holder",
         "control_plane",
     ];
-    const SCHEDULER_REJECTION_REASONS: [&str; 6] = [
+    const SCHEDULER_REJECTION_REASONS: [&str; 5] = [
         "queue_full",
         "lane_full",
         "scheduler_closed",
         "delay_control_shed",
         "caller_dropped",
-        "no_worker",
     ];
     const QUEUE_LANES: [&str; 4] = [
         "dependency",
@@ -1198,8 +1191,7 @@ pub fn create_code_cache_timer() -> StatusTimer {
 
 register_convex_histogram!(
     CONCURRENCY_PERMIT_ACQUIRE_SECONDS,
-    "Time to acquire a concurrency permit. High latency indicate that isolate threads are \
-     oversubscribed and spend time waiting for CPU instead of waiting on async work",
+    "Time waiting for active-JavaScript admission by effective service class and phase",
     &[STATUS_LABEL[0], "active_javascript_class", "phase"]
 );
 
@@ -1230,17 +1222,17 @@ pub(crate) fn concurrency_permit_acquire_timer(
 
 register_convex_gauge!(
     ACTIVE_JAVASCRIPT_CAPACITY_INFO,
-    "Configured active-JavaScript admission capacity by kind",
+    "Configured active-JavaScript total and class minimums by kind; zero total means unlimited",
     &["capacity_kind"]
 );
 register_convex_gauge!(
     ACTIVE_JAVASCRIPT_OCCUPANCY_INFO,
-    "Active-JavaScript permits held or granted by service class",
+    "Active-JavaScript permits held or granted by effective service class",
     &["active_javascript_class"]
 );
 register_convex_gauge!(
     ACTIVE_JAVASCRIPT_WAITERS_INFO,
-    "Active-JavaScript permit waiters by service class and phase",
+    "Queued, not-yet-granted active-JavaScript waiters by effective service class and phase",
     &["active_javascript_class", "phase"]
 );
 
