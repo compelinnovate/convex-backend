@@ -109,16 +109,16 @@ Suppose shared-base worker capacity is 48, active-JavaScript capacity is 28, the
 gate is 32, and analysis concurrency is 4. Before this integration, 32 degradable leaders and four
 analysis attempts could directly present 36 roots to lower execution gates. With this integration,
 four analysis reservations leave at most 28 root-work permits for degradable leaders. The active
-gate independently guarantees protected and degradable progress through its configured service
-floors; analysis uses the protected class.
+gate independently applies non-preemptive protected and degradable service floors under
+two-class contention; analysis uses the protected class.
 
 This is intentionally not a mathematical bound on physical workers. One admitted query leader can
 spawn separately scheduled dependencies, and dependency work retains its existing reserve. Normal
 queries, mutations, actions, and non-degradable clients also bypass the elastic gate. The configured
 cap must therefore leave measured headroom at the application query gate, isolate shared base, and
 other lifetime limits. With active-JavaScript service floors enabled, the cap can exceed finite
-active capacity because these gates bound different resources. Without service floors, startup
-still requires finite active capacity to exceed the cap.
+active capacity because these gates bound different resources. Without service floors, any
+configured finite active capacity must exceed the cap; `0` continues to mean unlimited.
 
 The patch does not add an analysis-specific scheduler reservation. Analysis can still wait after
 gate admission when protected work or dependencies occupy workers, when active-JavaScript permits

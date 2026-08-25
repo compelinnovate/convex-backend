@@ -125,7 +125,10 @@ use value::{
 };
 
 use crate::{
-    application_function_runner::FunctionRouter,
+    application_function_runner::{
+        DatabaseFunctionKind,
+        FunctionRouter,
+    },
     audit_logging::AuditLogClient,
     function_log::FunctionExecutionLog,
     QueryReturn,
@@ -913,11 +916,10 @@ impl<RT: Runtime> CacheManager<RT> {
                             .execute_query_or_mutation(
                                 tx,
                                 path_and_args,
-                                UdfType::Query,
+                                DatabaseFunctionKind::Query(active_javascript_class),
                                 journal.clone(),
                                 context,
                                 scheduler_dependency,
-                                active_javascript_class,
                             )
                             .await?;
                         let FunctionOutcome::Query(mut query_outcome) = outcome else {

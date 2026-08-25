@@ -121,8 +121,9 @@ When both minimums are zero, class-aware admission is disabled completely. The
 active limiter retains the existing behavior in which all resumptions precede
 initial starts; dependencies and degradable execution both use ordinary active
 admission for their phase. In that mode the leader cap remains strictly below
-finite active capacity. With positive minimums, the leader cap can exceed `A`
-because `G` supplies admitted degradable execution progress.
+any configured finite active capacity; `0` continues to mean unlimited. With
+positive minimums, the leader cap can exceed `A` because `G` supplies admitted
+degradable execution progress.
 
 The leader cap remains strictly below the application query shared base and
 the isolate worker shared base. Active admission does not replace lifetime and

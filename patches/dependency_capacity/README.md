@@ -14,7 +14,7 @@ degradable-query integration gives dependency work the next grant at the already
 active-JavaScript gate when its service floors are enabled because that grant releases an
 isolate-holding ancestor.
 
-Upstream now has a distinct internal path for direct nested UDF callbacks. Those requests bypass
+Upstream has a distinct internal path for direct nested UDF callbacks. Those requests bypass
 CoDel and are selected before external queued requests. The active-JavaScript integration
 classifies them as dependencies. This patch keeps that upstream path intact. Its bounded `Q + R`
 CoDel admission remains
@@ -106,8 +106,8 @@ but it preserves the ancestor-release contract and is counted separately.
 The scheduler has two ingress paths with intentionally different waiting semantics:
 
 - Direct nested UDF callbacks use upstream's internal unbounded channel. The scheduler polls this
-  path before the external stream, it has no CoDel expiry, and it acquires a dependency-class
-  active-JavaScript permit before worker assignment. Its local
+  path before the external stream, it has no CoDel expiry, and it acquires its active-JavaScript
+  permit before worker assignment. Its local
   buffer discards closed callers and selects the oldest request eligible in the current worker
   snapshot, so an older callback at one client's total cannot hide an eligible callback for
   another client.
@@ -125,11 +125,11 @@ eligible external work below shared base capacity; they become the only external
 when the shared base is full.
 
 `FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate active-JavaScript permit gate with one fixed
-total. With the degradable-query patch applied, dependency work receives the next available grant,
-protected and degradable application work use work-conserving service floors, and resumptions
-precede initial starts within the selected class. The floors reserve no idle permits and add no
-capacity. A dependency can be eligible for worker overflow and still wait for an active permit or
-CPU behind non-preemptible JavaScript that already holds the finite gate.
+total. When active-JavaScript service floors are enabled, dependency work receives the next
+available grant, protected and degradable application work use work-conserving service floors, and
+resumptions precede initial starts within the selected class. The floors reserve no idle permits
+and add no capacity. A dependency can be eligible for worker overflow and still wait for an active
+permit or CPU behind non-preemptible JavaScript that already holds the finite gate.
 
 Initial external permit waits remain bounded by the request's original queue deadline: the
 applicable CoDel expiration or lane hard deadline. Direct separately scheduled nested transactional
@@ -140,13 +140,15 @@ permit. The scheduler exposes one external waiter per active class and one inter
 waiter, reserving worker eligibility for each exposed request. A non-consuming queue expiry
 companion continues enforcing every retained entry's deadline.
 
-Scheduler dependency ownership and active-permit priority intentionally differ at resource
-boundaries. A transactional descendant that retains an isolate-holding ancestor is eligible for
-scheduler overflow and receives high active-permit priority. An action callback can be eligible for
-scheduler overflow while retaining root-style, low-priority initial active-permit acquisition. An
-already-started independent root reacquires its suspended permit at high priority even though it is
-not a scheduler dependency. The patch does not add active-permit overflow because doing so could
-oversubscribe the host and move rather than remove the bottleneck.
+Scheduler dependency ownership and active-permit phase are separate properties. With
+active-JavaScript service floors enabled, every ancestor-unblocking request, including an external
+action callback, uses the `Dependency` class and receives the next available grant. An independent
+root stays in its application class when it reacquires a suspended permit; resumption priority
+applies within that class. With both floors disabled, every class collapses to the phase-only
+compatibility policy: direct internal callbacks and reacquisitions use the resumption tier, while
+external callbacks remain initial starts bounded by their original queue deadline. Neither mode
+adds active-permit overflow because doing so could oversubscribe the host and move rather than
+remove the bottleneck.
 
 ## Configuration
 

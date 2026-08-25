@@ -311,7 +311,6 @@ impl AnalyzeResponseSender {
 
 pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
 pub const PAUSE_REQUEST: &str = "pause_request";
-pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
 
 /// Caller-drop signal for one isolate execution tree.
 ///
@@ -751,9 +750,9 @@ fn pending_active_javascript_class_index(
     class: ActiveJavascriptClass,
     class_aware_admission_enabled: bool,
 ) -> usize {
-    // The zero-minimum compatibility mode has one phase-only external wait,
-    // just as it did before service classes existed. Distinguish pending
-    // classes only when the active limiter will distinguish their grants.
+    // The zero-minimum compatibility contract has one phase-only external
+    // wait. Distinguish pending classes only when the active limiter will
+    // distinguish their grants.
     let class = if class_aware_admission_enabled {
         class
     } else {
@@ -918,20 +917,6 @@ impl SchedulerStateSnapshot {
 
     fn dependency_dispatch_uses_reserve(&self) -> bool {
         self.active_counts.total >= self.base_worker_capacity
-    }
-}
-
-fn worker_rejection_reason(
-    eligibility: IsolateQueueEligibility,
-) -> Option<RejectedBeforeExecutionReason> {
-    if eligibility.is_eligible() {
-        None
-    } else if eligibility.per_client_total || eligibility.per_client_base {
-        // Preserve the scheduler's historical per-client-first classification
-        // if both a client fence and a global fence became full concurrently.
-        Some(RejectedBeforeExecutionReason::PerClientWorkerOverloaded)
-    } else {
-        Some(RejectedBeforeExecutionReason::WorkerPoolOverloaded)
     }
 }
 
@@ -1241,6 +1226,7 @@ pub enum RequestType<RT: Runtime> {
         is_control_plane: bool,
         reuses_database_context: bool,
         fail_worker: bool,
+        dispatch_observer: Option<mpsc::UnboundedSender<usize>>,
         started: mpsc::UnboundedSender<usize>,
         completion: oneshot::Receiver<()>,
         response: oneshot::Sender<anyhow::Result<()>>,
@@ -2284,8 +2270,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
     /// if at least one request is active for that client.
     in_progress_counts_by_client: HashMap<String, ActiveRequestCounts>,
     in_progress_counts: ActiveRequestCounts,
-    /// Worker-capacity reservations for external requests that left the queue
-    /// and are waiting for an initial active-JavaScript permit.
+    /// Worker-capacity reservations for selected external class waiters and
+    /// the direct internal dependency waiter while they acquire an initial
+    /// active-JavaScript permit. Each reservation is released before worker
+    /// assignment or terminal rejection.
     pending_permit_counts_by_client: HashMap<String, ActiveRequestCounts>,
     pending_permit_counts: ActiveRequestCounts,
     /// Externally visible active-worker accounting. The worker request owns the
@@ -2436,6 +2424,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
 
     fn reserve_pending_permit(&mut self, request: &Request<RT>) {
         let properties = request.scheduling_properties(self.control_plane_lane_enabled);
+        assert!(
+            self.state_snapshot()
+                .can_start_request(properties, &request.client_id),
+            "selected active-JavaScript waiter cannot reserve worker capacity"
+        );
         self.pending_permit_counts.increment(properties);
         self.pending_permit_counts_by_client
             .entry(request.client_id.clone())
@@ -2620,22 +2613,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                         },
                     }
                 },
-                request = internal_request_stream.next(),
-                if internal_request_stream_open && !has_pending_internal => {
-                    let Some(request) = request else {
-                        internal_request_stream_open = false;
-                        continue;
-                    };
-                    // Keep one internal dependency visible to the active gate.
-                    // Its worker reservation prevents concurrent external
-                    // permit waits from consuming the slot needed to release
-                    // its isolate-holding ancestor.
-                    self.reserve_pending_permit(&request);
-                    pending_internal_permits.push(wait_for_internal_permit(
-                        self.worker.config().limiter.clone(),
-                        request,
-                    ));
-                },
+                // Complete resource-owning waits before selecting fresh work.
+                // An acquired outcome may already own both an active permit
+                // and a worker reservation; biased fresh ingress must not
+                // indefinitely delay its dispatch or cancellation cleanup.
                 pending = pending_external_permits.next(), if has_pending_external => {
                     let Some(PendingExternalPermit {
                         request,
@@ -2679,6 +2660,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                             request.reject(RejectedBeforeExecutionReason::InitialPermitTimeout);
                         },
                     }
+                },
+                request = internal_request_stream.next(),
+                if internal_request_stream_open && !has_pending_internal => {
+                    let Some(request) = request else {
+                        internal_request_stream_open = false;
+                        continue;
+                    };
+                    // Keep one internal dependency visible to the active gate.
+                    // Its worker reservation prevents concurrent external
+                    // permit waits from consuming the slot needed to release
+                    // its isolate-holding ancestor.
+                    self.reserve_pending_permit(&request);
+                    pending_internal_permits.push(wait_for_internal_permit(
+                        self.worker.config().limiter.clone(),
+                        request,
+                    ));
                 },
                 output = external_request_stream.next(), if external_request_stream_open => {
                     let Some(IsolateQueueOutput {
@@ -2793,24 +2790,23 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             log_scheduler_caller_dropped(self.worker.config().name, scheduling_properties);
             return SchedulerDispatchOutcome::Continue;
         }
-        let dispatch_state = self.state_snapshot();
+        #[cfg(test)]
+        if let RequestType::Test {
+            id,
+            dispatch_observer: Some(dispatch_observer),
+            ..
+        } = &request.inner
+        {
+            dispatch_observer
+                .send(*id)
+                .expect("scheduler dispatch observer dropped early");
+        }
         let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
-            && dispatch_state.dependency_dispatch_uses_reserve();
+            && self.state_snapshot().dependency_dispatch_uses_reserve();
         let WorkerSelection {
             worker_id,
             context_affinity,
-        } = match self.get_worker(&request, &dispatch_state) {
-            Ok(selection) => selection,
-            Err(reason) => {
-                metrics::log_scheduler_request_rejected(
-                    self.worker.config().name,
-                    scheduling_properties.as_label(),
-                    "no_worker",
-                );
-                request.reject(reason);
-                return SchedulerDispatchOutcome::Continue;
-            },
-        };
+        } = self.get_worker(&request);
         let (done_sender, done_receiver) = oneshot::channel();
         let client_id = request.client_id.clone();
         let st = ActiveWorkerState {
@@ -2874,29 +2870,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
     }
 
     /// Find a worker for the request's client.
-    /// Returns an error if no worker can be allocated for this client.
-    ///
     /// Note that the selected worker is removed from the
     /// `self.available_workers` state, so the caller is responsible for using
     /// the worker and returning it back to `self.available_workers` after it is
     /// done.
-    fn get_worker(
-        &mut self,
-        request: &Request<RT>,
-        state: &SchedulerStateSnapshot,
-    ) -> Result<WorkerSelection, RejectedBeforeExecutionReason> {
+    fn get_worker(&mut self, request: &Request<RT>) -> WorkerSelection {
         let client_id = request.client_id.as_str();
-        let eligibility = state.request_eligibility(
-            request.scheduling_properties(self.control_plane_lane_enabled),
-            client_id,
-        );
-        if let Some(reason) = worker_rejection_reason(eligibility) {
-            tracing::warn!(
-                "Selected request no longer satisfies {} scheduler capacity constraints",
-                self.worker.config().name,
-            );
-            return Err(reason);
-        }
+        // The scheduler removed this request's reservation immediately before
+        // calling us, without an intervening await. Do not rerun class-sensitive
+        // eligibility here: a later dependency may have reserved overflow and
+        // dispatched first, but it cannot invalidate this request's earlier
+        // shared-base reservation.
         let reusable_context_kind = request.reusable_context_kind();
         // Try to find an existing worker for this client.
         if let Some((client_id, mut workers)) = self.available_workers.remove_entry(client_id) {
@@ -2923,10 +2907,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             if !workers.is_empty() {
                 self.available_workers.insert(client_id, workers);
             }
-            return Ok(WorkerSelection {
+            return WorkerSelection {
                 worker_id: worker.worker_id,
                 context_affinity: reusable_context_kind.map(|context_kind| (context_kind, outcome)),
-            });
+            };
         }
         // If we've recently started up and haven't yet created `max_workers` threads,
         // create a new worker instead of "stealing" some other client's worker.
@@ -2947,11 +2931,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                 self.worker.config().name,
                 self.worker_senders.len() - 1
             );
-            return Ok(WorkerSelection {
+            return WorkerSelection {
                 worker_id: self.worker_senders.len() - 1,
                 context_affinity: reusable_context_kind
                     .map(|context_kind| (context_kind, SchedulerContextAffinityOutcome::NewWorker)),
-            });
+            };
         }
         // No existing worker for this client and we've already started the max number
         // of workers -- just grab the least recently used worker. This worker is least
@@ -2966,10 +2950,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                     .last_used_ts
             })
         else {
-            // No available workers. This should be unreachable since we don't
-            // pull a request from the queue until there is a free worker.
-            tracing::error!("unexpected: couldn't find a worker?");
-            return Err(RejectedBeforeExecutionReason::WorkerPoolOverloaded);
+            panic!("worker-capacity reservation has no available isolate worker");
         };
         let worker = workers
             .pop_back()
@@ -2983,10 +2964,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             let key = key.clone();
             self.available_workers.remove(&key);
         }
-        Ok(WorkerSelection {
+        WorkerSelection {
             worker_id: worker.worker_id,
             context_affinity,
-        })
+        }
     }
 
     fn aggregate_heap_stats(&self) -> IsolateHeapStats {
@@ -3286,7 +3267,6 @@ mod tests {
         per_client_worker_capacity,
         validate_control_plane_lane_config,
         wait_for_external_permit,
-        worker_rejection_reason,
         ActiveRequestCounts,
         AnalyzeResponseSender,
         CancelExecutionOnDrop,
@@ -3432,6 +3412,7 @@ mod tests {
                         is_control_plane: _,
                         reuses_database_context: _,
                         fail_worker,
+                        dispatch_observer: _,
                         started,
                         completion,
                         response,
@@ -3566,6 +3547,19 @@ mod tests {
         response: oneshot::Receiver<anyhow::Result<()>>,
     }
 
+    impl PendingTestRequest {
+        fn with_dispatch_observer(mut self, observer: mpsc::UnboundedSender<usize>) -> Self {
+            let RequestType::Test {
+                dispatch_observer, ..
+            } = &mut self.request.inner
+            else {
+                unreachable!("test request helper constructed a non-test request")
+            };
+            *dispatch_observer = Some(observer);
+            self
+        }
+    }
+
     struct InFlightTestRequest {
         completion: oneshot::Sender<()>,
         response: oneshot::Receiver<anyhow::Result<()>>,
@@ -3617,6 +3611,7 @@ mod tests {
             is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
             reuses_database_context: false,
             fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
+            dispatch_observer: None,
             started,
             completion: completion_receiver,
             response: response_sender,
@@ -4399,25 +4394,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_worker_recheck_distinguishes_global_and_per_client_overload() {
-        assert!(matches!(
-            worker_rejection_reason(IsolateQueueEligibility {
-                physical_total: true,
-                ..Default::default()
-            }),
-            Some(RejectedBeforeExecutionReason::WorkerPoolOverloaded)
-        ));
-        assert!(matches!(
-            worker_rejection_reason(IsolateQueueEligibility {
-                physical_total: true,
-                per_client_total: true,
-                ..Default::default()
-            }),
-            Some(RejectedBeforeExecutionReason::PerClientWorkerOverloaded)
-        ));
-    }
-
-    #[test]
     fn per_client_capacity_handles_large_worker_totals_without_overflow() {
         assert_eq!(
             per_client_worker_capacity(usize::MAX, 50),
@@ -4517,10 +4493,7 @@ mod tests {
         };
         *reuses_database_context = true;
 
-        let state = scheduler.state_snapshot();
-        let selection = scheduler
-            .get_worker(&request, &state)
-            .expect("idle same-client worker was not selected");
+        let selection = scheduler.get_worker(&request);
         assert_eq!(selection.worker_id, 0);
         assert_eq!(
             selection.context_affinity,
@@ -4913,18 +4886,190 @@ mod tests {
     }
 
     #[test]
+    fn dependency_dispatch_preserves_earlier_shared_base_reservation() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("scheduler_reservation_dispatch_order_test", async move {
+            let limiter = ConcurrencyLimiter::new(2);
+            let first_held = limiter
+                .acquire(Arc::new("first-held".to_owned()), false)
+                .await;
+            let second_held = limiter
+                .acquire(Arc::new("second-held".to_owned()), false)
+                .await;
+            let mut harness = SchedulerHarness::new(scheduler_rt, 2, 1, 1, 100, 64);
+            harness.set_concurrency_limiter(limiter.clone());
+            let ordinary = harness.enqueue_test(1, TestRequestKind::Independent);
+            harness.start();
+
+            tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, async {
+                while limiter.waiting_permits(
+                    ActiveJavascriptClass::Protected,
+                    ConcurrencyPermitPhase::Initial,
+                ) != 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ordinary request did not reserve shared-base worker capacity");
+
+            let dependency = harness.enqueue_internal_test(2);
+            tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, async {
+                while limiter.waiting_permits(
+                    ActiveJavascriptClass::Protected,
+                    ConcurrencyPermitPhase::Resume,
+                ) != 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("dependency did not reserve worker overflow");
+
+            drop(first_held);
+            assert_eq!(harness.next_started().await, 2);
+            drop(second_held);
+            assert_eq!(harness.next_started().await, 1);
+
+            dependency.complete().await;
+            ordinary.complete().await;
+            harness.shutdown().await;
+            assert_eq!(limiter.active_permits(), 0);
+        });
+    }
+
+    #[test]
+    fn completed_external_permit_precedes_fresh_internal_selection() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("scheduler_completed_permit_order_test", async move {
+            let limiter = ConcurrencyLimiter::new(3);
+            let held_permits = futures::future::join_all(
+                (0..3).map(|index| limiter.acquire(Arc::new(format!("held-{index}")), false)),
+            )
+            .await;
+            let mut harness = SchedulerHarness::new(scheduler_rt, 3, 1, 1, 100, 64);
+            harness.set_concurrency_limiter(limiter.clone());
+            let (dispatch_observer, mut dispatched) = mpsc::unbounded_channel();
+
+            let PendingTestRequest {
+                request,
+                completion,
+                response,
+            } = test_request(
+                1,
+                TestRequestKind::Independent,
+                harness.started_sender.clone(),
+            )
+            .with_dispatch_observer(dispatch_observer.clone());
+            harness.enqueue(request);
+            let external = InFlightTestRequest {
+                completion,
+                response,
+            };
+            harness.start();
+            tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, async {
+                while limiter.waiting_permits(
+                    ActiveJavascriptClass::Protected,
+                    ConcurrencyPermitPhase::Initial,
+                ) != 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("external request did not enter its active-permit wait");
+
+            let PendingTestRequest {
+                request,
+                completion,
+                response,
+            } = test_request(
+                2,
+                TestRequestKind::Dependency,
+                harness.started_sender.clone(),
+            )
+            .with_dispatch_observer(dispatch_observer.clone());
+            harness
+                .internal_sender
+                .send(request)
+                .expect("test internal scheduler queue is closed");
+            let first_dependency = InFlightTestRequest {
+                completion,
+                response,
+            };
+            tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, async {
+                while limiter.waiting_permits(
+                    ActiveJavascriptClass::Protected,
+                    ConcurrencyPermitPhase::Resume,
+                ) != 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("internal dependency did not enter its active-permit wait");
+
+            let PendingTestRequest {
+                request,
+                completion,
+                response,
+            } = test_request(
+                3,
+                TestRequestKind::Dependency,
+                harness.started_sender.clone(),
+            )
+            .with_dispatch_observer(dispatch_observer);
+            harness
+                .internal_sender
+                .send(request)
+                .expect("test internal scheduler queue is closed");
+            let fresh_dependency = InFlightTestRequest {
+                completion,
+                response,
+            };
+
+            drop(held_permits);
+            assert_eq!(dispatched.recv().await, Some(2));
+            assert_eq!(
+                dispatched.recv().await,
+                Some(1),
+                "fresh internal work overtook a resource-owning external wait"
+            );
+            assert_eq!(dispatched.recv().await, Some(3));
+
+            first_dependency.complete().await;
+            external.complete().await;
+            fresh_dependency.complete().await;
+            harness.shutdown().await;
+            assert_eq!(limiter.active_permits(), 0);
+        });
+    }
+
+    #[test]
     fn pending_permit_reservations_apply_worker_and_client_limits() {
         let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
         let rt = ProdRuntime::new(&tokio);
         let scheduler_rt = SchedulerTestRuntime::new(rt);
 
-        let mut global_harness = SchedulerHarness::new(scheduler_rt.clone(), 1, 1, 1, 100, 4);
+        let mut global_harness = SchedulerHarness::new(scheduler_rt.clone(), 2, 1, 1, 100, 4);
         let PendingTestRequest {
             request: global_pending,
             ..
         } = test_request(
             1,
             TestRequestKind::Degradable,
+            global_harness.started_sender.clone(),
+        );
+        let PendingTestRequest {
+            request: global_dependency,
+            ..
+        } = test_request(
+            2,
+            TestRequestKind::Dependency,
             global_harness.started_sender.clone(),
         );
         let global_scheduler = &mut global_harness
@@ -4935,20 +5080,54 @@ mod tests {
         global_scheduler.reserve_pending_permit(&global_pending);
         let global_state = global_scheduler.state_snapshot();
         let candidate = properties(false, false, false);
+        let dependency_candidate = properties(true, false, false);
+        assert!(
+            !global_state
+                .request_eligibility(candidate, "another_deployment")
+                .physical_total
+        );
+        assert!(
+            global_state
+                .request_eligibility(candidate, "another_deployment")
+                .shared_base
+        );
+        assert!(global_state
+            .request_eligibility(dependency_candidate, &global_dependency.client_id)
+            .is_eligible());
+        global_scheduler.reserve_pending_permit(&global_dependency);
+        let global_state = global_scheduler.state_snapshot();
         assert!(
             global_state
                 .request_eligibility(candidate, "another_deployment")
                 .physical_total
         );
+        assert!(
+            global_state
+                .request_eligibility(dependency_candidate, "another_deployment")
+                .physical_total
+        );
+        global_scheduler.release_pending_permit(&global_dependency);
         global_scheduler.release_pending_permit(&global_pending);
+        assert!(global_scheduler
+            .state_snapshot()
+            .request_eligibility(candidate, "another_deployment")
+            .is_eligible());
 
-        let mut client_harness = SchedulerHarness::new(scheduler_rt, 2, 2, 2, 50, 4);
+        let mut client_harness = SchedulerHarness::new(scheduler_rt, 4, 3, 3, 50, 4);
         let PendingTestRequest {
             request: client_pending,
             ..
         } = test_request(
-            2,
+            3,
             TestRequestKind::Degradable,
+            client_harness.started_sender.clone(),
+        );
+        let PendingTestRequest {
+            request: client_dependency,
+            ..
+        } = test_request(
+            4,
+            TestRequestKind::Dependency,
             client_harness.started_sender.clone(),
         );
         let client_scheduler = &mut client_harness
@@ -4961,8 +5140,25 @@ mod tests {
         let client_eligibility =
             client_state.request_eligibility(candidate, &client_pending.client_id);
         assert!(!client_eligibility.physical_total);
+        assert!(client_eligibility.per_client_base);
+        assert!(client_state
+            .request_eligibility(dependency_candidate, &client_dependency.client_id)
+            .is_eligible());
+        client_scheduler.reserve_pending_permit(&client_dependency);
+        let client_state = client_scheduler.state_snapshot();
+        let client_eligibility =
+            client_state.request_eligibility(dependency_candidate, &client_dependency.client_id);
+        assert!(!client_eligibility.physical_total);
         assert!(client_eligibility.per_client_total);
+        assert!(client_state
+            .request_eligibility(candidate, "another_deployment")
+            .is_eligible());
+        client_scheduler.release_pending_permit(&client_dependency);
         client_scheduler.release_pending_permit(&client_pending);
+        assert!(client_scheduler
+            .state_snapshot()
+            .request_eligibility(candidate, &client_pending.client_id)
+            .is_eligible());
     }
 
     #[test]

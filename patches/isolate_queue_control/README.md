@@ -11,6 +11,15 @@ evaluation requests into a bounded `control_plane` lane with a longer hard deadl
 shedding. Neither feature creates execution capacity, replaces worker limits, or grants
 unconditional dispatch priority.
 
+The detailed
+[`IsolateDelayQueue` design reference](isolate_delay_queue_design_reference.md)
+documents the queue's classification axes, selection and lifecycle mechanics,
+and interactions with dependency capacity, degradable queries, active-JavaScript
+admission, deployment pacing, HTTP admission, scheduled actions, and context
+reuse. The
+[`deployment-lane design reference`](deployment_lane_design_reference.md)
+preserves the control-plane-specific motivation and alternatives.
+
 ## Relationship to generic CoDel
 
 The isolate scheduler constructs exactly one external queue implementation when
@@ -79,7 +88,9 @@ only when that request is currently blocked by one or more of:
 - shared-base worker capacity;
 - the per-client total;
 - the per-client shared base;
-- the independent-action cap.
+- the independent-action cap;
+- an already exposed initial active-JavaScript waiter for the same effective
+  service class.
 
 This selection rule preserves FIFO among simultaneously eligible requests and
 allows work for one client or class to proceed around an ineligible head. It
@@ -160,12 +171,13 @@ in the same snapshot; FIFO remains intact among simultaneously eligible
 internal callbacks.
 
 After an external entry becomes scheduler-eligible, its original hard deadline
-continues to bound the low-priority active-JavaScript permit wait. The worker is
+continues to bound its initial active-JavaScript permit wait. The worker is
 assigned only after that permit is acquired. Direct internal callbacks instead
-use upstream's high-priority permit wait without a CoDel deadline because those
-nested requests cannot be retried safely. Both paths still consume the same
-physical worker total and dependency reserve when the scheduler assigns a
-worker.
+use the backend-owned dependency class without a CoDel deadline because those
+nested requests cannot be retried safely. When class-aware admission is
+disabled, these waits retain the phase-only compatibility policy. Both paths
+still consume the same physical worker total and dependency reserve when the
+scheduler assigns a worker.
 
 The periodic lane metrics reporter shares only the locked queue state. It does
 not clone receiver wake state or keep the queue logically open. The expiry
@@ -296,7 +308,7 @@ control-plane classification is disabled. Enabling the deployment lane also adds
 `scheduler_class="control_plane"`; `isolate_control_plane_lane_enabled_info{pool_name}` proves
 whether that classification is effective.
 Rejection reasons distinguish `lane_full`, `queue_full`, `hard_expired`, `caller_dropped`,
-`scheduler_closed`, and `no_worker`. `delay_control_shed` and dependency-reserve use for
+`scheduler_closed`, and `delay_control_shed`. Delay-control shedding and dependency-reserve use for
 `control_plane` are invariant violations and must remain zero.
 
 The patch extends the dependency-capacity scheduler counter initialization with the control-plane
@@ -365,8 +377,8 @@ space. A full shared base rejects control-plane work even when dependency-reserv
 Control-plane entries participate in delay observations and overload metrics but are never rejected
 by adaptive delay shedding. They still fail on lane-full or shared-queue admission, caller drop,
 their finite hard deadline, scheduler closure, or worker failure. The built-in 30-second deadline is
-an enqueue-to-active-permit budget: it bounds both queue residence and the low-priority
-active-JavaScript permit wait that now precedes worker assignment. V8 execution, HTTP, proxy, CLI,
+an enqueue-to-active-permit budget: it bounds both queue residence and the initial
+active-JavaScript permit wait that precedes worker assignment. V8 execution, HTTP, proxy, CLI,
 and deployment-phase timeouts remain separate.
 
 Each post-admission analysis or evaluation retry is a new queue entry with a new deadline. The
@@ -496,10 +508,11 @@ has an unambiguous rollback. Context reuse can be disabled without changing
 queue state; queue control can be disabled without changing context semantics.
 
 `FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate CPU-execution gate. An external request acquires
-its initial low-priority active-thread permit before worker assignment. Once execution begins, it
+its initial class-aware active-thread permit before worker assignment. Once execution begins, it
 can temporarily release that permit during an asynchronous wait while retaining the assigned
-worker, then use the existing high-priority reacquisition path. Queue delay control cannot create
-CPU capacity or reserve active-thread permits for dependencies.
+worker, then reacquire in the resume phase of the same class. Backend-derived dependencies take
+precedence when class-aware admission is enabled. Queue delay control cannot create CPU capacity
+or reserve active-thread permits for dependencies.
 
 Query coalescing and application dependency gates run before the isolate queue.
 They must continue propagating dependency role so a child does not wait behind

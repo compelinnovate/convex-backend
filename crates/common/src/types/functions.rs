@@ -139,14 +139,18 @@ pub enum SchedulerDependencyClass {
 
 impl SchedulerDependencyClass {
     pub fn unblocks_ancestor(&self) -> bool {
-        matches!(self, Self::UnblocksAncestor)
+        match self {
+            Self::Independent => false,
+            Self::UnblocksAncestor => true,
+        }
     }
 }
 
 /// Service class used by the finite active-JavaScript admission gate.
 ///
-/// The class is backend-owned. A client can opt an independent root query down
-/// to `Degradable`, but only the runtime can create `Dependency` work.
+/// The class is backend-owned. The query cache assigns `Degradable` only after
+/// admitting an independent root query cache miss; a client declaration alone
+/// does not assign it. Only runtime-derived ancestry creates `Dependency` work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ActiveJavascriptClass {
     Dependency,
@@ -156,15 +160,16 @@ pub enum ActiveJavascriptClass {
 
 impl ActiveJavascriptClass {
     pub fn for_scheduler_dependency(self, dependency: SchedulerDependencyClass) -> Self {
-        if dependency.unblocks_ancestor() {
-            Self::Dependency
-        } else {
-            assert_ne!(
-                self,
-                Self::Dependency,
-                "dependency active JavaScript requires ancestor-unblocking scheduler ownership"
-            );
-            self
+        match dependency {
+            SchedulerDependencyClass::Independent => {
+                assert_ne!(
+                    self,
+                    Self::Dependency,
+                    "dependency active JavaScript requires ancestor-unblocking scheduler ownership"
+                );
+                self
+            },
+            SchedulerDependencyClass::UnblocksAncestor => Self::Dependency,
         }
     }
 }

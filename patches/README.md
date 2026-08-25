@@ -6,9 +6,11 @@ a patch, preserve its prerequisites, and verify the effective configuration and 
 backend replacement.
 
 The maintained backend source chain normally keeps each product patch in its own operator-adoption
-commit; repository-maintenance commits can remain separate. When lifecycle ownership spans patches,
-an explicitly ordered corrective integration commit may complete several earlier adoption commits;
-the owning essays identify those compositions. Lane-aware queueing and its optional deployment
+commit; repository-maintenance commits can remain separate. Patch-history is also used to preserve
+fine-grained bisectability when one adopter-facing feature is developed from several historical
+seams. When lifecycle ownership spans patches, an explicitly ordered corrective integration commit
+may complete several earlier adoption commits; the owning essays identify those compositions.
+Lane-aware queueing and its optional deployment
 extension are one queue-control patch. The matching degradable-query client half is maintained in
 `convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
 chain. Non-committing codegen analysis likewise has a matching CLI commit, with the combined
@@ -291,7 +293,8 @@ adoption contract documented in the backend essay.
   subscriptions stay mounted.
 - Activation: backend admission is inert while
   `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is unset. Clients must explicitly send the
-  degradable declaration; normal clients, mutations, actions, and dependencies remain normal.
+  degradable declaration; normal clients, mutations, and actions remain outside the degradable
+  sub-cap, while dependencies retain their backend-derived treatment.
   Optional protected and degradable active-JavaScript minimums provide work-conserving execution
   progress when the leader cap exceeds active-JavaScript capacity.
 - Rollback: remove the application opt-in first, then unset the backend cap. The protocol fields can
@@ -299,11 +302,18 @@ adoption contract documented in the backend essay.
 
 ## Detailed design references
 
-These files preserve the full earlier analysis without creating additional operator adoption units:
+These files preserve detailed implementation and design analysis without creating additional
+operator adoption units:
 
 - [Combined dependency and HTTP capacity design](dependency_capacity/design_reference.md)
   retains the benchmark tables, full stage model, metrics interpretation, and application coverage
-  matrix that preceded the two concise adoption essays.
+  matrix that preceded the two concise adoption essays. Its phase-only active-permit discussion
+  describes zero-floor compatibility mode; the class-aware policy is specified in the degradable
+  active-JavaScript admission note below.
+- [Isolate delay queue design](isolate_queue_control/isolate_delay_queue_design_reference.md)
+  defines the queue-lane, scheduler-property, active-class, and active-permit-phase distinctions;
+  the oldest-eligible selection and lifecycle mechanics; and interactions with the surrounding
+  admission and execution patches.
 - [Deployment control-plane lane design](isolate_queue_control/deployment_lane_design_reference.md) retains
   the complete classifier, FIFO and reserve proof, deferred worker-reservation design, rejected
   alternatives, and test matrix.

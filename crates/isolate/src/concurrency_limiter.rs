@@ -43,12 +43,13 @@ pub(crate) enum ConcurrencyPermitPhase {
 /// Limits how many isolate threads can actively run JavaScript at the same
 /// time.
 ///
-/// Dependency work always runs first because it releases an isolate-holding
-/// ancestor. When class minimums are configured, protected and degradable work
-/// each receive a non-preemptive service floor under contention and borrow all
+/// When class minimums are configured, dependency work runs first because it
+/// releases an isolate-holding ancestor. Protected and degradable work each
+/// receive a non-preemptive service floor under contention and borrow all
 /// capacity the other class does not need. Elastic occupancy is balanced
-/// between the two classes. Resumptions precede initial starts within the
-/// selected class.
+/// between the two classes, and resumptions precede initial starts within the
+/// selected class. Without class minimums, the limiter retains its phase-only
+/// compatibility policy.
 #[derive(Clone, Debug)]
 pub struct ConcurrencyLimiter {
     inner: Arc<ConcurrencyLimiterInner>,
@@ -62,9 +63,9 @@ struct ConcurrencyLimiterInner {
     degradable_minimum: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum WaiterState {
-    Waiting,
+    Waiting(oneshot::Sender<()>),
     Granted,
 }
 
@@ -72,7 +73,6 @@ enum WaiterState {
 struct Waiter {
     queue: WaiterQueue,
     state: WaiterState,
-    sender: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Debug)]
@@ -152,7 +152,7 @@ struct ActivePermitsTracker {
     granted_by_class: [usize; 3],
     waiters: Slab<Waiter>,
     queues: [VecDeque<usize>; WaiterQueue::COUNT],
-    next_elastic_class: ActiveJavascriptClass,
+    next_tied_class: ActiveJavascriptClass,
 }
 
 impl ConcurrencyLimiter {
@@ -175,6 +175,10 @@ impl ConcurrencyLimiter {
             "protected and degradable minimums must be enabled together"
         );
         assert!(
+            protected_minimum == 0 || max_concurrency != usize::MAX,
+            "active-JavaScript class minimums require finite total capacity"
+        );
+        assert!(
             protected_minimum
                 .checked_add(degradable_minimum)
                 .is_some_and(|sum| sum <= max_concurrency),
@@ -188,7 +192,7 @@ impl ConcurrencyLimiter {
                     granted_by_class: [0; 3],
                     waiters: Slab::new(),
                     queues: array::from_fn(|_| VecDeque::new()),
-                    next_elastic_class: ActiveJavascriptClass::Degradable,
+                    next_tied_class: ActiveJavascriptClass::Degradable,
                 }),
                 max_permits: max_concurrency,
                 protected_minimum,
@@ -280,9 +284,9 @@ impl ConcurrencyLimiter {
         class: ActiveJavascriptClass,
         phase: ConcurrencyPermitPhase,
     ) -> ConcurrencyPermit {
-        // Zero minimums disable class-aware admission completely. Preserve the
-        // previous phase-only policy so adding this code does not reprioritize
-        // dependencies or degradable declarations without an explicit opt-in.
+        // Zero minimums disable class-aware admission completely. Collapse all
+        // declarations so the compatibility contract remains phase-only and
+        // no class changes ordering without an explicit opt-in.
         let class = if !self.class_aware_admission_enabled() {
             ActiveJavascriptClass::Protected
         } else {
@@ -290,13 +294,35 @@ impl ConcurrencyLimiter {
         };
         let queue = WaiterQueue::new(class, phase);
         let timer = concurrency_permit_acquire_timer(class, queue.phase());
+        let immediate_permit_id = {
+            let mut tracker = self.inner.tracker.lock();
+            // Avoid waiter machinery on the uncontended path, but never let a
+            // new arrival barge ahead of an already queued request.
+            if tracker.total_occupancy() < self.inner.max_permits
+                && tracker.queues.iter().all(VecDeque::is_empty)
+            {
+                increment_active_javascript_occupancy(class);
+                Some(tracker.register(client_id.clone(), class))
+            } else {
+                None
+            }
+        };
+        if let Some(permit_id) = immediate_permit_id {
+            timer.finish(true);
+            return ConcurrencyPermit {
+                permit_id,
+                limiter: self.clone(),
+                client_id,
+                class,
+            };
+        }
+
         let (sender, receiver) = oneshot::channel();
         let waiter_id = {
             let mut tracker = self.inner.tracker.lock();
             let waiter_id = tracker.waiters.insert(Waiter {
                 queue,
-                state: WaiterState::Waiting,
-                sender: Some(sender),
+                state: WaiterState::Waiting(sender),
             });
             tracker.queues[queue.index()].push_back(waiter_id);
             increment_active_javascript_waiters(class, queue.phase());
@@ -306,18 +332,24 @@ impl ConcurrencyLimiter {
         let mut guard = WaiterGuard {
             limiter: self.clone(),
             waiter_id: Some(waiter_id),
+            receiver,
         };
         let _span = Span::enter_with_local_parent(func_path!());
-        receiver
+        (&mut guard.receiver)
             .await
             .expect("active-JavaScript waiter disappeared before its grant");
 
         let permit_id = {
             let mut tracker = self.inner.tracker.lock();
+            // The acquisition now owns the grant. Disarm cancellation at the
+            // same transition before removing the waiter from its slab.
+            let waiter_id = guard
+                .waiter_id
+                .take()
+                .expect("active-JavaScript waiter guard was already disarmed");
             let waiter = tracker.waiters.remove(waiter_id);
-            assert_eq!(
-                waiter.state,
-                WaiterState::Granted,
+            assert!(
+                matches!(waiter.state, WaiterState::Granted),
                 "active-JavaScript waiter awoke without a grant"
             );
             let class_index = class_index(class);
@@ -326,7 +358,6 @@ impl ConcurrencyLimiter {
                 .expect("active-JavaScript granted count underflow");
             tracker.register(client_id.clone(), class)
         };
-        guard.waiter_id = None;
         timer.finish(true);
         ConcurrencyPermit {
             permit_id,
@@ -340,10 +371,10 @@ impl ConcurrencyLimiter {
         &self,
         client_id: Arc<String>,
     ) -> ConcurrencyPermit {
-        // Direct internal callbacks used the resumption tier before service
-        // classes existed. Preserve that ordering when class-aware admission
-        // is disabled; with service floors enabled, dependency class supplies
-        // the priority and the callback remains an initial start.
+        // In compatibility mode, direct internal callbacks use the resume
+        // phase so they precede external initial starts. With service floors
+        // enabled, the dependency class supplies that priority and the
+        // callback remains an initial start.
         let phase = if !self.class_aware_admission_enabled() {
             ConcurrencyPermitPhase::Resume
         } else {
@@ -355,11 +386,9 @@ impl ConcurrencyLimiter {
 
     fn cancel_waiter(&self, waiter_id: usize) {
         let mut tracker = self.inner.tracker.lock();
-        let Some(waiter) = tracker.waiters.try_remove(waiter_id) else {
-            return;
-        };
+        let waiter = tracker.waiters.remove(waiter_id);
         match waiter.state {
-            WaiterState::Waiting => {
+            WaiterState::Waiting(_) => {
                 let queue = &mut tracker.queues[waiter.queue.index()];
                 let position = queue
                     .iter()
@@ -383,6 +412,9 @@ impl ConcurrencyLimiter {
 struct WaiterGuard {
     limiter: ConcurrencyLimiter,
     waiter_id: Option<usize>,
+    // `Drop` runs before fields are destroyed, so cancellation removes a
+    // waiting or granted entry while its receiver can still accept a grant.
+    receiver: oneshot::Receiver<()>,
 }
 
 impl Drop for WaiterGuard {
@@ -451,6 +483,20 @@ impl ActivePermitsTracker {
     }
 
     fn select_class(&mut self, inner: &ConcurrencyLimiterInner) -> Option<ActiveJavascriptClass> {
+        if inner.protected_minimum == 0 {
+            // `acquire_with_class` collapses every declaration before queueing
+            // in compatibility mode. Keep that the only compatibility rule so
+            // future call paths cannot silently introduce class priority.
+            assert!(
+                !self.class_has_waiter(ActiveJavascriptClass::Dependency)
+                    && !self.class_has_waiter(ActiveJavascriptClass::Degradable),
+                "class-specific active-JavaScript waiter escaped compatibility collapse"
+            );
+            return self
+                .class_has_waiter(ActiveJavascriptClass::Protected)
+                .then_some(ActiveJavascriptClass::Protected);
+        }
+
         if self.class_has_waiter(ActiveJavascriptClass::Dependency) {
             return Some(ActiveJavascriptClass::Dependency);
         }
@@ -462,18 +508,6 @@ impl ActivePermitsTracker {
             (true, false) => return Some(ActiveJavascriptClass::Protected),
             (false, true) => return Some(ActiveJavascriptClass::Degradable),
             (true, true) => {},
-        }
-
-        if inner.protected_minimum == 0 {
-            // Preserve the original two-tier behavior when class minimums are
-            // disabled: every resumption precedes every initial start.
-            let protected_resume = !self.queues[WaiterQueue::ProtectedResume.index()].is_empty();
-            let degradable_resume = !self.queues[WaiterQueue::DegradableResume.index()].is_empty();
-            return match (protected_resume, degradable_resume) {
-                (true, false) => Some(ActiveJavascriptClass::Protected),
-                (false, true) => Some(ActiveJavascriptClass::Degradable),
-                _ => Some(self.take_next_elastic_class()),
-            };
         }
 
         let protected_occupancy = self.class_occupancy(ActiveJavascriptClass::Protected);
@@ -496,7 +530,7 @@ impl ActivePermitsTracker {
                 } else if degradable_scaled < protected_scaled {
                     Some(ActiveJavascriptClass::Degradable)
                 } else {
-                    Some(self.take_next_elastic_class())
+                    Some(self.take_next_tied_class())
                 }
             },
             (false, false) => {
@@ -511,19 +545,19 @@ impl ActivePermitsTracker {
                 } else if degradable_elastic < protected_elastic {
                     Some(ActiveJavascriptClass::Degradable)
                 } else {
-                    Some(self.take_next_elastic_class())
+                    Some(self.take_next_tied_class())
                 }
             },
         }
     }
 
-    fn take_next_elastic_class(&mut self) -> ActiveJavascriptClass {
-        let selected = self.next_elastic_class;
-        self.next_elastic_class = match selected {
+    fn take_next_tied_class(&mut self) -> ActiveJavascriptClass {
+        let selected = self.next_tied_class;
+        self.next_tied_class = match selected {
             ActiveJavascriptClass::Protected => ActiveJavascriptClass::Degradable,
             ActiveJavascriptClass::Degradable => ActiveJavascriptClass::Protected,
             ActiveJavascriptClass::Dependency => {
-                panic!("dependency cannot be the next elastic active-JavaScript class")
+                panic!("dependency cannot be the next tied active-JavaScript class")
             },
         };
         selected
@@ -563,20 +597,18 @@ impl ActivePermitsTracker {
                 .waiters
                 .get_mut(waiter_id)
                 .expect("queued active-JavaScript waiter is missing");
-            assert_eq!(waiter.state, WaiterState::Waiting);
-            waiter.state = WaiterState::Granted;
+            let sender = match mem::replace(&mut waiter.state, WaiterState::Granted) {
+                WaiterState::Waiting(sender) => sender,
+                WaiterState::Granted => {
+                    panic!("granted active-JavaScript waiter remained queued")
+                },
+            };
             self.granted_by_class[class_index(class)] += 1;
             decrement_active_javascript_waiters(class, waiter.queue.phase());
             increment_active_javascript_occupancy(class);
-            let sender = waiter
-                .sender
-                .take()
-                .expect("waiting active-JavaScript waiter has no sender");
-            if sender.send(()).is_err() {
-                self.waiters.remove(waiter_id);
-                self.granted_by_class[class_index(class)] -= 1;
-                decrement_active_javascript_occupancy(class);
-            }
+            sender
+                .send(())
+                .expect("active-JavaScript receiver closed before waiter cancellation");
         }
     }
 
@@ -691,22 +723,96 @@ mod tests {
     async fn resumption_overtakes_initial_start_without_class_minimums() {
         let limiter = ConcurrencyLimiter::new(1);
         let initial_permit = limiter.acquire(Arc::new("initial".to_owned()), false).await;
-        let mut low_priority = Box::pin(limiter.acquire(Arc::new("low".to_owned()), false));
-        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
-        let mut high_priority = Box::pin(limiter.acquire(Arc::new("high".to_owned()), true));
-        assert!(matches!(poll!(high_priority.as_mut()), Poll::Pending));
+        let mut initial_waiter =
+            Box::pin(limiter.acquire(Arc::new("initial-waiter".to_owned()), false));
+        assert!(matches!(poll!(initial_waiter.as_mut()), Poll::Pending));
+        let mut resume_waiter =
+            Box::pin(limiter.acquire(Arc::new("resume-waiter".to_owned()), true));
+        assert!(matches!(poll!(resume_waiter.as_mut()), Poll::Pending));
 
         drop(initial_permit);
 
-        let Poll::Ready(high_priority_permit) = poll!(high_priority.as_mut()) else {
-            panic!("high-priority waiter was not notified first");
+        let Poll::Ready(resume_permit) = poll!(resume_waiter.as_mut()) else {
+            panic!("resume waiter was not notified first");
         };
-        assert!(matches!(poll!(low_priority.as_mut()), Poll::Pending));
-        drop(high_priority_permit);
-        let Poll::Ready(low_priority_permit) = poll!(low_priority.as_mut()) else {
-            panic!("low-priority waiter was not notified after the high-priority permit dropped");
+        assert!(matches!(poll!(initial_waiter.as_mut()), Poll::Pending));
+        drop(resume_permit);
+        let Poll::Ready(initial_waiter_permit) = poll!(initial_waiter.as_mut()) else {
+            panic!("initial waiter was not notified after the resume permit dropped");
         };
-        drop(low_priority_permit);
+        drop(initial_waiter_permit);
+    }
+
+    #[test]
+    #[should_panic(expected = "active-JavaScript class minimums require finite total capacity")]
+    fn class_minimums_require_finite_capacity() {
+        let _ = ConcurrencyLimiter::new_with_class_minimums(usize::MAX, 1, 1);
+    }
+
+    #[tokio::test]
+    async fn compatibility_mode_collapses_classes_and_preserves_phase_fifo() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let held = limiter.acquire(Arc::new("held".to_owned()), false).await;
+        let mut first_initial = Box::pin(acquire(
+            &limiter,
+            "first-initial",
+            ActiveJavascriptClass::Dependency,
+            ConcurrencyPermitPhase::Initial,
+        ));
+        let mut second_initial = Box::pin(acquire(
+            &limiter,
+            "second-initial",
+            ActiveJavascriptClass::Degradable,
+            ConcurrencyPermitPhase::Initial,
+        ));
+        let mut first_resume = Box::pin(acquire(
+            &limiter,
+            "first-resume",
+            ActiveJavascriptClass::Degradable,
+            ConcurrencyPermitPhase::Resume,
+        ));
+        let mut second_resume = Box::pin(acquire(
+            &limiter,
+            "second-resume",
+            ActiveJavascriptClass::Dependency,
+            ConcurrencyPermitPhase::Resume,
+        ));
+        assert!(matches!(poll!(first_initial.as_mut()), Poll::Pending));
+        assert!(matches!(poll!(second_initial.as_mut()), Poll::Pending));
+        assert!(matches!(poll!(first_resume.as_mut()), Poll::Pending));
+        assert!(matches!(poll!(second_resume.as_mut()), Poll::Pending));
+
+        drop(held);
+        let Poll::Ready(first_resume_permit) = poll!(first_resume.as_mut()) else {
+            panic!("first resumption was not granted first");
+        };
+        assert_eq!(first_resume_permit.class, ActiveJavascriptClass::Protected);
+        assert!(matches!(poll!(second_resume.as_mut()), Poll::Pending));
+        assert!(matches!(poll!(first_initial.as_mut()), Poll::Pending));
+        drop(first_resume_permit);
+
+        let Poll::Ready(second_resume_permit) = poll!(second_resume.as_mut()) else {
+            panic!("resumptions did not remain FIFO");
+        };
+        assert_eq!(second_resume_permit.class, ActiveJavascriptClass::Protected);
+        assert!(matches!(poll!(first_initial.as_mut()), Poll::Pending));
+        drop(second_resume_permit);
+
+        let Poll::Ready(first_initial_permit) = poll!(first_initial.as_mut()) else {
+            panic!("first initial start did not follow resumptions");
+        };
+        assert_eq!(first_initial_permit.class, ActiveJavascriptClass::Protected);
+        assert!(matches!(poll!(second_initial.as_mut()), Poll::Pending));
+        drop(first_initial_permit);
+
+        let Poll::Ready(second_initial_permit) = poll!(second_initial.as_mut()) else {
+            panic!("initial starts did not remain FIFO");
+        };
+        assert_eq!(
+            second_initial_permit.class,
+            ActiveJavascriptClass::Protected
+        );
+        drop(second_initial_permit);
     }
 
     #[tokio::test]
@@ -835,6 +941,76 @@ mod tests {
         assert_eq!((protected_permits.len(), degradable_permits.len()), (2, 4));
         drop(protected_permits);
         drop(degradable_permits);
+    }
+
+    #[tokio::test]
+    async fn exact_floor_and_elastic_ties_alternate() {
+        let limiter = ConcurrencyLimiter::new_with_class_minimums(6, 1, 1);
+        let mut dependencies = Vec::new();
+        for index in 0..6 {
+            dependencies.push(
+                acquire(
+                    &limiter,
+                    format!("dependency-{index}"),
+                    ActiveJavascriptClass::Dependency,
+                    ConcurrencyPermitPhase::Initial,
+                )
+                .await,
+            );
+        }
+        let mut first_protected = Box::pin(acquire(
+            &limiter,
+            "first-protected",
+            ActiveJavascriptClass::Protected,
+            ConcurrencyPermitPhase::Initial,
+        ));
+        let mut second_protected = Box::pin(acquire(
+            &limiter,
+            "second-protected",
+            ActiveJavascriptClass::Protected,
+            ConcurrencyPermitPhase::Initial,
+        ));
+        let mut first_degradable = Box::pin(acquire(
+            &limiter,
+            "first-degradable",
+            ActiveJavascriptClass::Degradable,
+            ConcurrencyPermitPhase::Initial,
+        ));
+        let mut second_degradable = Box::pin(acquire(
+            &limiter,
+            "second-degradable",
+            ActiveJavascriptClass::Degradable,
+            ConcurrencyPermitPhase::Initial,
+        ));
+        assert!(matches!(poll!(first_protected.as_mut()), Poll::Pending));
+        assert!(matches!(poll!(second_protected.as_mut()), Poll::Pending));
+        assert!(matches!(poll!(first_degradable.as_mut()), Poll::Pending));
+        assert!(matches!(poll!(second_degradable.as_mut()), Poll::Pending));
+
+        drop(dependencies.pop());
+        let Poll::Ready(first_degradable_permit) = poll!(first_degradable.as_mut()) else {
+            panic!("underfilled-floor tie did not choose degradable");
+        };
+
+        drop(dependencies.pop());
+        let Poll::Ready(first_protected_permit) = poll!(first_protected.as_mut()) else {
+            panic!("protected floor did not receive the next grant");
+        };
+
+        drop(dependencies.pop());
+        let Poll::Ready(second_protected_permit) = poll!(second_protected.as_mut()) else {
+            panic!("elastic tie did not alternate to protected");
+        };
+
+        drop(dependencies.pop());
+        let Poll::Ready(second_degradable_permit) = poll!(second_degradable.as_mut()) else {
+            panic!("elastic occupancy did not rebalance toward degradable");
+        };
+
+        drop(first_degradable_permit);
+        drop(first_protected_permit);
+        drop(second_protected_permit);
+        drop(second_degradable_permit);
     }
 
     #[tokio::test]

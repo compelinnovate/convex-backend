@@ -164,11 +164,12 @@ service protections are deliberately local:
 - degradable roots have a finite sub-cap;
 - normal and dependency queries bypass an in-flight degradable cache leader.
 
-The active-JavaScript gate maps normal roots and backend work to `Protected`,
-maps only admitted degradable cache-miss leaders to `Degradable`, and gives
-`Dependency` the next grant. Protected and degradable work use work-conserving
-minimums rather than global strict priority. Normal still means unaffected by
-the degradable sub-cap, not permission to claim an unbounded priority class.
+The active-JavaScript gate maps normal roots and nondependency backend work to
+`Protected` and maps only admitted degradable cache-miss leaders to
+`Degradable`. With positive class minimums it gives `Dependency` the next
+grant. Protected and degradable work use work-conserving minimums rather than
+global strict priority. Normal still means unaffected by the degradable
+sub-cap, not permission to claim an unbounded priority class.
 
 The client field only opts work down. A forged degradable value can reduce the sender's own
 service. Omitting the field remains possible, so the mechanism is not an overload defense against
@@ -544,10 +545,12 @@ leader receives `Degradable`; separately scheduled descendants override it
 with the existing backend-derived dependency class.
 
 Protected and degradable minimums are non-preemptive service floors. Either
-class borrows every permit that the other class does not need. Dependencies
-receive the next grant because they release isolate-holding ancestors. After
-both application floors are met, elastic occupancy is balanced between the two
-classes, and resumptions precede initial starts within a selected class.
+class borrows every permit that the other class does not need. With positive
+class minimums, dependencies receive the next grant because they release
+isolate-holding ancestors. After both application floors are met, elastic
+occupancy is balanced between the two classes, and resumptions precede initial
+starts within a selected class. With zero minimums, the compatibility policy
+remains phase-only: all resumptions precede all initial starts.
 
 The scheduler exposes at most one external initial waiter per active class so
 a wave from one class cannot hide the other class behind serial permit waits.
@@ -601,8 +604,9 @@ minimums require finite `FUNRUN_ISOLATE_ACTIVE_THREADS`, require the leader
 cap, cannot sum above active capacity, and cannot set the degradable minimum
 above the leader cap. With positive minimums the leader cap can exceed active
 capacity because the cap bounds admitted tree lifetime while active capacity
-bounds instantaneous JavaScript execution. With zero minimums, the previous
-validation remains: a finite active capacity must exceed the leader cap.
+bounds instantaneous JavaScript execution. With zero minimums, any configured
+finite active capacity must exceed the leader cap, while `0` continues to mean
+unlimited.
 
 If a custom runner does not expose equivalent capacity, it cannot claim the
 same normal-capacity reservation from this cap alone.
@@ -775,9 +779,8 @@ the cap reserves capacity and the existing query policy remains unchanged. The o
 admission models without changing Connect parsing, leader admission, cache bypass, client pressure
 semantics, or isolate queue selection.
 
-[`cancellation_safe_database_context_reuse/README.md`](../cancellation_safe_database_context_reuse/README.md)
-and [`context_reuse_observability/README.md`](../context_reuse_observability/README.md) are
-independent service-cost patches. Reuse can change query service time and the
+[`context_reuse/README.md`](../context_reuse/README.md) is an
+independent service-cost patch. Reuse can change query service time and the
 leader-cap value that is appropriate, but it does not change workload class or
 pressure semantics. Measure and roll back the features independently.
 
