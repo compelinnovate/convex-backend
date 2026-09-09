@@ -30,6 +30,7 @@ pub use crate::executor::{
     NodeExecutorCutoverTarget,
     NodeExecutorStreamPart,
     Package,
+    ResponsePart,
     SourcePackage,
     ARGS_TOO_LARGE_RESPONSE_MESSAGE,
     EXECUTE_TIMEOUT_RESPONSE_JSON,
