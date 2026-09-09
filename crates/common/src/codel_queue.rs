@@ -541,6 +541,36 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_sender_retains_rejected_items_until_caller_drops_them() {
+        let queue = CoDelQueue::new_with_reserved_capacity(QueueTestRuntime::new(), 1, 1);
+        let (sender, receiver) = queue.into_sender_and_receiver();
+        let inner = Arc::downgrade(&sender.inner);
+        let unlocked_drops = Arc::new(AtomicUsize::new(0));
+        let probe = || LockingDropProbe {
+            inner: inner.clone(),
+            unlocked_drops: unlocked_drops.clone(),
+        };
+
+        assert!(sender.try_send_or_recover(probe()).is_ok());
+        // Recovery uses ordinary admission, even when dependency reserve is free.
+        let Err((super::QueueFull, full_item)) = sender.try_send_or_recover(probe()) else {
+            panic!("Ordinary recovery API consumed dependency reserve");
+        };
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 0);
+        drop(receiver);
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 1);
+        drop(full_item);
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 2);
+
+        let Err((super::QueueFull, closed_item)) = sender.try_send_or_recover(probe()) else {
+            panic!("Recovery API admitted work after receiver closure");
+        };
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 2);
+        drop(closed_item);
+        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
     fn detailed_sender_errors_distinguish_full_from_closed() {
         let rt = QueueTestRuntime::new();
         let queue = CoDelQueue::new_with_reserved_capacity(rt, 1, 1);

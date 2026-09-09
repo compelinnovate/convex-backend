@@ -599,11 +599,8 @@ impl RouteMapper for NoopRouteMapper {
     }
 }
 
-fn concurrency_metric_name(service_name: &str, namespace: &str) -> String {
-    let name = format!(
-        "{}_http_service_concurrent_requests",
-        service_name.replace('-', "_")
-    );
+fn service_metric_name(service_name: &str, namespace: &str, metric_name: &str) -> String {
+    let name = format!("{}_{metric_name}", service_name.replace('-', "_"));
     // The registry already prefixes metrics with the executable name.
     name.strip_prefix(&format!("{namespace}_"))
         .unwrap_or(&name)
@@ -766,9 +763,10 @@ impl ConvexHttpService {
         let concurrency_gate_for_base_gauge = concurrency_gate.clone();
         let base_concurrency_gauge = (dependency_reserve > 0).then(|| {
             PullingGauge::new(
-                format!(
-                    "{}_http_service_base_concurrent_requests",
-                    service_name.replace('-', "_")
+                service_metric_name(
+                    service_name,
+                    &SERVICE_NAME,
+                    "http_service_base_concurrent_requests",
                 ),
                 "The amount of shared base HTTP admission capacity in use",
                 Box::new(move || concurrency_gate_for_base_gauge.base_in_use() as f64),
@@ -790,7 +788,11 @@ impl ConvexHttpService {
             service_name,
         };
         let concurrency_gauge = PullingGauge::new(
-            concurrency_metric_name(service_name, &SERVICE_NAME),
+            service_metric_name(
+                service_name,
+                &SERVICE_NAME,
+                "http_service_concurrent_requests",
+            ),
             "The number of currently outstanding requests on the ConvexHttpService",
             Box::new(move || concurrency_gate_for_total_gauge.active() as f64),
         )
@@ -1701,6 +1703,27 @@ mod tests {
         StatusCode,
     };
     use crate::dependency_overflow::DependencyOverflowGate;
+
+    #[test]
+    fn concurrency_gauges_strip_only_the_matching_executable_prefix() {
+        for metric_name in [
+            "http_service_concurrent_requests",
+            "http_service_base_concurrent_requests",
+        ] {
+            for (service_name, namespace, expected_prefix) in [
+                ("local-backend", "local_backend", ""),
+                ("local-backend-site", "local_backend", "site_"),
+                ("function-runner", "local_backend", "function_runner_"),
+                ("local-backend", "local", "backend_"),
+                ("local-backend", "local_back", "local_backend_"),
+            ] {
+                assert_eq!(
+                    super::service_metric_name(service_name, namespace, metric_name),
+                    format!("{expected_prefix}{metric_name}"),
+                );
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct BlockingHandlerState {
