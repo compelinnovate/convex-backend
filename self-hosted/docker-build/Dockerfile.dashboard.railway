@@ -25,7 +25,7 @@ ENV NODE_ENV=production
 # Build workspace deps first, then force webpack for a reliable standalone trace.
 RUN turbo run build --filter=dashboard-self-hosted^...
 WORKDIR /app/npm-packages/dashboard-self-hosted
-RUN npm run build:generated && next build --webpack
+RUN npm run build:generated && pnpm exec next build --webpack
 
 FROM ubuntu:noble
 
