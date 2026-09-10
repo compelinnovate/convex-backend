@@ -1,63 +1,57 @@
 # syntax=docker/dockerfile:1-labs
-# Railway-compatible variant: no BuildKit cache mounts (Railway rejects them).
+# Railway-compatible dashboard image.
+# Uses Next standalone output (not pnpm deploy) and webpack production builds so
+# Turbopack hashed externals like @radix-ui/react-icons-<hash> do not break SSR.
 FROM ubuntu:noble AS build
 
-# Install deps
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential
 
-# Install Node.js from NodeSource repository
-# We extract the version from .nvmrc
 COPY .nvmrc /nvmrc
 RUN <<EOF
-# Extract major version (e.g., "18" from "18.x.x")
 NODE_MAJOR=$(cat /nvmrc | cut -d. -f1 | tr -d 'v\n')
-# Add NodeSource repository and its signing key
 curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash -
-# Install the specific version listed in the nvmrc file
 NODE_VERSION=$(cat /nvmrc | tr -d 'v\n')
 apt-get install -y --no-install-recommends nodejs=${NODE_VERSION}-1nodesource1
 EOF
 
 WORKDIR /app
-# pnpm/turbo come pinned from scripts/package-lock.json, so release builds
-# always use the exact vetted versions.
 COPY scripts ./scripts
 RUN npm ci --prefix scripts
 ENV PATH="/app/scripts/node_modules/.bin:$PATH"
 COPY ./npm-packages ./npm-packages
-# Install dependencies and build
 WORKDIR /app/npm-packages
 RUN pnpm install --frozen-lockfile
 ENV NODE_ENV=production
-RUN turbo run build --filter=dashboard-self-hosted...
-RUN pnpm --filter=dashboard-self-hosted deploy --legacy --prod /tmp/deploy
+# Build workspace deps first, then force webpack for a reliable standalone trace.
+RUN turbo run build --filter=dashboard-self-hosted^...
+WORKDIR /app/npm-packages/dashboard-self-hosted
+RUN npm run build:generated && next build --webpack
 
 FROM ubuntu:noble
 
-# Install Node.js from NodeSource repository
-# We extract the version from .nvmrc
 COPY .nvmrc /nvmrc
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
 RUN <<EOF
-# Extract major version (e.g., "18" from "18.x.x")
 NODE_MAJOR=$(cat /nvmrc | cut -d. -f1 | tr -d 'v\n')
-# Add NodeSource repository and its signing key
 curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash -
-# Install the specific version listed in the nvmrc file
 NODE_VERSION=$(cat /nvmrc | tr -d 'v\n')
 apt-get install -y --no-install-recommends nodejs=${NODE_VERSION}-1nodesource1
 EOF
 
 RUN groupadd --system --gid 1001 nodejs
 RUN useradd --system --uid 1001 --gid nodejs nextjs
-COPY --from=build --chown=nextjs:nodejs /tmp/deploy/ /app/
+
 WORKDIR /app
-# Since the pnpm workspace root (npm-packages/, where pnpm-lock.yaml lives) is
-# an ancestor of the package, Next infers it as outputFileTracingRoot and nests
-# the standalone output under the package's workspace-relative path.
-RUN cp /app/.next/standalone/dashboard-self-hosted/server.js .
+# Next nests the app under dashboard-self-hosted because the pnpm workspace root
+# is used as the file-tracing root.
+COPY --from=build --chown=nextjs:nodejs /app/npm-packages/dashboard-self-hosted/.next/standalone ./
+COPY --from=build --chown=nextjs:nodejs /app/npm-packages/dashboard-self-hosted/.next/static ./dashboard-self-hosted/.next/static
+COPY --from=build --chown=nextjs:nodejs /app/npm-packages/dashboard-self-hosted/public ./dashboard-self-hosted/public
+
 USER nextjs
+WORKDIR /app/dashboard-self-hosted
 EXPOSE 6791
+ENV NODE_ENV=production
 ENV PORT=6791
 ENV HOSTNAME=0.0.0.0
-CMD ["node", "./server.js"]
+CMD ["node", "server.js"]
