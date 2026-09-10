@@ -23,7 +23,10 @@ COPY third_party/mysql_async ./third_party/mysql_async
 COPY .cargo ./.cargo
 # Exclusive cache mounts make it safe to remove Git locks left by a canceled
 # BuildKit step before Cargo accesses the persistent repositories.
-RUN find /usr/local/cargo/git -type f -name '*.lock' -delete &&  cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
+# Without BuildKit cache mounts the cargo git dir may not exist yet.
+RUN mkdir -p /usr/local/cargo/git /usr/local/cargo/registry && \
+    find /usr/local/cargo/git -type f -name '*.lock' -delete; \
+    cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
 
 # Build stage: Compiles the Rust backend with all dependencies
 # Uses cargo-chef's recipe from the previous stage for optimal caching
@@ -103,7 +106,8 @@ ENV CARGO_TARGET_DIR=/convex/target
 # This step will be cached unless dependencies change
 RUN <<EOF
 set -euo pipefail
-find /usr/local/cargo/git -type f -name '*.lock' -delete
+mkdir -p /usr/local/cargo/git /usr/local/cargo/registry
+find /usr/local/cargo/git -type f -name '*.lock' -delete || true
 : "${CARGO_BUILD_PROFILE:?CARGO_BUILD_PROFILE must not be empty}"
 if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
   export CARGO_PROFILE_RELEASE_DEBUG
@@ -132,7 +136,8 @@ ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
 ENV VERGEN_GIT_COMMIT_TIMESTAMP=${VERGEN_GIT_COMMIT_TIMESTAMP}
 RUN <<EOF
 set -euo pipefail
-find /usr/local/cargo/git -type f -name '*.lock' -delete
+mkdir -p /usr/local/cargo/git /usr/local/cargo/registry
+find /usr/local/cargo/git -type f -name '*.lock' -delete || true
 if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
   export CARGO_PROFILE_RELEASE_DEBUG
 else
