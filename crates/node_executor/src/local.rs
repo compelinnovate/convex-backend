@@ -6637,9 +6637,15 @@ impl LocalNodeExecutor {
                 );
             }
             request_guard.set_outcome("http_error");
+            let status = response.status().as_u16();
+            // Include a short body snippet so operators can see PackageCacheError /
+            // analyze failures that the Node executor surfaces as bare HTTP 500s.
+            let body = response.text().await.unwrap_or_default();
+            let body_snippet: String = body.chars().take(800).collect();
             anyhow::bail!(
-                "Node executor server returned HTTP {}",
-                response.status().as_u16()
+                "Node executor server returned HTTP {}: {}",
+                status,
+                body_snippet
             );
         }
         let stream = Self::response_stream(response, request_deadline);

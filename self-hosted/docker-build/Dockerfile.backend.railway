@@ -215,8 +215,9 @@ COPY --chmod=744 self-hosted/docker-build/run_backend.sh .
 COPY --chmod=744 self-hosted/docker-build/generate_admin_key.sh .
 
 
-# Set the backend as the executable
-ENTRYPOINT ["./run_backend.sh"]
+# Use CMD (not ENTRYPOINT) so Railway startCommand can fully replace the process
+# instead of being appended as args to a fixed ENTRYPOINT.
+CMD ["./run_backend.sh"]
 
 # Expose the required ports
 EXPOSE 3210
