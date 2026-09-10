@@ -1,0 +1,218 @@
+# syntax=docker/dockerfile:1-labs
+# Railway-compatible variant: no BuildKit cache mounts / VOLUME (Railway rejects them).
+# This Dockerfile builds the self-hosted version of the Convex backend
+# It creates a minimal runtime image that can run a local Convex instance
+
+ARG VERGEN_GIT_SHA
+ARG VERGEN_GIT_COMMIT_TIMESTAMP
+
+# cargo-chef is used to cache Rust dependencies and build artifacts
+# It creates a recipe of our dependencies first, then builds them in a separate stage
+# This helps avoid rebuilding dependencies when only first-party source code changes
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+WORKDIR /tmp
+COPY rust-toolchain .
+# Dummy command to just fetch the toolchain that'll get installed by running `cargo chef`
+RUN rustup self update && rustup toolchain install
+# The pinned nightly supports shallow Git dependencies, including when Cargo
+# delegates fetching to the Git CLI. This avoids cloning reachable history for
+# exact revisions.
+ENV CARGO_UNSTABLE_GIT=shallow-deps
+COPY --parents crates* Cargo* ./
+COPY third_party/mysql_async ./third_party/mysql_async
+COPY .cargo ./.cargo
+# Exclusive cache mounts make it safe to remove Git locks left by a canceled
+# BuildKit step before Cargo accesses the persistent repositories.
+RUN find /usr/local/cargo/git -type f -name '*.lock' -delete &&  cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
+
+# Build stage: Compiles the Rust backend with all dependencies
+# Uses cargo-chef's recipe from the previous stage for optimal caching
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS build
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Update APT configuration for Docker builds
+# Sets retry attempts, assumes yes for prompts, and configures dpkg timeout
+# Also installs a few libraries needed for building the backend
+RUN <<EOF
+printf 'APT::Acquire::Retries \"10\";\n' > /etc/apt/apt.conf.d/80retries
+printf 'APT::Get::Assume-Yes \"true\";\n' > /etc/apt/apt.conf.d/90forceyes
+printf 'DPkg::Lock::Timeout \"30\";\n' > /etc/apt/apt.conf.d/85timeout
+echo 'DEBIAN_FRONTEND=noninteractive' > /etc/environment
+apt-get update
+apt-get install -y --no-install-recommends cmake libclang-dev libstdc++6 libc6
+EOF
+
+# Install Just (for build scripts)
+RUN cargo install just
+
+WORKDIR /
+
+# Install Node.js from NodeSource repository
+# We extract the version from .nvmrc
+COPY .nvmrc /nvmrc
+RUN <<EOF
+# Extract major version (e.g., "18" from "18.x.x")
+NODE_MAJOR=$(cat /nvmrc | cut -d. -f1 | tr -d 'v\n')
+# Add NodeSource repository and its signing key
+curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash -
+# Install the specific version listed in the nvmrc file
+NODE_VERSION=$(cat /nvmrc | tr -d 'v\n')
+apt-get install -y --no-install-recommends nodejs=${NODE_VERSION}-1nodesource1
+EOF
+
+# Ensure this file is copied so we'll restart here if the file changes
+COPY rust-toolchain /rust-toolchain
+# Dummy command to just fetch the toolchain and cargo index
+RUN rustup self update && rustup toolchain install && cargo search -q convex
+ENV CARGO_UNSTABLE_GIT=shallow-deps
+
+WORKDIR /convex
+COPY scripts ./scripts
+RUN npm ci --prefix scripts/
+
+# Provision protoc via mise before the cargo layers (version + checksum from
+# mise.toml/mise.lock; mise's own version from min_version). mise lives only in
+# this build stage, never the runtime image. $PROTOC is set per cargo RUN below
+# so it's available to both `cargo chef cook` and the real build.
+COPY mise.toml mise.lock ./
+ENV MISE_INSTALL_PATH="/usr/local/bin/mise" \
+    MISE_DATA_DIR="/mise" \
+    MISE_CONFIG_DIR="/mise" \
+    MISE_CACHE_DIR="/mise/cache"
+RUN curl -fsSL https://mise.run | MISE_VERSION="v$(sed -nE 's/^min_version = "([^"]+)"/\1/p' mise.toml)" sh \
+    && mise trust && mise install --locked protoc
+
+# Cargo reads .cargo/config.toml (e.g. RUSTY_V8_MIRROR, which redirects the V8
+# static-lib download to our fork) via hierarchical discovery from the working
+# directory, so the complete Cargo configuration must be present before
+# `cargo chef cook` builds dependencies.
+COPY .cargo ./.cargo
+COPY third_party/mysql_async ./third_party/mysql_async
+COPY --from=chef /tmp/recipe.json recipe.json
+ARG CARGO_BUILD_PROFILE=release
+ARG CARGO_PROFILE_RELEASE_DEBUG=
+ARG CARGO_PROFILE_RELEASE_STRIP=
+ARG TARGETARCH
+# Keep cargo-chef and the final build on the mounted target cache. This also
+# makes the artifact paths below independent of Cargo config target-dir changes.
+ENV CARGO_TARGET_DIR=/convex/target
+# cargo-chef removes dummy workspace artifacts after Cargo releases its own
+# target lock. Lock all partially mounted Cargo caches across concurrent builds;
+# TARGETARCH also keeps native artifacts from different platforms separate.
+# Use cargo-chef to build dependencies from the recipe created in the first stage
+# This step will be cached unless dependencies change
+RUN <<EOF
+set -euo pipefail
+find /usr/local/cargo/git -type f -name '*.lock' -delete
+: "${CARGO_BUILD_PROFILE:?CARGO_BUILD_PROFILE must not be empty}"
+if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
+  export CARGO_PROFILE_RELEASE_DEBUG
+else
+  unset CARGO_PROFILE_RELEASE_DEBUG
+fi
+if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
+  export CARGO_PROFILE_RELEASE_STRIP
+else
+  unset CARGO_PROFILE_RELEASE_STRIP
+fi
+PROTOC="$(mise which protoc)" cargo chef cook --profile "$CARGO_BUILD_PROFILE" --recipe-path recipe.json
+EOF
+# Copy first-party Rust and JavaScript sources only after dependency cooking.
+# isolate's build script installs the frozen JavaScript workspace with lifecycle
+# scripts disabled and builds the packages embedded in the backend. A separate
+# `just install-js` here duplicates that install and downloads unrelated browser
+# artifacts whenever package source changes.
+COPY . .
+
+# Build the convex-local-backend binary
+# Must redeclare these as environment variables so that they are available
+ARG VERGEN_GIT_SHA
+ARG VERGEN_GIT_COMMIT_TIMESTAMP
+ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
+ENV VERGEN_GIT_COMMIT_TIMESTAMP=${VERGEN_GIT_COMMIT_TIMESTAMP}
+RUN <<EOF
+set -euo pipefail
+find /usr/local/cargo/git -type f -name '*.lock' -delete
+if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
+  export CARGO_PROFILE_RELEASE_DEBUG
+else
+  unset CARGO_PROFILE_RELEASE_DEBUG
+fi
+if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
+  export CARGO_PROFILE_RELEASE_STRIP
+else
+  unset CARGO_PROFILE_RELEASE_STRIP
+fi
+export PROTOC="$(mise which protoc)"
+artifact_dir=/convex/backend-artifacts
+mkdir "$artifact_dir"
+# The pinned nightly Cargo copies each requested binary and final companion
+# artifacts such as packed split-debuginfo files out of the cache mount.
+cargo -Z unstable-options build \
+  --artifact-dir "$artifact_dir" \
+  --profile "$CARGO_BUILD_PROFILE" \
+  -p local_backend \
+  --bin convex-local-backend
+test -x "$artifact_dir/convex-local-backend"
+cargo -Z unstable-options build \
+  --artifact-dir "$artifact_dir" \
+  --profile "$CARGO_BUILD_PROFILE" \
+  -p keybroker \
+  --bin generate_key
+test -x "$artifact_dir/generate_key"
+EOF
+ARG debug
+RUN <<EOF
+set -euo pipefail
+cargo_profile_release_debug="${CARGO_PROFILE_RELEASE_DEBUG:-}"
+# Keep the legacy GNU strip only for release builds where Cargo was not asked
+# to control stripping or emit debuginfo.
+if [[ -z "${debug:-}" &&
+      "${CARGO_BUILD_PROFILE:-release}" == "release" &&
+      -z "${CARGO_PROFILE_RELEASE_STRIP:-}" ]]; then
+  case "${cargo_profile_release_debug,,}" in
+    ""|false|0|none)
+      strip ./backend-artifacts/convex-local-backend
+      strip ./backend-artifacts/generate_key
+      ;;
+  esac
+fi
+EOF
+
+# Final stage: Creates minimal runtime image with only necessary components
+# Uses Ubuntu Noble (24.04) as the base image
+FROM ubuntu:noble
+ARG VERGEN_GIT_SHA
+LABEL org.opencontainers.repository=https://github.com/get-convex/convex-backend
+LABEL org.opencontainers.image.revision=${VERGEN_GIT_SHA}
+
+WORKDIR /convex
+
+# Install libraries needed for running the backend
+RUN <<EOF
+apt-get update
+apt-get install -y --no-install-recommends libclang1 curl ca-certificates
+EOF
+
+# Install Node.js and npm, required for running Node.js actions in the backend
+COPY --from=build /usr/bin/node /usr/bin/node
+COPY --from=build /usr/bin/npm /usr/bin/npm
+COPY --from=build /usr/lib/node_modules/npm /usr/lib/node_modules/npm
+# Set up npm and npx commands
+RUN ln -sf /usr/lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
+    chmod +x /usr/bin/npm
+RUN ln -sf /usr/lib/node_modules/npm/bin/npx-cli.js /usr/bin/npx && \
+    chmod +x /usr/bin/npx
+COPY --from=build /convex/backend-artifacts/ ./
+RUN chmod 744 ./convex-local-backend ./generate_key
+COPY --chmod=744 self-hosted/docker-build/read_credentials.sh .
+COPY --chmod=744 self-hosted/docker-build/run_backend.sh .
+COPY --chmod=744 self-hosted/docker-build/generate_admin_key.sh .
+
+
+# Set the backend as the executable
+ENTRYPOINT ["./run_backend.sh"]
+
+# Expose the required ports
+EXPOSE 3210
+EXPOSE 3211
