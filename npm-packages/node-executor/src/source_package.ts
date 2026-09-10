@@ -64,7 +64,11 @@ const metadataJsonSchema = z.object({
   moduleEnvironments: z
     .array(z.tuple([modulePathSchema, moduleEnvironmentSchema]))
     .optional(),
-  externalDepsStorageKey: z.string().optional(),
+  // Rust serializes Option::None as null; older packages may omit this field.
+  externalDepsStorageKey: z
+    .string()
+    .nullish()
+    .transform((key) => key ?? undefined),
 });
 
 class PackageCacheError extends Error {}
@@ -879,7 +883,7 @@ async function decompressZipEntry(zipEntry: AdmZip.IZipEntry): Promise<Buffer> {
   }
 
   let crc = 0xffffffff;
-  for (let offset = 0; offset < contents.byteLength; ) {
+  for (let offset = 0; offset < contents.byteLength;) {
     const end = Math.min(offset + CRC32_YIELD_BYTES, contents.byteLength);
     for (; offset < end; offset += 1) {
       crc = CRC32_TABLE[(crc ^ contents[offset]) & 0xff] ^ (crc >>> 8);
@@ -1009,7 +1013,9 @@ async function processSourcePackageStream(
   // Match Rust upload_download.rs: sort both sides before comparing. Metadata
   // may not be written in lexicographic order (e.g. after CLI/backend churn).
   const metadataModulePaths = [...metadataJson.modulePaths].sort();
-  if (JSON.stringify(metadataModulePaths) !== JSON.stringify(actualModulePaths)) {
+  if (
+    JSON.stringify(metadataModulePaths) !== JSON.stringify(actualModulePaths)
+  ) {
     throw new PackageCacheError(
       "Source package metadata does not match archive contents",
     );
