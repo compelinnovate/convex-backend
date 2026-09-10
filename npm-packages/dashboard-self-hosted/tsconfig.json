@@ -15,7 +15,6 @@
     "downlevelIteration": true,
     "jsx": "react-jsx",
     "incremental": true,
-    "ignoreDeprecations": "6.0",
     "baseUrl": "src",
     "customConditions": ["convex-internal-types"],
     "paths": {
