@@ -186,6 +186,32 @@ test("pooled Node environment markers load as Node modules", async () => {
   }
 });
 
+test("source packages accept Rust metadata with a null external dependency key", async () => {
+  const zip = new AdmZip(makeSourcePackageZip(null));
+  const metadata = JSON.parse(zip.readAsText("metadata.json"));
+  metadata.externalDepsStorageKey = null;
+  zip.updateFile("metadata.json", Buffer.from(JSON.stringify(metadata)));
+  const sourceZip = zip.toBuffer();
+  const server = await startPackageServer({ "/source.zip": sourceZip });
+
+  try {
+    const local = await maybeDownloadAndLinkPackages(
+      makeSourceOnlyPackage(
+        `${server.baseUrl}/source.zip`,
+        sha256(sourceZip),
+        "rust-null-dependencies",
+      ),
+    );
+
+    expect(local.modules).toContain("actions/example.js");
+    expect(local.externalDepsStorageKey).toBeUndefined();
+    expect(fs.existsSync(path.join(local.dir, "node_modules"))).toBe(false);
+    expect(getPackageCacheStats().sourceFailedPublications).toBe(0);
+  } finally {
+    await server.close();
+  }
+});
+
 test("source package metadata rejects duplicate module environments", async () => {
   const sourceZip = makeSourcePackageZip(null, 1, "node", [
     ["_deps/chunk.js", "node"],
@@ -1705,9 +1731,7 @@ type RouteResponse = {
 };
 
 type Route =
-  | Buffer
-  | RouteResponse
-  | ((requestNumber: number) => RouteResponse);
+  Buffer | RouteResponse | ((requestNumber: number) => RouteResponse);
 
 async function startPackageServer(routes: Record<string, Route>): Promise<{
   baseUrl: string;
