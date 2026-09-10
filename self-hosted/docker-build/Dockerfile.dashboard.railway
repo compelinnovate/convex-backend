@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1-labs
 # Railway-compatible dashboard image.
-# Uses Next standalone output (not pnpm deploy) and webpack production builds so
-# Turbopack hashed externals like @radix-ui/react-icons-<hash> do not break SSR.
+# Uses Next standalone output (not the broken pnpm-deploy + server.js hybrid).
 FROM ubuntu:noble AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential
@@ -22,10 +21,8 @@ COPY ./npm-packages ./npm-packages
 WORKDIR /app/npm-packages
 RUN pnpm install --frozen-lockfile
 ENV NODE_ENV=production
-# Build workspace deps first, then force webpack for a reliable standalone trace.
-RUN turbo run build --filter=dashboard-self-hosted^...
-WORKDIR /app/npm-packages/dashboard-self-hosted
-RUN npm run build:generated && pnpm exec next build --webpack
+# Keep Turbopack production build (webpack cannot compile saffron WASM).
+RUN turbo run build --filter=dashboard-self-hosted...
 
 FROM ubuntu:noble
 

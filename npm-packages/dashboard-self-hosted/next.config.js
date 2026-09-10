@@ -66,7 +66,9 @@ const optionsForBuild = {
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  transpilePackages: [],
+  // Bundle icons into SSR chunks. Turbopack otherwise emits hashed
+  // externals like @radix-ui/react-icons-<hash> that break standalone deploys.
+  transpilePackages: ["@radix-ui/react-icons"],
   reactStrictMode: true,
   // Next 16 writes an AGENTS.md and a CLAUDE.md into the package on every
   // dev/build run; this repo keeps those files under its own conventions.
