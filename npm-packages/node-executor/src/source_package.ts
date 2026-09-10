@@ -1006,10 +1006,10 @@ async function processSourcePackageStream(
   createPackageJsonIfMissing(dir);
   logDurationMs("sourceWritesTime", startWrites);
   actualModulePaths.sort();
-  if (
-    JSON.stringify(metadataJson.modulePaths) !==
-    JSON.stringify(actualModulePaths)
-  ) {
+  // Match Rust upload_download.rs: sort both sides before comparing. Metadata
+  // may not be written in lexicographic order (e.g. after CLI/backend churn).
+  const metadataModulePaths = [...metadataJson.modulePaths].sort();
+  if (JSON.stringify(metadataModulePaths) !== JSON.stringify(actualModulePaths)) {
     throw new PackageCacheError(
       "Source package metadata does not match archive contents",
     );
