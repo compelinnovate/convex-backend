@@ -74,6 +74,7 @@ use common::{
     types::{
         FullyQualifiedObjectKey,
         IndexId,
+        IndexRef,
         MemberId,
         RepeatableTimestamp,
         TableName,
@@ -778,7 +779,7 @@ struct RepairFailedImportFromCheckpointsPlan {
     table_mapping_for_schema: TableMapping,
     virtual_system_mapping: VirtualSystemMapping,
     validation_ts: RepeatableTimestamp,
-    checkpoint_by_id_indexes: BTreeMap<TabletId, IndexId>,
+    checkpoint_by_id_indexes: BTreeMap<TabletId, IndexRef>,
     active_table_guards: Vec<RepairActiveTableGuard>,
     checkpoint_tablet_guards: Vec<RepairCheckpointTabletGuard>,
     completed_num_rows_written: u64,
@@ -1640,7 +1641,7 @@ async fn validate_repair_checkpoint_documents<RT: Runtime>(
     initial_schemas: &SchemasForImport,
     table_mapping_for_schema: &TableMapping,
     virtual_system_mapping: &VirtualSystemMapping,
-    checkpoint_by_id_indexes: &BTreeMap<TabletId, IndexId>,
+    checkpoint_by_id_indexes: &BTreeMap<TabletId, IndexRef>,
 ) -> anyhow::Result<()> {
     let user_tablet_ids = checkpoint_tablet_guards
         .iter()
