@@ -1675,6 +1675,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/teams/{team_id}/directory_sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_directory_sync"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/teams/{team_id}/directory_sync/portal_link": {
         parameters: {
             query?: never;
@@ -1685,6 +1701,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["generate_directory_sync_configuration_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/directory_sync/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["disable_directory_sync"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2075,6 +2107,14 @@ export interface components {
             idpId: string;
             mapping?: null | components["schemas"]["GroupRoleMappingResponse"];
         };
+        /** @description The one directory a team may connect, as WorkOS reports it. */
+        DirectoryResponse: {
+            /** @description like "directory_01ECAZ4NV9QMV47GW873HDCX74". */
+            id: string;
+            name?: string | null;
+            state: string;
+            linked: boolean;
+        };
         DirectorySyncOffer: {
             teamId: components["schemas"]["TeamId"];
             teamName: string;
@@ -2083,6 +2123,9 @@ export interface components {
         };
         DirectorySyncOffersResponse: {
             offers: components["schemas"]["DirectorySyncOffer"][];
+        };
+        DirectorySyncResponse: {
+            directory?: null | components["schemas"]["DirectoryResponse"];
         };
         DisconnectWorkOSTeamRequest: {
             /** @description Convex team ID to disconnect from WorkOS */
@@ -2614,6 +2657,13 @@ export interface components {
         RoleStatementEffect: "allow" | "deny";
         /** @enum {string} */
         RoleStatementWildcardAction: "*";
+        SSOConnectionResponse: {
+            id: string;
+            name: string;
+            connectionType: string;
+            state: string;
+            active: boolean;
+        };
         /** @enum {string} */
         SSODomainState: "verified" | "pending" | "failed" | "legacyVerified";
         SSOOrganizationDomain: {
@@ -2626,6 +2676,8 @@ export interface components {
             createTime: number;
             domains: components["schemas"]["SSOOrganizationDomain"][];
             requireSsoLogin: boolean;
+            /** @description SSO connections configured in WorkOS for this organization. */
+            connections: components["schemas"]["SSOConnectionResponse"][];
         };
         /** @enum {string} */
         SSOPortalIntent: "sso" | "domainVerification" | "certificateRenewal";
@@ -2881,8 +2933,10 @@ export type DeploymentWorkOsEnvironmentInfo = components['schemas']['DeploymentW
 export type DeploymentWorkOsEnvironmentResponse = components['schemas']['DeploymentWorkOSEnvironmentResponse'];
 export type DeviceName = components['schemas']['DeviceName'];
 export type DirectoryGroupResponse = components['schemas']['DirectoryGroupResponse'];
+export type DirectoryResponse = components['schemas']['DirectoryResponse'];
 export type DirectorySyncOffer = components['schemas']['DirectorySyncOffer'];
 export type DirectorySyncOffersResponse = components['schemas']['DirectorySyncOffersResponse'];
+export type DirectorySyncResponse = components['schemas']['DirectorySyncResponse'];
 export type DisconnectWorkOsTeamRequest = components['schemas']['DisconnectWorkOSTeamRequest'];
 export type DisconnectWorkOsTeamResponse = components['schemas']['DisconnectWorkOSTeamResponse'];
 export type DiscordAccount = components['schemas']['DiscordAccount'];
@@ -2971,6 +3025,7 @@ export type RoleStatementAction = components['schemas']['RoleStatementAction'];
 export type RoleStatementActions = components['schemas']['RoleStatementActions'];
 export type RoleStatementEffect = components['schemas']['RoleStatementEffect'];
 export type RoleStatementWildcardAction = components['schemas']['RoleStatementWildcardAction'];
+export type SsoConnectionResponse = components['schemas']['SSOConnectionResponse'];
 export type SsoDomainState = components['schemas']['SSODomainState'];
 export type SsoOrganizationDomain = components['schemas']['SSOOrganizationDomain'];
 export type SsoOrganizationResponse = components['schemas']['SSOOrganizationResponse'];
@@ -5347,6 +5402,28 @@ export interface operations {
             };
         };
     };
+    get_directory_sync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectorySyncResponse"];
+                };
+            };
+        };
+    };
     generate_directory_sync_configuration_link: {
         parameters: {
             query?: never;
@@ -5366,6 +5443,26 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["GenerateDirectorySyncConfigurationLinkResponse"];
                 };
+            };
+        };
+    };
+    disable_directory_sync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

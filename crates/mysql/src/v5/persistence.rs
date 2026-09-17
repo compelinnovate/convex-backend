@@ -78,6 +78,7 @@ use common::{
     shutdown::ShutdownSignal,
     types::{
         IndexId,
+        IndexRef,
         PersistenceVersion,
         Timestamp,
     },
@@ -110,6 +111,7 @@ use crate::{
         ApproxSize,
     },
     connection::{
+        is_message_too_large_error,
         MySqlConnection,
         MySqlTransaction,
     },
@@ -126,21 +128,6 @@ use crate::{
     MySqlOptions,
     MySqlReaderOptions,
 };
-
-/// Checks if an error is the Vitess "message too large" error that occurs
-/// when query results exceed 64MiB.
-fn is_message_too_large_error(error: &anyhow::Error) -> Option<&mysql_async::ServerError> {
-    error
-        .chain()
-        .find_map(|e| e.downcast_ref::<mysql_async::ServerError>())
-        .filter(|db_err| {
-            // matches both "trying to send message larger than max" and "received message
-            // larger than max"
-            db_err.state == "HY000"
-                && db_err.code == 1105
-                && db_err.message.contains("message larger than max")
-        })
-}
 
 pub struct Persistence<RT: Runtime> {
     newly_created: AtomicBool,
@@ -324,7 +311,7 @@ impl<RT: Runtime> PersistenceTrait for Persistence<RT> {
         indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(documents.len() <= super::documents::MAX_INSERT_SIZE);
+        anyhow::ensure!(documents.len() <= crate::MAX_INSERT_SIZE);
         let mut write_size = 0;
         for update in documents {
             match &update.value {
@@ -1409,7 +1396,7 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
 
     fn index_scan(
         &self,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         read_timestamp: Timestamp,
         range: &Interval,
@@ -1418,7 +1405,7 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
         retention_validator: Arc<dyn RetentionValidator>,
     ) -> IndexStream<'_> {
         self._index_scan(
-            index_id,
+            index.id(),
             tablet_id,
             read_timestamp,
             range.clone(),

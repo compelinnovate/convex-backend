@@ -92,6 +92,7 @@ declare_strings!(
     runRequest,
     setContinuationPreservedEmbedderData,
     setup,
+    setupTemporal,
     stack,
     syscall,
     TextDecoder,

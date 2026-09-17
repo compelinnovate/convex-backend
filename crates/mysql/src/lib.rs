@@ -9,7 +9,6 @@ mod document_encoding;
 mod metrics;
 mod sql;
 mod v5;
-#[allow(dead_code)]
 mod v6;
 use std::{
     ops::Deref,
@@ -30,6 +29,14 @@ use common::{
     },
 };
 pub use connection::ConvexMySqlPool;
+pub use v6::maintenance::{
+    IndexesLogMaintenance,
+    MaintenanceRound,
+};
+
+/// Maximum number of documents in one write: the sum of
+/// TRANSACTION_MAX_SYSTEM_NUM_WRITES and TRANSACTION_MAX_NUM_USER_WRITES.
+pub(crate) const MAX_INSERT_SIZE: usize = 56000;
 
 pub type MySqlPersistence<RT> = v5::Persistence<RT>;
 pub type MySqlReader<RT> = v5::Reader<RT>;

@@ -144,6 +144,7 @@ use common::{
         FunctionCaller,
         IndexId,
         IndexName,
+        IndexRef,
         ModuleEnvironment,
         NodeDependency,
         ObjectKey,
@@ -1142,7 +1143,7 @@ impl<RT: Runtime> Application<RT> {
     pub async fn index_page(
         &self,
         ts: RepeatableTimestamp,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         interval: &Interval,
         order: Order,
@@ -1152,7 +1153,7 @@ impl<RT: Runtime> Application<RT> {
         CursorPosition,
     )> {
         self.database
-            .index_page(ts, index_id, tablet_id, interval, order, max_size)
+            .index_page(ts, index, tablet_id, interval, order, max_size)
             .await
     }
 

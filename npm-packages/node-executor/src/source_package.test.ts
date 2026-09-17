@@ -1731,7 +1731,9 @@ type RouteResponse = {
 };
 
 type Route =
-  Buffer | RouteResponse | ((requestNumber: number) => RouteResponse);
+  | Buffer
+  | RouteResponse
+  | ((requestNumber: number) => RouteResponse);
 
 async function startPackageServer(routes: Record<string, Route>): Promise<{
   baseUrl: string;

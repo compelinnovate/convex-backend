@@ -85,7 +85,6 @@ use common::{
         QueryInvocation,
         SchedulerDependencyClass,
         Timestamp,
-        UdfIdentifier,
         UdfType,
     },
 };
@@ -1222,14 +1221,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
             anyhow::bail!(unauthorized_error("mutation"));
         }
-        let write_source = {
-            let component_path = path.clone().debug_into_component_path();
-            if path.is_system() {
-                WriteSource::SystemUdf(Arc::new(UdfIdentifier::Function(component_path)))
-            } else {
-                WriteSource::Udf(Arc::new(UdfIdentifier::Function(component_path)))
-            }
-        };
+        let write_source = WriteSource::mutation(path.clone().debug_into_component_path());
 
         let mut backoff = Backoff::new(
             *UDF_EXECUTOR_OCC_INITIAL_BACKOFF,
