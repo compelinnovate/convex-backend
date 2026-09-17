@@ -1195,6 +1195,7 @@ impl<RT: Runtime> Lease<RT> {
             "failed to acquire V6 lease: a higher lease timestamp already exists"
         );
         timer.finish();
+        drop(client);
         Ok(Self {
             pool,
             db_name,
@@ -1209,28 +1210,23 @@ impl<RT: Runtime> Lease<RT> {
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
         let mut client = self.pool.acquire("v6_transact", &self.db_name).await?;
-        let result = async {
-            let mut tx = client.transaction(self.pool.cluster_name(), None).await?;
-            let timer = metrics::lease_precond_timer(self.pool.cluster_name());
-            let lease: Option<Row> = tx
-                .exec_first(
-                    super::LEASE_PRECONDITION,
-                    vec![Value::Int(self.lease_ts), self.deployment_id.into()],
-                )
-                .await?;
-            if lease.is_none() {
-                self.lease_lost_shutdown.signal(lease_lost_error());
-                anyhow::bail!(lease_lost_error());
-            }
-            timer.finish();
-            let value = f(&mut tx).await?;
-            let timer = metrics::commit_timer(self.pool.cluster_name());
-            tx.commit().await?;
-            timer.finish();
-            Ok(value)
-        }
-        .await;
-        client.handle_errors(result).await
+        client
+            .transaction(self.pool.cluster_name(), None, async |tx| {
+                let timer = metrics::lease_precond_timer(self.pool.cluster_name());
+                let lease: Option<Row> = tx
+                    .exec_first(
+                        super::LEASE_PRECONDITION,
+                        vec![Value::Int(self.lease_ts), self.deployment_id.into()],
+                    )
+                    .await?;
+                if lease.is_none() {
+                    self.lease_lost_shutdown.signal(lease_lost_error());
+                    anyhow::bail!(lease_lost_error());
+                }
+                timer.finish();
+                f(tx).await
+            })
+            .await
     }
 }
 
